@@ -1,0 +1,13 @@
+# 每次新实验复制此文件，只写 overrides。
+# 迁移自: sgnn/transolver/multi_scale_config.yaml (run_name: Overfit-8-384-4-8-64-4-stepLR-50k)
+
+name: "Overfit-8-384-4-8-64-4-stepLR-50k"
+description: "Single-simulation overfit test. 8 layers, hidden_dim=384, StepLR 5k/0.8, 50k steps."
+
+model:
+  name: "multi_scale_simulator"
+  params: "configs/params/multi_scale_simulator.yaml"
+
+overrides: {}  # All values match the defaults in params file — no overrides needed.
+
+notes: "Used to verify the model can overfit to a single BVC simulation."
