@@ -6,7 +6,7 @@ model:
   params: "configs/params/transolver_net.yaml"  # base params file
 
 overrides:
-  train.lr: 0.001
+  train.lr: 0.0001
   model.dropout: 0.2
   train.batch_size: 2
   model.hidden_dim: 256
