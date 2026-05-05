@@ -420,7 +420,7 @@ def train(cfg: dict, git_commit: str = "unknown"):
                         model, val_loader, norm_stats,
                         loss_w_mse, loss_w_vm, device,
                     )
-                    val_loss = val_metrics["val/loss"]
+                    val_loss = val_metrics["loss"]
 
                     meta_payload = {
                         "step":       step,
@@ -457,8 +457,8 @@ def train(cfg: dict, git_commit: str = "unknown"):
 
                     print(f"[Val]   Step {step} | "
                           f"val_loss={val_loss:.5f} | "
-                          f"val_mse={val_metrics['val/loss_mse']:.5f} | "
-                          f"val_vm={val_metrics['val/loss_vm']:.5f} | "
+                          f"val_mse={val_metrics['loss_mse']:.5f} | "
+                          f"val_vm={val_metrics['loss_vm']:.5f} | "
                           f"best={best_val_loss:.5f} {tick}")
 
                     wandb_log.update({f"val/{k}": v for k, v in val_metrics.items()})
