@@ -183,9 +183,6 @@ def upload_artifact(cfg: dict, run, git_commit: str, val_loss: float):
 #   acceleration [6:9]
 #   stress       [9:15]   ← Voigt: sxx, syy, szz, sxy, syz, sxz
 
-_STRESS_START = 9
-_STRESS_END   = 15
-
 
 def _von_mises(stress: torch.Tensor) -> torch.Tensor:
     """Von Mises scalar from 6-component Voigt stress [..., 6].
@@ -204,95 +201,88 @@ def _von_mises(stress: torch.Tensor) -> torch.Tensor:
         + 6.0 * (s[..., 3] ** 2 + s[..., 4] ** 2 + s[..., 5] ** 2)
     ) + 1e-12)
 
+_POS_S, _POS_E = 0, 3
+_VEL_S, _VEL_E = 3, 6
+_ACC_S, _ACC_E = 6, 9
+_STR_S, _STR_E = 9, 15
 
 def compute_loss(
-    pred:       torch.Tensor,
-    target:     torch.Tensor,
-    norm_stats: NormStats,
-    loss_w_mse: float = 1.0,
-    loss_w_vm:  float = 1.0,
-    device:     torch.device = torch.device("cpu"),
-) -> tuple[torch.Tensor, dict]:
-    """Compute combined MSE + Von Mises stress loss.
+    pred, target, norm_stats,
+    loss_w_pos:    float = 1.0,
+    loss_w_vel:    float = 1.0,
+    loss_w_acc:    float = 1.0,
+    loss_w_stress: float = 1.0,
+    loss_w_vm:     float = 1.0,
+    device:        torch.device = torch.device("cpu"),
+    ):
+    loss_pos    = F.mse_loss(pred[..., _POS_S:_POS_E], target[..., _POS_S:_POS_E])
+    loss_vel    = F.mse_loss(pred[..., _VEL_S:_VEL_E], target[..., _VEL_S:_VEL_E])
+    loss_acc    = F.mse_loss(pred[..., _ACC_S:_ACC_E], target[..., _ACC_S:_ACC_E])
 
-    MSE is computed in normalized space (fast, scale-balanced).
-    Von Mises is computed in original physical space (denormalize stress first).
+    pred_stress   = pred[...,   _STR_S:_STR_E]
+    target_stress = target[..., _STR_S:_STR_E]
+    loss_stress = F.mse_loss(pred_stress, target_stress)
 
-    Args:
-        pred:       Model output   (B, N, 15), normalized.
-        target:     Ground truth   (B, N, 15), normalized.
-        norm_stats: NormStats instance for denormalizing stress.
-        loss_w_mse: Weight for MSE loss term.
-        loss_w_vm:  Weight for Von Mises loss term.
-        device:     Torch device.
+    # VM 在 normalized stress 空间算（数值稳定，不破坏梯度）
+    loss_vm = F.mse_loss(_von_mises(pred_stress), _von_mises(target_stress))
 
-    Returns:
-        (total_loss, log_dict)
-    """
-    # ── MSE on all 15 dims (normalized space) ─────────────────────────────
-    loss_mse = F.mse_loss(pred, target)
+    total = (loss_w_pos    * loss_pos
+           + loss_w_vel    * loss_vel
+           + loss_w_acc    * loss_acc
+           + loss_w_stress * loss_stress
+           + loss_w_vm     * loss_vm)
 
-    # ── Von Mises on stress (physical space) ──────────────────────────────
-    pred_stress   = pred[..., _STRESS_START:_STRESS_END]     # (B, N, 6)
-    target_stress = target[..., _STRESS_START:_STRESS_END]   # (B, N, 6)
-
-    pred_stress_raw   = norm_stats.denormalize_tensor("stress", pred_stress.detach())
-    target_stress_raw = norm_stats.denormalize_tensor("stress", target_stress.detach())
-
-    pred_vm   = _von_mises(pred_stress_raw)    # (B, N)
-    target_vm = _von_mises(target_stress_raw)  # (B, N)
-
-    # Re-attach gradients: compute VM MSE in normalized stress space for backprop
-    pred_vm_norm   = _von_mises(pred_stress)
-    target_vm_norm = _von_mises(target_stress)
-    loss_vm        = F.mse_loss(pred_vm_norm, target_vm_norm)
-
-    total = loss_w_mse * loss_mse + loss_w_vm * loss_vm
+    # 仅用于监控：denorm 后的 VM 量纲（MPa/Pa），方便看物理意义
+    with torch.no_grad():
+        pred_vm_phys   = _von_mises(norm_stats.denormalize_tensor("stress", pred_stress))
+        target_vm_phys = _von_mises(norm_stats.denormalize_tensor("stress", target_stress))
 
     log = {
-        "loss_mse":    loss_mse.item(),
+        "loss_pos":    loss_pos.item(),
+        "loss_vel":    loss_vel.item(),
+        "loss_acc":    loss_acc.item(),
+        "loss_stress": loss_stress.item(),
         "loss_vm":     loss_vm.item(),
-        "vm_pred_mean":   pred_vm.mean().item(),
-        "vm_target_mean": target_vm.mean().item(),
+        "vm_pred_mean_phys":   pred_vm_phys.mean().item(),
+        "vm_target_mean_phys": target_vm_phys.mean().item(),
     }
     return total, log
-
 
 # ── Validation loop ───────────────────────────────────────────────────────────
 
 @torch.no_grad()
 def run_validation(
-    model:      torch.nn.Module,
-    val_loader: torch.utils.data.DataLoader,
-    norm_stats: NormStats,
-    loss_w_mse: float,
-    loss_w_vm:  float,
-    device:     torch.device,
-) -> dict:
-    """Run full validation set, return averaged metrics."""
+    model, val_loader, norm_stats,
+    loss_w_pos, loss_w_vel, loss_w_acc, loss_w_stress, loss_w_vm,
+    device,
+    ) -> dict:
     tracker = MetricTracker()
 
     for x, y in val_loader:
         x, y = x.to(device), y.to(device)
-        # pred = model(x)
 
-        # TODO modify evaluate.py 和 rollout.py 里
-        pred_residual = model(x)              # (B, N, 15) 残差
-        last_frame    = x[..., -15:]          # 取输入的最后一帧 (B, N, 15)
-        pred = pred_residual + last_frame   # 还原绝对值 (B, N, 15)
+        pred_residual = model(x)
+        last_frame    = x[..., -15:]
+        pred = pred_residual + last_frame
 
         loss, log = compute_loss(
             pred, y, norm_stats,
-            loss_w_mse=loss_w_mse,
+            loss_w_pos=loss_w_pos,
+            loss_w_vel=loss_w_vel,
+            loss_w_acc=loss_w_acc,
+            loss_w_stress=loss_w_stress,
             loss_w_vm=loss_w_vm,
             device=device,
         )
-        tracker.update("loss",     loss.item(),        n=x.size(0))
-        tracker.update("loss_mse", log["loss_mse"],    n=x.size(0))
-        tracker.update("loss_vm",  log["loss_vm"],     n=x.size(0))
+        bs = x.size(0)
+        tracker.update("loss",        loss.item(),         n=bs)
+        tracker.update("loss_pos",    log["loss_pos"],     n=bs)
+        tracker.update("loss_vel",    log["loss_vel"],     n=bs)
+        tracker.update("loss_acc",    log["loss_acc"],     n=bs)
+        tracker.update("loss_stress", log["loss_stress"],  n=bs)
+        tracker.update("loss_vm",     log["loss_vm"],      n=bs)
 
     return tracker.compute()
-
 
 # ── Main training loop ────────────────────────────────────────────────────────
 
@@ -343,8 +333,12 @@ def train(cfg: dict, git_commit: str = "unknown"):
     # ── Loss weights ──────────────────────────────────────────────────────
     #   loss_weight_position: 1.0
     #   loss_weight_strain: 0.0
-    loss_w_mse = float(train_cfg.get("loss_weight_position",    1.0))
-    loss_w_vm  = float(train_cfg.get("loss_weight_strain",     1.0))
+    loss_w_pos    = float(train_cfg.get("loss_weight_position",     1.0))
+    loss_w_vel    = float(train_cfg.get("loss_weight_velocity",     0.0))
+    loss_w_acc    = float(train_cfg.get("loss_weight_acceleration", 0.0))
+    loss_w_stress = float(train_cfg.get("loss_weight_stress",       1.0))
+    loss_w_vm     = float(train_cfg.get("loss_weight_vm",           1.0))
+
     grad_clip  = float(train_cfg.get("grad_clip",          1.0))
 
     # ── Checkpoint state ──────────────────────────────────────────────────
@@ -380,9 +374,19 @@ def train(cfg: dict, git_commit: str = "unknown"):
                 pred = model(x)                       # (B, N, 15)
 
                 # ── Loss ──────────────────────────────────────────────────
+                # loss, loss_log = compute_loss(
+                #     pred, y, norm_stats,
+                #     loss_w_mse=loss_w_mse,
+                #     loss_w_vm=loss_w_vm,
+                #     device=device,
+                # )
+
                 loss, loss_log = compute_loss(
                     pred, y, norm_stats,
-                    loss_w_mse=loss_w_mse,
+                    loss_w_pos=loss_w_pos,
+                    loss_w_vel=loss_w_vel,
+                    loss_w_acc=loss_w_acc,
+                    loss_w_stress=loss_w_stress,
                     loss_w_vm=loss_w_vm,
                     device=device,
                 )
@@ -399,17 +403,25 @@ def train(cfg: dict, git_commit: str = "unknown"):
 
                 # ── Step log ──────────────────────────────────────────────
                 wandb_log = {
-                    "train/loss":     loss.item(),
-                    "train/loss_mse": loss_log["loss_mse"],
-                    "train/loss_vm":  loss_log["loss_vm"],
-                    "lr":             lr_now,
+                    "train/loss":        loss.item(),
+                    "train/loss_pos":    loss_log["loss_pos"],
+                    "train/loss_vel":    loss_log["loss_vel"],
+                    "train/loss_acc":    loss_log["loss_acc"],
+                    "train/loss_stress": loss_log["loss_stress"],
+                    "train/loss_vm":     loss_log["loss_vm"],
+                    "train/vm_pred_phys":   loss_log["vm_pred_mean_phys"],
+                    "train/vm_target_phys": loss_log["vm_target_mean_phys"],
+                    "lr":                lr_now,
                 }
 
                 if step % 10 == 0:
                     print(f"[Train] Step {step}/{nsteps} | "
                           f"loss={loss.item():.5f} | "
-                          f"mse={loss_log['loss_mse']:.5f} | "
-                          f"vm={loss_log['loss_vm']:.5f} | "
+                          f"pos={loss_log['loss_pos']:.5f} | "
+                        #   f"vel={loss_log['loss_vel']:.5f} | "
+                        #   f"acc={loss_log['loss_acc']:.5f} | "
+                        #   f"stress={loss_log['loss_stress']:.5f} | "
+                        #   f"vm={loss_log['loss_vm']:.5f} | "
                           f"lr={lr_now:.2e}")
 
                 # ── Validation + checkpoint ───────────────────────────────
@@ -418,7 +430,8 @@ def train(cfg: dict, git_commit: str = "unknown"):
 
                     val_metrics = run_validation(
                         model, val_loader, norm_stats,
-                        loss_w_mse, loss_w_vm, device,
+                        loss_w_pos, loss_w_vel, loss_w_acc, loss_w_stress, loss_w_vm,
+                        device,
                     )
                     val_loss = val_metrics["loss"]
 
@@ -456,10 +469,11 @@ def train(cfg: dict, git_commit: str = "unknown"):
                         tick = ""
 
                     print(f"[Val]   Step {step} | "
-                          f"val_loss={val_loss:.5f} | "
-                          f"val_mse={val_metrics['loss_mse']:.5f} | "
-                          f"val_vm={val_metrics['loss_vm']:.5f} | "
-                          f"best={best_val_loss:.5f} {tick}")
+                        f"val_loss={val_loss:.5f} | "
+                        f"pos={val_metrics['loss_pos']:.5f} | "
+                        f"stress={val_metrics['loss_stress']:.5f} | "
+                        f"vm={val_metrics['loss_vm']:.5f} | "
+                        f"best={best_val_loss:.5f} {tick}")
 
                     wandb_log.update({f"val/{k}": v for k, v in val_metrics.items()})
                     model.train()

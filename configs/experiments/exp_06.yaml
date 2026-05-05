@@ -1,0 +1,15 @@
+name: "exp_05"
+description: "New loss function for loss position and loss of vm stress."
+
+model:
+  name: "transolver_net"                        # registry key
+  params: "configs/params/transolver_net.yaml"  # base params file
+
+overrides:
+  train.lr: 0.0001
+  model.dropout: 0.2
+  train.batch_size: 2
+  model.hidden_dim: 256
+  train.ntraining_steps: 5000
+
+notes: "Position and VM stress loss experiment."
