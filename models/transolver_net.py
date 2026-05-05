@@ -31,11 +31,11 @@ def build_mlp(
     return mlp
 
 
-@register("multi_scale_gnn")
-class MultiScaleGNN(nn.Module):
+@register("transolver_net")
+class TransolverNet(nn.Module):
     """MLP encoder → Transolver blocks → MLP decoder (single-frame input).
 
-    Registry key: ``"multi_scale_gnn"``
+    Registry key: ``"transolver_net"``
 
     cfg keys used (all under ``model``):
         nnode_in_features, nnode_out_features, hidden_dim, layers,
@@ -91,7 +91,7 @@ class MultiScaleGNN(nn.Module):
         return out.squeeze(0) if squeeze else out
 
 
-class TemporalMultiScaleGNN(nn.Module):
+class TemporalTransolverNet(nn.Module):
     """Temporal attention over T frames → spatial Transolver.
 
     Not registered — experimental; wire up explicitly when needed.

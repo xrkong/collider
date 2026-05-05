@@ -2,11 +2,13 @@
 # 改动内容: 拆分为 model / train / data 三段；将硬编码参数移入此文件
 
 model:
-  name: multi_scale_simulator
+  name: transolver_net
 
   # ── 空间维度 ──────────────────────────────────────────────────────────
   dim: 3
   input_sequence_length: 5
+  nnode_in_features: 75 # 5 frame * 15 features (pos 3 + vel 3 + acc 3 + stress 6) = 75
+  nnode_out_features: 15 
 
   # ── 网络结构 ──────────────────────────────────────────────────────────
   hidden_dim: 384
@@ -50,8 +52,9 @@ train:
   keep_top_k: 3       # 保留 val_loss 最低的 K 个 checkpoint
 
 data:
-  base_path: "dataset/data_processed"
-  metadata_path: "dataset/data_processed/metadata.json"
+  base_path: "/home/kong/datasets/barrier/split_data/T_lok_F_shape_barrier_9_3_100km_50_2/"
+  metadata_path: "/home/kong/datasets/barrier/split_data/T_lok_F_shape_barrier_9_3_100km_50_2/metadata.json"
+  dataset_type: bvc 
   num_workers: 0
   pin_memory: true
 

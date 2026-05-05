@@ -1,19 +1,23 @@
-# 迁移自: dataset/bvc_data_loader.py
+# 迁移自: src/dataset.py
 # 改动内容:
-#   - 添加 BaseDataset 抽象类和 build_dataloader() 工厂函数
-#   - BVCWindowDataset / BVCFullTrajectoryDataset 继承 BaseDataset，__init__ 接收 cfg
-#   - 原有 __getitem__ 逻辑保留不变
-#   - normalize_feature() 保留但标注为 no-op（数据已由 h5_dataset_builder.py 预归一化）
+#   - 删除 BVCWindowDataset（数据已预切窗口，滑窗逻辑多余）
+#   - 删除 _BaseBVCMixin（normalize_feature 是 no-op，数据已预归一化）
+#   - 删除 H5Dataset（项目未使用）
+#   - BVCDataset: 修复 h5 文件句柄问题（lazy open，支持 num_workers > 0）
+#   - BVCDataset: 添加 z-score normalization，从 metadata.json 读取 stats
+#   - BVCFullTrajectoryDataset: 去掉 Mixin，简化为直接读取，同样支持 normalize
+#   - build_dataloader: 默认 dataset_type 改为 "bvc"
 
 from __future__ import annotations
 
 import abc
 import json
 from pathlib import Path
+from typing import Dict, Optional, Tuple
 
+import numpy as np
 import torch
 import torch.utils.data
-import numpy as np
 
 try:
     import h5py
@@ -21,273 +25,317 @@ except ImportError:
     raise ImportError("h5py is required: pip install h5py")
 
 
+# ── Normalization stats ───────────────────────────────────────────────────────
+
+class NormStats:
+    """Holds per-feature z-score stats loaded from metadata.json.
+
+    Reads ``normalization_stats`` section:
+    ::
+
+        {
+          "normalization_stats": {
+            "positions":    {"mean": [x, y, z],          "std": [x, y, z]},
+            "velocity":     {"mean": [x, y, z],          "std": [x, y, z]},
+            "acceleration": {"mean": [x, y, z],          "std": [x, y, z]},
+            "stress":       {"mean": [s0..s5],            "std": [s0..s5]}
+          }
+        }
+
+    Args:
+        metadata_path: Path to ``metadata.json``.
+
+    Example::
+
+        stats = NormStats("datasets/dataset_v1/metadata.json")
+        x_norm = stats.normalize("positions", x)   # (T, N, 3) or (N, 3)
+        x_raw  = stats.denormalize("positions", x_norm)
+    """
+
+    FEATURES = ["positions", "velocity", "acceleration", "stress"]
+
+    def __init__(self, metadata_path: str | Path):
+        path = Path(metadata_path)
+        if not path.exists():
+            raise FileNotFoundError(f"metadata.json not found: {path}")
+
+        with open(path) as f:
+            meta = json.load(f)
+
+        raw = meta.get("normalization_stats", {})
+        self._mean: Dict[str, np.ndarray] = {}
+        self._std:  Dict[str, np.ndarray] = {}
+
+        for feat in self.FEATURES:
+            if feat not in raw:
+                raise KeyError(
+                    f"Feature '{feat}' missing from normalization_stats in {path}"
+                )
+            self._mean[feat] = np.array(raw[feat]["mean"], dtype=np.float32)
+            self._std[feat]  = np.array(raw[feat]["std"],  dtype=np.float32)
+
+            # Guard against zero std (would cause NaN)
+            zero_mask = self._std[feat] < 1e-8
+            if zero_mask.any():
+                print(f"Warning: near-zero std in '{feat}' dims {np.where(zero_mask)[0]} "
+                      f"— clamped to 1.0")
+                self._std[feat][zero_mask] = 1.0
+
+    def normalize(self, feature: str, arr: np.ndarray) -> np.ndarray:
+        """Z-score normalize. Works for shapes (..., C)."""
+        return (arr - self._mean[feature]) / self._std[feature]
+
+    def denormalize(self, feature: str, arr: np.ndarray) -> np.ndarray:
+        """Invert z-score. Works for shapes (..., C)."""
+        return arr * self._std[feature] + self._mean[feature]
+
+    def denormalize_tensor(self, feature: str, t: torch.Tensor) -> torch.Tensor:
+        """Denormalize a torch tensor (for use in loss / rollout)."""
+        mean = torch.tensor(self._mean[feature], dtype=t.dtype, device=t.device)
+        std  = torch.tensor(self._std[feature],  dtype=t.dtype, device=t.device)
+        return t * std + mean
+
+
+def load_norm_stats(metadata_path: str | Path) -> Optional[NormStats]:
+    """Load NormStats if path exists; return None if not found (normalize disabled)."""
+    try:
+        return NormStats(metadata_path)
+    except FileNotFoundError:
+        return None
+
+
 # ── Abstract base ─────────────────────────────────────────────────────────────
 
 class BaseDataset(torch.utils.data.Dataset, abc.ABC):
-    """Abstract dataset. Subclasses must implement ``load_data`` and ``__getitem__``.
+    """Abstract dataset base class.
 
     Args:
-        cfg: Config dict or OmegaConf DictConfig.
+        cfg: Config dict with at least ``cfg["data"]["path"]``.
     """
 
-    def __init__(self, cfg):
+    def __init__(self, cfg: dict):
         super().__init__()
         self.cfg = cfg
-
-    @abc.abstractmethod
-    def load_data(self):
-        """Build in-memory data or a lazy index."""
-
-    @abc.abstractmethod
-    def __getitem__(self, idx: int):
-        """Return a single sample."""
 
     @abc.abstractmethod
     def __len__(self) -> int:
         pass
 
-
-# ── Generic H5 dataset ────────────────────────────────────────────────────────
-
-class H5Dataset(BaseDataset):
-    """Generic HDF5 dataset returning ``(x, y)`` tensor pairs.
-
-    Expects top-level datasets ``"x"`` and ``"y"`` inside the HDF5 file.
-
-    Args:
-        cfg: Must have ``cfg["data"]["path"]``.
-    """
-
-    def __init__(self, cfg):
-        super().__init__(cfg)
-        self._x = self._y = None
-        self.load_data()
-
-    def load_data(self):
-        path = self.cfg["data"]["path"]
-        with h5py.File(path, "r") as f:
-            self._x = torch.from_numpy(f["x"][:]).float()
-            self._y = torch.from_numpy(f["y"][:]).float()
-
-    def __len__(self):
-        return len(self._x)
-
-    def __getitem__(self, idx):
-        """Returns: Tuple[Tensor, Tensor] — ``(x[idx], y[idx])``"""
-        return self._x[idx], self._y[idx]
+    @abc.abstractmethod
+    def __getitem__(self, idx: int):
+        pass
 
 
-# ── BVC normalization mixin ───────────────────────────────────────────────────
+# ── BVC Training Dataset ──────────────────────────────────────────────────────
 
-class _BaseBVCMixin:
-    """Normalization helpers shared by BVC dataset classes.
+class BVCDataset(BaseDataset):
+    """HDF5 dataset for TransolverNet training.
 
-    NOTE: With h5_dataset_builder.py the data is already z-score normalised at
-    build time. ``normalize_feature()`` is effectively a no-op in the current
-    pipeline because ``global_stats`` only contains displacement/acceleration
-    keys, not per-field keys like ``positions_mean``.
-    """
+    Reads pre-windowed h5 files where each window has 6 frames.
+    Splits into:
+        - x (input):  first 5 frames, all features concatenated → (N, 75)
+        - y (target): 6th frame, all features concatenated      → (N, 15)
 
-    def _load_normalization_stats(self, data_dir: str) -> dict:
-        for candidate in [
-            Path(data_dir).parent / "metadata" / "metadata.json",
-            Path(data_dir).parent / "metadata.json",
-        ]:
-            if candidate.exists():
-                with open(candidate) as f:
-                    return json.load(f).get("global_stats") or {}
-        return {}
+    Input feature layout  (75 dims per node):
+        positions    5 × 3 = 15
+        velocity     5 × 3 = 15
+        acceleration 5 × 3 = 15
+        stress       5 × 6 = 30
 
-    def normalize_feature(self, feature: np.ndarray, feature_name: str) -> np.ndarray:
-        stats = getattr(self, "_stats", None)
-        if not stats:
-            return feature
-        mean_k, std_k = f"{feature_name}_mean", f"{feature_name}_std"
-        if mean_k not in stats:
-            return feature
-        mean, std = stats[mean_k], stats[std_k]
-        return feature if std == 0 else (feature - mean) / std
-
-
-# ── BVC Window Dataset ────────────────────────────────────────────────────────
-
-class BVCWindowDataset(_BaseBVCMixin, BaseDataset):
-    """Sliding-window HDF5 dataset for BVC training/validation.
-
-    Each ``__getitem__`` returns::
-
-        {
-          "context":    {feat: Tensor(context_length, N, C)},
-          "prediction": {feat: Tensor(1, N, C)},  # last frame
-          "meta":       {"window_idx": int, "num_particles": int, "window_name": str},
-        }
+    Target feature layout (15 dims per node):
+        positions    1 × 3 = 3
+        velocity     1 × 3 = 3
+        acceleration 1 × 3 = 3
+        stress       1 × 6 = 6
 
     Args:
-        cfg: Must have ``cfg["data"]["path"]`` pointing to a split directory
-             (e.g. ``dataset/data_processed/train``).
+        cfg: Must have:
+            - ``cfg["data"]["path"]``: path to h5 file
+            - ``cfg["data"]["metadata_path"]``: path to metadata.json
+            - ``cfg["data"]["normalize"]``: bool, default True
+
+    Note:
+        h5 file is opened lazily per ``__getitem__`` call to support
+        ``num_workers > 0`` in DataLoader.
     """
 
-    def __init__(self, cfg):
+    FEATURES     = ["positions", "velocity", "acceleration", "stress"]
+    INPUT_FRAMES = 5
+    TARGET_FRAME = 5   # 6th frame, 0-indexed
+
+    def __init__(self, cfg: dict):
         super().__init__(cfg)
-        d = cfg["data"]
-        self.data_dir       = Path(d["path"])
-        self.context_length = d.get("context_length", 5)
-        self.normalize      = d.get("normalize", True)
-        self._stats = self._load_normalization_stats(str(self.data_dir)) if self.normalize else {}
+        data_cfg = cfg["data"]
 
-        split_name = self.data_dir.name
-        h5_files   = sorted(self.data_dir.glob(f"{split_name}_data_*.h5"))
-        if not h5_files:
-            fb = self.data_dir / f"{split_name}_data.h5"
-            h5_files = [fb] if fb.exists() else []
-        if not h5_files:
-            raise FileNotFoundError(f"No HDF5 files found in {self.data_dir}")
+        self.h5_path = Path(data_cfg["path"])
+        if not self.h5_path.exists():
+            raise FileNotFoundError(f"H5 file not found: {self.h5_path}")
 
-        self.h5_files = h5_files
-        self._file_window_map: list = []
-        self._total_windows = 0
-        self._available_features: list[str] = []
-        self._window_length = self._num_particles = self._spatial_dim = None
+        # Load normalization stats
+        self._stats: Optional[NormStats] = None
+        if data_cfg.get("normalize", True):
+            meta_path = data_cfg.get("metadata_path")
+            if meta_path:
+                self._stats = NormStats(meta_path)
+                print(f"[Dataset] Normalization enabled — stats loaded from {meta_path}")
+            else:
+                print("Warning: normalize=True but metadata_path not set — skipping normalization")
 
-        for h5f in h5_files:
-            with h5py.File(h5f, "r") as f:
-                wnames = sorted(k for k in f if k.startswith("window_"))
-                self._file_window_map.append((h5f, wnames))
-                self._total_windows += len(wnames)
-                if wnames and not self._available_features:
-                    self._available_features = list(f[wnames[0]].keys())
-                if wnames and self._window_length is None and "positions" in f[wnames[0]]:
-                    s = f[wnames[0]]["positions"][:]
-                    self._window_length = s.shape[0]
-                    self._num_particles = s.shape[1]
-                    self._spatial_dim   = s.shape[2] if s.ndim > 2 else 1
+        # Build key index without holding the file open
+        with h5py.File(self.h5_path, "r") as f:
+            self._keys = sorted(k for k in f.keys() if k.startswith("window_"))
 
-        lf = d.get("load_features", None)
-        self.features = [x for x in lf if x in self._available_features] if lf else self._available_features
-        self.load_data()
+        if not self._keys:
+            raise ValueError(f"No window groups found in {self.h5_path}")
 
-    def load_data(self):
-        pass  # index built in __init__; lazy loading per __getitem__
+        # File handle — opened lazily per worker in __getitem__
+        self._file: Optional[h5py.File] = None
 
-    def __len__(self):
-        return self._total_windows
+    def __len__(self) -> int:
+        return len(self._keys)
 
-    def __getitem__(self, idx: int) -> dict:
-        cumulative = 0
-        for h5f, wnames in self._file_window_map:
-            if cumulative + len(wnames) > idx:
-                wname = wnames[idx - cumulative]
-                break
-            cumulative += len(wnames)
+    def _get_file(self) -> h5py.File:
+        """Lazy-open the h5 file. Each DataLoader worker gets its own handle."""
+        if self._file is None:
+            self._file = h5py.File(self.h5_path, "r")
+        return self._file
 
-        with h5py.File(h5f, "r") as f:
-            grp = f[wname]
-            data = {}
-            for feat in self.features:
-                if feat in grp:
-                    arr = self.normalize_feature(grp[feat][:], feat)
-                    data[feat] = torch.from_numpy(arr).float()
-            n_particles = int(grp.attrs.get("num_particles", 0))
+    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Return (x, y) tensors for one window.
 
-        return {
-            "context":    {k: v[: self.context_length] for k, v in data.items()},
-            "prediction": {k: v[-1:]                   for k, v in data.items()},
-            "meta": {"window_idx": idx, "num_particles": n_particles, "window_name": wname},
-        }
+        Returns:
+            x: FloatTensor of shape (N, 75) — 5-frame input, normalized
+            y: FloatTensor of shape (N, 15) — target frame, normalized
+        """
+        f   = self._get_file()
+        grp = f[self._keys[idx]]
+
+        # ── Input: first 5 frames ─────────────────────────────────────────────
+        x_parts = []
+        for feat in self.FEATURES:
+            arr = grp[feat][:self.INPUT_FRAMES].astype(np.float32)  # (5, N, C)
+            if self._stats is not None:
+                arr = self._stats.normalize(feat, arr)
+            x_parts.append(arr)
+
+        x = np.concatenate(x_parts, axis=-1)   # (5, N, 15)
+        x = x.reshape(x.shape[1], -1)           # (N, 75)
+
+        # ── Target: 6th frame ─────────────────────────────────────────────────
+        y_parts = []
+        for feat in self.FEATURES:
+            arr = grp[feat][self.TARGET_FRAME].astype(np.float32)   # (N, C)
+            if self._stats is not None:
+                arr = self._stats.normalize(feat, arr)
+            y_parts.append(arr)
+
+        y = np.concatenate(y_parts, axis=-1)    # (N, 15)
+
+        return torch.from_numpy(x), torch.from_numpy(y)
+
+    def __del__(self):
+        if self._file is not None:
+            try:
+                self._file.close()
+            except Exception:
+                pass
 
 
 # ── BVC Full-Trajectory Dataset ───────────────────────────────────────────────
 
-class BVCFullTrajectoryDataset(_BaseBVCMixin, BaseDataset):
-    """Full-trajectory HDF5 dataset for BVC evaluation / autoregressive rollout.
+class BVCFullTrajectoryDataset(BaseDataset):
+    """Full-trajectory dataset for autoregressive rollout evaluation.
 
-    Each ``__getitem__`` returns::
+    Each ``__getitem__`` returns a complete window as a dict of tensors,
+    suitable for step-by-step rollout evaluation.
+
+    Returns::
 
         {
-          "data": {feat: Tensor(T, N, C)},
-          "meta": {"window_idx": int, "num_particles": int, "batch_id": int, "window_name": str},
+          "positions":    FloatTensor (6, N, 3),  # normalized if stats provided
+          "velocity":     FloatTensor (6, N, 3),
+          "acceleration": FloatTensor (6, N, 3),
+          "stress":       FloatTensor (6, N, 6),
+          "meta":         {"window_name": str, "window_idx": int},
         }
 
     Args:
-        cfg: Must have ``cfg["data"]["path"]`` pointing to a split directory.
+        cfg: Must have:
+            - ``cfg["data"]["path"]``: path to h5 file
+            - ``cfg["data"]["metadata_path"]``: path to metadata.json
+            - ``cfg["data"]["normalize"]``: bool, default True
     """
 
-    def __init__(self, cfg):
+    FEATURES = ["positions", "velocity", "acceleration", "stress"]
+
+    def __init__(self, cfg: dict):
         super().__init__(cfg)
-        d = cfg["data"]
-        self.data_dir  = Path(d["path"])
-        self.normalize = d.get("normalize", True)
-        self._stats    = self._load_normalization_stats(str(self.data_dir)) if self.normalize else {}
+        data_cfg = cfg["data"]
 
-        split_name = self.data_dir.name
-        h5_files   = sorted(self.data_dir.glob(f"{split_name}_data_*.h5"))
-        if not h5_files:
-            fb = self.data_dir / f"{split_name}_data.h5"
-            h5_files = [fb] if fb.exists() else []
-        if not h5_files:
-            raise FileNotFoundError(f"No HDF5 files found in {self.data_dir}")
+        self.h5_path = Path(data_cfg["path"])
+        if not self.h5_path.exists():
+            raise FileNotFoundError(f"H5 file not found: {self.h5_path}")
 
-        self.h5_files = h5_files
-        self._file_window_map: list = []
-        self._total_windows = 0
-        self._available_features: list[str] = []
+        # Load normalization stats (shared with BVCDataset — same metadata.json)
+        self._stats: Optional[NormStats] = None
+        if data_cfg.get("normalize", True):
+            meta_path = data_cfg.get("metadata_path")
+            if meta_path:
+                self._stats = NormStats(meta_path)
 
-        for h5f in h5_files:
-            with h5py.File(h5f, "r") as f:
-                wnames = sorted(k for k in f if k.startswith("window_"))
-                self._file_window_map.append((h5f, wnames))
-                self._total_windows += len(wnames)
-                if wnames and not self._available_features:
-                    self._available_features = list(f[wnames[0]].keys())
+        with h5py.File(self.h5_path, "r") as f:
+            self._keys = sorted(k for k in f.keys() if k.startswith("window_"))
 
-        lf = d.get("load_features", None)
-        self.features = [x for x in lf if x in self._available_features] if lf else self._available_features
-        self.load_data()
+        if not self._keys:
+            raise ValueError(f"No window groups found in {self.h5_path}")
 
-    def load_data(self):
-        pass
+        self._file: Optional[h5py.File] = None
 
-    def __len__(self):
-        return self._total_windows
+    def __len__(self) -> int:
+        return len(self._keys)
 
-    def __getitem__(self, idx: int) -> dict:
-        cumulative = 0
-        for h5f, wnames in self._file_window_map:
-            if cumulative + len(wnames) > idx:
-                wname = wnames[idx - cumulative]
-                break
-            cumulative += len(wnames)
+    def _get_file(self) -> h5py.File:
+        if self._file is None:
+            self._file = h5py.File(self.h5_path, "r")
+        return self._file
 
-        with h5py.File(h5f, "r") as f:
-            grp = f[wname]
-            data = {}
-            for feat in self.features:
-                if feat in grp:
-                    arr = self.normalize_feature(grp[feat][:], feat)
-                    data[feat] = torch.from_numpy(arr).float()
-            n_particles = int(grp.attrs.get("num_particles", 0))
-            batch_id    = int(grp.attrs.get("batch_id", 0))
+    def __getitem__(self, idx: int) -> Dict[str, object]:
+        """Return full 6-frame window for rollout evaluation."""
+        f     = self._get_file()
+        wname = self._keys[idx]
+        grp   = f[wname]
 
-        return {
-            "data": data,
-            "meta": {
-                "window_idx": idx, "num_particles": n_particles,
-                "batch_id": batch_id, "window_name": wname,
-            },
-        }
+        data = {}
+        for feat in self.FEATURES:
+            arr = grp[feat][:].astype(np.float32)   # (6, N, C)
+            if self._stats is not None:
+                arr = self._stats.normalize(feat, arr)
+            data[feat] = torch.from_numpy(arr)
+
+        data["meta"] = {"window_name": wname, "window_idx": idx}
+        return data
+
+    def __del__(self):
+        if self._file is not None:
+            try:
+                self._file.close()
+            except Exception:
+                pass
 
 
 # ── DataLoader factory ────────────────────────────────────────────────────────
 
 _DATASET_MAP = {
-    "bvc_window":     BVCWindowDataset,
+    "bvc":            BVCDataset,
     "bvc_trajectory": BVCFullTrajectoryDataset,
-    "h5":             H5Dataset,
 }
 
 
 def build_dataloader(cfg: dict, split: str = "train") -> torch.utils.data.DataLoader:
     """Build a DataLoader for the given split.
+
+    Expects h5 files at:
+        ``{cfg["data"]["base_path"]}/{split}/{split}_data.h5``
 
     Args:
         cfg:   Full config dict with ``cfg["data"]`` and ``cfg["train"]`` sections.
@@ -295,23 +343,41 @@ def build_dataloader(cfg: dict, split: str = "train") -> torch.utils.data.DataLo
 
     Returns:
         torch.utils.data.DataLoader
+
+    Example::
+
+        train_loader = build_dataloader(cfg, split="train")
+        val_loader   = build_dataloader(cfg, split="val")
+
+        for x, y in train_loader:
+            # x: (B, N, 75)
+            # y: (B, N, 15)
     """
     data_cfg  = cfg.get("data", {})
     train_cfg = cfg.get("train", {})
 
-    dataset_type = data_cfg.get("dataset_type", "bvc_window")
-    dataset_cls  = _DATASET_MAP.get(dataset_type, BVCWindowDataset)
+    dataset_type = data_cfg.get("dataset_type", "bvc")
+    dataset_cls  = _DATASET_MAP.get(dataset_type)
+    if dataset_cls is None:
+        raise ValueError(
+            f"Unknown dataset_type '{dataset_type}'. "
+            f"Available: {list(_DATASET_MAP.keys())}"
+        )
 
-    base_path = data_cfg.get("base_path", data_cfg.get("path", "dataset/data_processed"))
-    split_cfg = {**data_cfg, "path": str(Path(base_path) / split)}
-    split_cfg_wrapped = {**cfg, "data": split_cfg}
+    # Build per-split h5 path: base_path/split/split_data.h5
+    base_path = Path(data_cfg.get("base_path", "dataset/data_processed"))
+    h5_path   = base_path / f"{split}" / f"{split}_data_000.h5" #TODO: support multiple files per split (e.g. _000, _001, ...)
 
-    dataset = dataset_cls(split_cfg_wrapped)
+    split_cfg = {**cfg, "data": {**data_cfg, "path": str(h5_path)}}
+    dataset   = dataset_cls(split_cfg)
+
+    is_train  = (split == "train")
+    batch_size = train_cfg.get("batch_size", 1) if is_train else 1
 
     return torch.utils.data.DataLoader(
         dataset,
-        batch_size  = train_cfg.get("batch_size", 1) if split == "train" else 1,
-        shuffle     = (split == "train"),
+        batch_size  = batch_size,
+        shuffle     = is_train,
         num_workers = data_cfg.get("num_workers", 0),
         pin_memory  = data_cfg.get("pin_memory", True),
     )

@@ -1,0 +1,17 @@
+name: dyna_builder
+channels:
+  - conda-forge
+dependencies:
+  - python=3.11
+  - pip
+  - pip:
+      - lasso-python==2.0.4
+      - numpy
+      - scipy
+      - pandas
+      - h5py
+      - matplotlib
+      - plotly
+      - imageio
+      - tqdm
+      - pyyaml
