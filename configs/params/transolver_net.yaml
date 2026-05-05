@@ -33,14 +33,14 @@ train:
   lr: 0.001
   weight_decay: 0.0
   batch_size: 4
-  ntraining_steps: 100
+  ntraining_steps: 10000
   nsave_steps: 100        # 验证频率（同时触发 checkpoint 保存）
   noise_std: 0.0
   inference_mode: autoregressive
 
   # ── 损失权重 ──────────────────────────────────────────────────────────
   loss_weight_position: 1.0
-  loss_weight_strain: 0.0
+  loss_weight_strain: 1.0
 
   # ── 学习率调度 ────────────────────────────────────────────────────────
   scheduler: step_lr
