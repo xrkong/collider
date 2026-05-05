@@ -11,7 +11,7 @@ model:
   nnode_out_features: 15 
 
   # ── 网络结构 ──────────────────────────────────────────────────────────
-  hidden_dim: 384
+  hidden_dim: 128
   layers: 8            # nmessage_passing_steps (Transolver blocks 数)
   nmlp_layers: 4
   num_heads: 8
@@ -20,27 +20,17 @@ model:
   mlp_ratio: 2
   block_act: silu
 
-  # ── 多尺度图参数 ───────────────────────────────────────────────────────
-  num_scales: 2
-  window_size: 6
-  radius_multiplier: 2.0
-
-  # ── 粒子类型嵌入 ───────────────────────────────────────────────────────
-  particle_type_embedding_size: 9
-
 train:
   optimizer: adam
   lr: 0.001
   weight_decay: 0.0
   batch_size: 4
   ntraining_steps: 10000
-  nsave_steps: 100        # 验证频率（同时触发 checkpoint 保存）
-  noise_std: 0.0
-  inference_mode: autoregressive
+  nsave_steps: 100       
 
   # ── 损失权重 ──────────────────────────────────────────────────────────
   loss_weight_position: 1.0
-  loss_weight_strain: 1.0
+  loss_weight_strain: 0.0
 
   # ── 学习率调度 ────────────────────────────────────────────────────────
   scheduler: step_lr
