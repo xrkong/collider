@@ -200,34 +200,32 @@ class BVCDataset(BaseDataset):
             self._file = h5py.File(self.h5_path, "r")
         return self._file
 
-    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Return (x, y) tensors for one window.
-
-        Returns:
-            x: FloatTensor of shape (N, 75) — 5-frame input, normalized
-            y: FloatTensor of shape (N, 15) — target frame, normalized
-        """
+    def __getitem__(self, idx):
         f   = self._get_file()
         grp = f[self._keys[idx]]
 
-        # ── Input: first 5 frames ─────────────────────────────────────────────
+        # ── Input: 前5帧（不变）─────────────────────────
         x_parts = []
         for feat in self.FEATURES:
-            arr = grp[feat][:self.INPUT_FRAMES].astype(np.float32)  # (5, N, C)
+            arr = grp[feat][:self.INPUT_FRAMES].astype(np.float32)
             if self._stats is not None:
                 arr = self._stats.normalize(feat, arr)
             x_parts.append(arr)
-
         x = np.concatenate(x_parts, axis=-1)   # (5, N, 15)
         x = x.reshape(x.shape[1], -1)           # (N, 75)
 
-        # ── Target: 6th frame ─────────────────────────────────────────────────
+        # ── Target: 残差 = frame 6 - frame 5 ─────────────
         y_parts = []
         for feat in self.FEATURES:
-            arr = grp[feat][self.TARGET_FRAME].astype(np.float32)   # (N, C)
+            frame_6 = grp[feat][self.TARGET_FRAME].astype(np.float32)   # (N, C)
+            frame_5 = grp[feat][self.INPUT_FRAMES - 1].astype(np.float32) # (N, C)
+            
             if self._stats is not None:
-                arr = self._stats.normalize(feat, arr)
-            y_parts.append(arr)
+                frame_6 = self._stats.normalize(feat, frame_6)
+                frame_5 = self._stats.normalize(feat, frame_5)
+            
+            residual = frame_6 - frame_5   # (N, C) 在 normalized space 算残差
+            y_parts.append(residual)
 
         y = np.concatenate(y_parts, axis=-1)    # (N, 15)
 

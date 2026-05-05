@@ -6,6 +6,7 @@ import os
 import subprocess
 import sys
 from pathlib import Path
+from xml.parsers.expat import model
 
 import torch
 import torch.nn.functional as F
@@ -273,7 +274,12 @@ def run_validation(
 
     for x, y in val_loader:
         x, y = x.to(device), y.to(device)
-        pred = model(x)
+        # pred = model(x)
+
+        # TODO modify evaluate.py 和 rollout.py 里
+        pred_residual = model(x)              # (B, N, 15) 残差
+        last_frame    = x[..., -15:]          # 取输入的最后一帧 (B, N, 15)
+        pred = pred_residual + last_frame   # 还原绝对值 (B, N, 15)
 
         loss, log = compute_loss(
             pred, y, norm_stats,
@@ -281,9 +287,9 @@ def run_validation(
             loss_w_vm=loss_w_vm,
             device=device,
         )
-        tracker.update("val/loss",     loss.item(),        n=x.size(0))
-        tracker.update("val/loss_mse", log["loss_mse"],    n=x.size(0))
-        tracker.update("val/loss_vm",  log["loss_vm"],     n=x.size(0))
+        tracker.update("loss",     loss.item(),        n=x.size(0))
+        tracker.update("loss_mse", log["loss_mse"],    n=x.size(0))
+        tracker.update("loss_vm",  log["loss_vm"],     n=x.size(0))
 
     return tracker.compute()
 
