@@ -1,0 +1,13 @@
+name: "exp_03"
+description: "transolver net lower learning rate"
+
+model:
+  name: "transolver_net"                        # registry key
+  params: "configs/params/transolver_net.yaml"  # base params file
+
+overrides:
+  train.lr: 0.0001
+  model.dropout: 0.2
+  train.batch_size: 2
+
+notes: "First experiment. Comparing against SGD baseline in exp_002."

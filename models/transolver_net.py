@@ -90,7 +90,7 @@ class TransolverNet(nn.Module):
         out = self.output_head(tokens)
         return out.squeeze(0) if squeeze else out
 
-
+@register("temporal_transolver_net")
 class TemporalTransolverNet(nn.Module):
     """Temporal attention over T frames → spatial Transolver.
 
