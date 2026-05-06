@@ -176,135 +176,57 @@ def upload_artifact(cfg: dict, run, git_commit: str, val_loss: float):
 
 
 # ── Loss functions ────────────────────────────────────────────────────────────
+def relative_l2_loss(pred: torch.Tensor, target: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
+    """Per-sample relative L2, averaged over batch.
 
-# Target vector layout (15 dims):
-#   positions    [0:3]
-#   velocity     [3:6]
-#   acceleration [6:9]
-#   stress       [9:15]   ← Voigt: sxx, syy, szz, sxy, syz, sxz
-
-
-def _von_mises(stress: torch.Tensor) -> torch.Tensor:
-    """Von Mises scalar from 6-component Voigt stress [..., 6].
-
-    Args:
-        stress: Tensor of shape (..., 6) in order [sxx, syy, szz, sxy, syz, sxz].
-
-    Returns:
-        Tensor of shape (...,) with Von Mises stress values.
+    pred, target: (B, N, D)  — same shape
+    Returns: scalar
     """
-    s = stress
-    return torch.sqrt(0.5 * (
-        (s[..., 0] - s[..., 1]) ** 2
-        + (s[..., 1] - s[..., 2]) ** 2
-        + (s[..., 2] - s[..., 0]) ** 2
-        + 6.0 * (s[..., 3] ** 2 + s[..., 4] ** 2 + s[..., 5] ** 2)
-    ) + 1e-12)
+    B = pred.shape[0]
+    diff = (pred - target).reshape(B, -1)
+    targ = target.reshape(B, -1)
+    num = torch.linalg.norm(diff, dim=-1)
+    den = torch.linalg.norm(targ, dim=-1).clamp(min=eps)
+    return (num / den).mean()
 
-_POS_S, _POS_E = 0, 3
-_VEL_S, _VEL_E = 3, 6
-_ACC_S, _ACC_E = 6, 9
-_STR_S, _STR_E = 9, 15
+def compute_loss(pred: torch.Tensor, target: torch.Tensor) -> tuple[torch.Tensor, dict]:
+    """Acceleration-only relative L2 loss.
 
-def compute_loss(
-    pred, target, norm_stats,
-    loss_w_pos:    float = 1.0,
-    loss_w_vel:    float = 1.0,
-    loss_w_acc:    float = 1.0,
-    loss_w_stress: float = 1.0,
-    loss_w_vm:     float = 1.0,
-    device:        torch.device = torch.device("cpu"),
-    ):
-    loss_pos    = F.mse_loss(pred[..., _POS_S:_POS_E], target[..., _POS_S:_POS_E])
-    loss_vel    = F.mse_loss(pred[..., _VEL_S:_VEL_E], target[..., _VEL_S:_VEL_E])
-    loss_acc    = F.mse_loss(pred[..., _ACC_S:_ACC_E], target[..., _ACC_S:_ACC_E])
+    pred, target: (B, N, D_acc)
+    """
+    loss = relative_l2_loss(pred, target)
+    return loss, {"loss_acc_relL2": loss.item}
 
-    pred_stress   = pred[...,   _STR_S:_STR_E]
-    target_stress = target[..., _STR_S:_STR_E]
-    loss_stress = F.mse_loss(pred_stress, target_stress)
 
-    # VM 在 normalized stress 空间算（数值稳定，不破坏梯度）
-    loss_vm = F.mse_loss(_von_mises(pred_stress), _von_mises(target_stress))
 
-    total = (loss_w_pos    * loss_pos
-           + loss_w_vel    * loss_vel
-           + loss_w_acc    * loss_acc
-           + loss_w_stress * loss_stress
-           + loss_w_vm     * loss_vm)
-
-    # 仅用于监控：denorm 后的 VM 量纲（MPa/Pa），方便看物理意义
-    with torch.no_grad():
-        pred_vm_phys   = _von_mises(norm_stats.denormalize_tensor("stress", pred_stress))
-        target_vm_phys = _von_mises(norm_stats.denormalize_tensor("stress", target_stress))
-
-    log = {
-        "loss_pos":    loss_pos.item(),
-        "loss_vel":    loss_vel.item(),
-        "loss_acc":    loss_acc.item(),
-        "loss_stress": loss_stress.item(),
-        "loss_vm":     loss_vm.item(),
-        "vm_pred_mean_phys":   pred_vm_phys.mean().item(),
-        "vm_target_mean_phys": target_vm_phys.mean().item(),
-    }
-    return total, log
 
 # ── Validation loop ───────────────────────────────────────────────────────────
 
 @torch.no_grad()
-def run_validation(
-    model, val_loader, norm_stats,
-    loss_w_pos, loss_w_vel, loss_w_acc, loss_w_stress, loss_w_vm,
-    device,
-    ) -> dict:
-    tracker = MetricTracker()
-
+def run_validation(model, val_loader, device) -> dict:
+    model.eval()
+    total, n_batches = 0.0, 0
     for x, y in val_loader:
         x, y = x.to(device), y.to(device)
-
-        pred_residual = model(x)
-        last_frame    = x[..., -15:]
-        pred = pred_residual + last_frame
-
-        loss, log = compute_loss(
-            pred, y, norm_stats,
-            loss_w_pos=loss_w_pos,
-            loss_w_vel=loss_w_vel,
-            loss_w_acc=loss_w_acc,
-            loss_w_stress=loss_w_stress,
-            loss_w_vm=loss_w_vm,
-            device=device,
-        )
-        bs = x.size(0)
-        tracker.update("loss",        loss.item(),         n=bs)
-        tracker.update("loss_pos",    log["loss_pos"],     n=bs)
-        tracker.update("loss_vel",    log["loss_vel"],     n=bs)
-        tracker.update("loss_acc",    log["loss_acc"],     n=bs)
-        tracker.update("loss_stress", log["loss_stress"],  n=bs)
-        tracker.update("loss_vm",     log["loss_vm"],      n=bs)
-
-    return tracker.compute()
+        pred = model(x)
+        loss, _ = compute_loss(pred, y)
+        total += loss.item()
+        n_batches += 1
+    return {"loss": total / max(n_batches, 1)}
 
 # ── Main training loop ────────────────────────────────────────────────────────
-
 def train(cfg: dict, git_commit: str = "unknown"):
-    """TransolverNet training loop.
+    """TransolverNet training loop (velocity → acceleration, relative L2).
 
     Data flow:
-        BVCDataset  →  (x: B,N,75)  →  TransolverNet  →  (pred: B,N,15)
-                       (y: B,N,15)  →  loss (MSE + Von Mises)
-
-    Returns:
-        best_val_loss (float)
+        BVCDataset  →  (x: B,N,D_vel)  →  TransolverNet  →  (pred: B,N,D_acc)
+                       (y: B,N,D_acc)  →  relative L2 loss
     """
     device    = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     train_cfg = cfg["train"]
     model_cfg = cfg["model"]
 
     print(f"[Train] Device: {device}")
-
-    # ── Normalization stats (for Von Mises denorm) ────────────────────────
-    meta_path  = cfg["data"]["metadata_path"]
-    norm_stats = NormStats(meta_path)
 
     # ── Build model ───────────────────────────────────────────────────────
     model = build_model(model_cfg["name"], cfg)
@@ -318,10 +240,15 @@ def train(cfg: dict, git_commit: str = "unknown"):
         lr=float(train_cfg["lr"]),
         weight_decay=float(train_cfg.get("weight_decay", 0.01)),
     )
-    scheduler = torch.optim.lr_scheduler.StepLR(
+    # scheduler = torch.optim.lr_scheduler.StepLR(
+    #     optimizer,
+    #     step_size=int(train_cfg.get("scheduler_step_size", 5000)),
+    #     gamma=float(train_cfg.get("scheduler_gamma", 0.8)),
+    # )
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
         optimizer,
-        step_size=int(train_cfg.get("scheduler_step_size", 5000)),
-        gamma=float(train_cfg.get("scheduler_gamma", 0.8)),
+        T_max=int(train_cfg.get("scheduler_step_size", 10000)), 
+        eta_min=float(train_cfg.get("min_lr", 1e-6))     
     )
 
     # ── Data ──────────────────────────────────────────────────────────────
@@ -330,16 +257,7 @@ def train(cfg: dict, git_commit: str = "unknown"):
     print(f"[Train] train={len(train_loader.dataset)} windows, "
           f"val={len(val_loader.dataset)} windows")
 
-    # ── Loss weights ──────────────────────────────────────────────────────
-    #   loss_weight_position: 1.0
-    #   loss_weight_strain: 0.0
-    loss_w_pos    = float(train_cfg.get("loss_weight_position",     1.0))
-    loss_w_vel    = float(train_cfg.get("loss_weight_velocity",     0.0))
-    loss_w_acc    = float(train_cfg.get("loss_weight_acceleration", 0.0))
-    loss_w_stress = float(train_cfg.get("loss_weight_stress",       1.0))
-    loss_w_vm     = float(train_cfg.get("loss_weight_vm",           1.0))
-
-    grad_clip  = float(train_cfg.get("grad_clip",          1.0))
+    grad_clip = float(train_cfg.get("grad_clip", 1.0))
 
     # ── Checkpoint state ──────────────────────────────────────────────────
     save_dir      = PROJECT_ROOT / "outputs" / "checkpoints" / cfg["name"]
@@ -368,28 +286,13 @@ def train(cfg: dict, git_commit: str = "unknown"):
                 if step >= nsteps:
                     break
 
-                x, y = x.to(device), y.to(device)   # (B, N, 75), (B, N, 15)
+                x, y = x.to(device), y.to(device)   # x: (B,N,D_vel), y: (B,N,D_acc)
 
                 # ── Forward ───────────────────────────────────────────────
-                pred = model(x)                       # (B, N, 15)
+                pred = model(x)                      # (B, N, D_acc)
 
-                # ── Loss ──────────────────────────────────────────────────
-                # loss, loss_log = compute_loss(
-                #     pred, y, norm_stats,
-                #     loss_w_mse=loss_w_mse,
-                #     loss_w_vm=loss_w_vm,
-                #     device=device,
-                # )
-
-                loss, loss_log = compute_loss(
-                    pred, y, norm_stats,
-                    loss_w_pos=loss_w_pos,
-                    loss_w_vel=loss_w_vel,
-                    loss_w_acc=loss_w_acc,
-                    loss_w_stress=loss_w_stress,
-                    loss_w_vm=loss_w_vm,
-                    device=device,
-                )
+                # ── Loss (Relative L2 on acceleration) ────────────────────
+                loss, _ = compute_loss(pred, y)
 
                 # ── Backward ──────────────────────────────────────────────
                 optimizer.zero_grad()
@@ -398,41 +301,22 @@ def train(cfg: dict, git_commit: str = "unknown"):
                 optimizer.step()
                 scheduler.step()
 
-                step    += 1
-                lr_now   = scheduler.get_last_lr()[0]
+                step  += 1
+                lr_now = scheduler.get_last_lr()[0]
 
                 # ── Step log ──────────────────────────────────────────────
                 wandb_log = {
-                    "train/loss":        loss.item(),
-                    "train/loss_pos":    loss_log["loss_pos"],
-                    "train/loss_vel":    loss_log["loss_vel"],
-                    "train/loss_acc":    loss_log["loss_acc"],
-                    "train/loss_stress": loss_log["loss_stress"],
-                    "train/loss_vm":     loss_log["loss_vm"],
-                    "train/vm_pred_phys":   loss_log["vm_pred_mean_phys"],
-                    "train/vm_target_phys": loss_log["vm_target_mean_phys"],
-                    "lr":                lr_now,
+                    "train/loss":            loss.item(),
+                    "lr":                    lr_now,
                 }
 
                 if step % 10 == 0:
                     print(f"[Train] Step {step}/{nsteps} | "
-                          f"loss={loss.item():.5f} | "
-                          f"pos={loss_log['loss_pos']:.5f} | "
-                        #   f"vel={loss_log['loss_vel']:.5f} | "
-                        #   f"acc={loss_log['loss_acc']:.5f} | "
-                        #   f"stress={loss_log['loss_stress']:.5f} | "
-                        #   f"vm={loss_log['loss_vm']:.5f} | "
-                          f"lr={lr_now:.2e}")
+                          f"loss={loss.item():.5f} | lr={lr_now:.2e}")
 
                 # ── Validation + checkpoint ───────────────────────────────
                 if step % nsave == 0:
-                    model.eval()
-
-                    val_metrics = run_validation(
-                        model, val_loader, norm_stats,
-                        loss_w_pos, loss_w_vel, loss_w_acc, loss_w_stress, loss_w_vm,
-                        device,
-                    )
+                    val_metrics = run_validation(model, val_loader, device)
                     val_loss = val_metrics["loss"]
 
                     meta_payload = {
@@ -469,11 +353,8 @@ def train(cfg: dict, git_commit: str = "unknown"):
                         tick = ""
 
                     print(f"[Val]   Step {step} | "
-                        f"val_loss={val_loss:.5f} | "
-                        f"pos={val_metrics['loss_pos']:.5f} | "
-                        f"stress={val_metrics['loss_stress']:.5f} | "
-                        f"vm={val_metrics['loss_vm']:.5f} | "
-                        f"best={best_val_loss:.5f} {tick}")
+                          f"val_loss={val_loss:.5f} | "
+                          f"best={best_val_loss:.5f} {tick}")
 
                     wandb_log.update({f"val/{k}": v for k, v in val_metrics.items()})
                     model.train()
@@ -486,7 +367,6 @@ def train(cfg: dict, git_commit: str = "unknown"):
 
     print(f"[Train] Done — best val_loss: {best_val_loss:.5f}")
     return best_val_loss
-
 
 # ── Entry point ───────────────────────────────────────────────────────────────
 

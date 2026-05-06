@@ -4,12 +4,12 @@ model:
   # ── 空间维度 ──────────────────────────────────────────────────────────
   dim: 3
   input_sequence_length: 5
-  nnode_in_features: 75 # 5 frame * 15 features (pos 3 + vel 3 + acc 3 + stress 6) = 75
-  nnode_out_features: 15 
+  nnode_in_features: 15 # 5 frame * 15 features (pos 3 + vel 3 + acc 3 + stress 6) = 75
+  nnode_out_features: 3 # 1 frame * acceleration = 3
 
   # ── 网络结构 ──────────────────────────────────────────────────────────
   hidden_dim: 128
-  layers: 8            # nmessage_passing_steps (Transolver blocks 数)
+  layers: 8            # number of transolver blocks
   nmlp_layers: 4
   num_heads: 8
   slice_num: 64
@@ -28,7 +28,7 @@ train:
   # ── 损失权重 ──────────────────────────────────────────────────────────
   loss_weight_position:     1.0
   loss_weight_velocity:     0.0    
-  loss_weight_acceleration: 0.0   
+  loss_weight_acceleration: 1.0   
   loss_weight_stress:       0.0
   loss_weight_vm:           0.0
 

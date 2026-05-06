@@ -8,7 +8,7 @@ import torch
 import torch.nn as nn
 
 from models.registry import register
-from models.blocks.transolver import Transolver_block
+from models.blocks.transolver import MLP, Physics_Attention_Irregular_Mesh, Transolver_block
 
 
 def build_mlp(
@@ -30,6 +30,7 @@ def build_mlp(
         mlp.add_module(f"Act-{i}", acts[i]())
     return mlp
 
+
 @register("transolver_net")
 class TransolverNet(nn.Module):
     """MLP encoder → Transolver blocks → MLP decoder (single-frame input).
@@ -48,7 +49,7 @@ class TransolverNet(nn.Module):
         nnode_in  = m["nnode_in_features"]
         nnode_out = m["nnode_out_features"]
         latent    = m["hidden_dim"]
-        nsteps    = m["layers"]
+        layers    = m["layers"]
         nmlp      = m.get("nmlp_layers", 2)
         heads     = m.get("num_heads", 8)
         dropout   = m.get("dropout", 0.0)
@@ -56,27 +57,33 @@ class TransolverNet(nn.Module):
         block_act = m.get("block_act", "gelu")
         slice_num = m.get("slice_num", 64)
 
-        self._init_network(nnode_in, nnode_out, latent, nsteps, nmlp,
+        self._init_network(nnode_in, nnode_out, latent, layers, 
                            heads, dropout, mlp_ratio, block_act, slice_num)
 
-    def _init_network(self, nnode_in, nnode_out, latent_dim, nmessage_passing_steps,
-                      nmlp_layers, num_heads, dropout, mlp_ratio, block_act, slice_num):
+    def _init_network(self, nnode_in, nnode_out, latent_dim, layers,
+                      num_heads, dropout, mlp_ratio, block_act, slice_num):
         if latent_dim % num_heads != 0:
             raise ValueError(f"hidden_dim ({latent_dim}) must be divisible by num_heads ({num_heads})")
 
-        self.input_proj = nn.Sequential(
-            build_mlp(nnode_in, [latent_dim] * nmlp_layers, latent_dim),
-            nn.LayerNorm(latent_dim),
-        )
-        self.blocks = nn.ModuleList([
-            Transolver_block(
-                num_heads=num_heads, hidden_dim=latent_dim, dropout=dropout,
-                act=block_act, mlp_ratio=mlp_ratio, last_layer=False,
-                out_dim=nnode_out, slice_num=slice_num,
+        self.input_proj = nn.Linear(nnode_in, latent_dim)
+
+        self.blocks = nn.ModuleList()
+        for i in range(layers):
+            is_last = (i == layers - 1)  
+            self.blocks.append(
+                Transolver_block(
+                    num_heads=num_heads, 
+                    hidden_dim=latent_dim, 
+                    dropout=dropout,
+                    act=block_act, 
+                    mlp_ratio=mlp_ratio, 
+                    last_layer=is_last,  
+                    out_dim=nnode_out, 
+                    slice_num=slice_num,
+                )
             )
-            for _ in range(nmessage_passing_steps)
-        ])
-        self.output_head = build_mlp(latent_dim, [latent_dim] * nmlp_layers, nnode_out)
+
+        # self.output_proj = nn.Linear(latent_dim, nnode_out)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Supports [N, C] or [B, N, C]."""
@@ -86,7 +93,8 @@ class TransolverNet(nn.Module):
         tokens = self.input_proj(x)
         for block in self.blocks:
             tokens = block(tokens)
-        out = self.output_head(tokens)
+        # out = self.output_proj(tokens)
+        out = tokens
         return out.squeeze(0) if squeeze else out
 
 @register("temporal_transolver_net")

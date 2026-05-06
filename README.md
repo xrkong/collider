@@ -29,7 +29,7 @@ For other versions, refer to [PyG installation guide](https://pytorch-geometric.
 
 ### 3. Training
 ```
-python train.py --experiment configs/experiments/exp_collider_001.yaml --skip-git-check
+python train.py --experiment configs/experiments/exp_06.yaml --skip-git-check
 ```
 
 
@@ -38,9 +38,9 @@ After training, you can evaluate the model on the test set and perform rollouts.
 
 ```
 python src/evaluate.py \
-    --checkpoint outputs/checkpoints/exp_collider_001/checkpoint-best.safetensors \
-    --experiment configs/experiments/exp_collider_001.yaml \
-    --output-dir outputs/eval/exp_collider_001
+    --checkpoint outputs/checkpoints/exp_06/checkpoint-best.safetensors \
+    --experiment configs/experiments/exp_06.yaml \
+    --output-dir outputs/eval/exp_06
 ```
 
 ### 5. Rollout 

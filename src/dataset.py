@@ -1,13 +1,3 @@
-# 迁移自: src/dataset.py
-# 改动内容:
-#   - 删除 BVCWindowDataset（数据已预切窗口，滑窗逻辑多余）
-#   - 删除 _BaseBVCMixin（normalize_feature 是 no-op，数据已预归一化）
-#   - 删除 H5Dataset（项目未使用）
-#   - BVCDataset: 修复 h5 文件句柄问题（lazy open，支持 num_workers > 0）
-#   - BVCDataset: 添加 z-score normalization，从 metadata.json 读取 stats
-#   - BVCFullTrajectoryDataset: 去掉 Mixin，简化为直接读取，同样支持 normalize
-#   - build_dataloader: 默认 dataset_type 改为 "bvc"
-
 from __future__ import annotations
 
 import abc
@@ -127,26 +117,19 @@ class BaseDataset(torch.utils.data.Dataset, abc.ABC):
 
 
 # ── BVC Training Dataset ──────────────────────────────────────────────────────
-
 class BVCDataset(BaseDataset):
-    """HDF5 dataset for TransolverNet training.
+    """HDF5 dataset for TransolverNet training (velocity → acceleration).
 
     Reads pre-windowed h5 files where each window has 6 frames.
     Splits into:
-        - x (input):  first 5 frames, all features concatenated → (N, 75)
-        - y (target): 6th frame, all features concatenated      → (N, 15)
+        - x (input):  velocity from first 5 frames → (N, 15)
+        - y (target): acceleration at 6th frame    → (N, 3)
 
-    Input feature layout  (75 dims per node):
-        positions    5 × 3 = 15
-        velocity     5 × 3 = 15
-        acceleration 5 × 3 = 15
-        stress       5 × 6 = 30
+    Input layout per node (15 dims):
+        [vx_t0, vy_t0, vz_t0, vx_t1, vy_t1, vz_t1, ..., vx_t4, vy_t4, vz_t4]
 
-    Target feature layout (15 dims per node):
-        positions    1 × 3 = 3
-        velocity     1 × 3 = 3
-        acceleration 1 × 3 = 3
-        stress       1 × 6 = 6
+    Target layout per node (3 dims):
+        [ax, ay, az]   (raw value at frame 6, not residual)
 
     Args:
         cfg: Must have:
@@ -159,9 +142,10 @@ class BVCDataset(BaseDataset):
         ``num_workers > 0`` in DataLoader.
     """
 
-    FEATURES     = ["positions", "velocity", "acceleration", "stress"]
-    INPUT_FRAMES = 5
-    TARGET_FRAME = 5   # 6th frame, 0-indexed
+    INPUT_FEATURE  = "velocity"
+    TARGET_FEATURE = "acceleration"
+    INPUT_FRAMES   = 5
+    TARGET_FRAME   = 5   # 6th frame, 0-indexed
 
     def __init__(self, cfg: dict):
         super().__init__(cfg)
@@ -171,7 +155,7 @@ class BVCDataset(BaseDataset):
         if not self.h5_path.exists():
             raise FileNotFoundError(f"H5 file not found: {self.h5_path}")
 
-        # Load normalization stats
+        # Load normalization stats (only needed for input + target features now)
         self._stats: Optional[NormStats] = None
         if data_cfg.get("normalize", True):
             meta_path = data_cfg.get("metadata_path")
@@ -204,32 +188,23 @@ class BVCDataset(BaseDataset):
         f   = self._get_file()
         grp = f[self._keys[idx]]
 
-        # ── Input: 前5帧（不变）─────────────────────────
-        x_parts = []
-        for feat in self.FEATURES:
-            arr = grp[feat][:self.INPUT_FRAMES].astype(np.float32)
-            if self._stats is not None:
-                arr = self._stats.normalize(feat, arr)
-            x_parts.append(arr)
-        x = np.concatenate(x_parts, axis=-1)   # (5, N, 15)
-        x = x.reshape(x.shape[1], -1)           # (N, 75)
+        # ── Input: velocity from first 5 frames ──────────────────────
+        vel = grp[self.INPUT_FEATURE][:self.INPUT_FRAMES].astype(np.float32)  # (5, N, 3)
+        if self._stats is not None:
+            vel = self._stats.normalize(self.INPUT_FEATURE, vel)
 
-        # ── Target: 残差 = frame 6 - frame 5 ─────────────
-        y_parts = []
-        for feat in self.FEATURES:
-            frame_6 = grp[feat][self.TARGET_FRAME].astype(np.float32)   # (N, C)
-            frame_5 = grp[feat][self.INPUT_FRAMES - 1].astype(np.float32) # (N, C)
-            
-            if self._stats is not None:
-                frame_6 = self._stats.normalize(feat, frame_6)
-                frame_5 = self._stats.normalize(feat, frame_5)
-            
-            residual = frame_6 - frame_5   # (N, C) 在 normalized space 算残差
-            y_parts.append(residual)
+        # (T, N, C) → (N, T, C) → (N, T*C)
+        # Per-node row: [v_t0_xyz, v_t1_xyz, ..., v_t4_xyz]
+        N = vel.shape[1]
+        x = vel.transpose(1, 0, 2).reshape(N, -1)   # (N, 15)
 
-        y = np.concatenate(y_parts, axis=-1)    # (N, 15)
+        # ── Target: acceleration at 6th frame (raw value, not residual) ─
+        acc = grp[self.TARGET_FEATURE][self.TARGET_FRAME].astype(np.float32)  # (N, 3)
+        if self._stats is not None:
+            acc = self._stats.normalize(self.TARGET_FEATURE, acc)
+        y = acc                                      # (N, 3)
 
-        return torch.from_numpy(x), torch.from_numpy(y)
+        return torch.from_numpy(x), torch.from_numpy(np.ascontiguousarray(y))
 
     def __del__(self):
         if self._file is not None:
@@ -237,7 +212,6 @@ class BVCDataset(BaseDataset):
                 self._file.close()
             except Exception:
                 pass
-
 
 # ── BVC Full-Trajectory Dataset ───────────────────────────────────────────────
 
@@ -332,15 +306,7 @@ _DATASET_MAP = {
 def build_dataloader(cfg: dict, split: str = "train") -> torch.utils.data.DataLoader:
     """Build a DataLoader for the given split.
 
-    Expects h5 files at:
-        ``{cfg["data"]["base_path"]}/{split}/{split}_data.h5``
-
-    Args:
-        cfg:   Full config dict with ``cfg["data"]`` and ``cfg["train"]`` sections.
-        split: ``"train"``, ``"val"``, or ``"test"``.
-
-    Returns:
-        torch.utils.data.DataLoader
+    ...
 
     Example::
 
@@ -348,9 +314,10 @@ def build_dataloader(cfg: dict, split: str = "train") -> torch.utils.data.DataLo
         val_loader   = build_dataloader(cfg, split="val")
 
         for x, y in train_loader:
-            # x: (B, N, 75)
-            # y: (B, N, 15)
+            # x: (B, N, 15)   — 5 frames of velocity
+            # y: (B, N, 3)    — acceleration at frame 6
     """
+    # ... rest unchanged
     data_cfg  = cfg.get("data", {})
     train_cfg = cfg.get("train", {})
 

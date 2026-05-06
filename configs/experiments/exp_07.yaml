@@ -1,4 +1,4 @@
-name: "exp_06"
+name: "exp_07"
 description: "Pure transolver with input of velocity, output of acceleration"
 
 model:
@@ -11,11 +11,13 @@ overrides:
   model.layers: 8            # number of transolver blocks
   model.nmlp_layers: 4
   model.num_heads: 8
-  model.slice_num: 32
+  model.slice_num: 64
 
 
   train.lr: 0.001
+  train.min_lr: 1e-6
   train.batch_size: 2
-  train.ntraining_steps: 5000
+  train.ntraining_steps: 10000
+  train.scheduler_step_size: 10000
 
 notes: "velocity -> acceleration, defualt optimizer, loss using Relative L2"

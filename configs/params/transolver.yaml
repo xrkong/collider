@@ -9,16 +9,14 @@ model:
 
   # ── 网络结构 ──────────────────────────────────────────────────────────
   hidden_dim: 128
-  layers: 8            # nmessage_passing_steps (Transolver blocks 数)
+  layers: 8            # number of Transolver blocks
   nmlp_layers: 4
   num_heads: 8
-  slice_num: 64
+  slice_num: 32
   dropout: 0.0
   mlp_ratio: 2
   block_act: silu
 
-  # self, num_heads, hidden_dim, dropout, act='gelu',
-  #                mlp_ratio=4, last_layer=False, out_dim=1, slice_num=32
 
 train:
   optimizer: adam
@@ -27,13 +25,6 @@ train:
   batch_size: 4
   ntraining_steps: 10000
   nsave_steps: 100       
-
-  # ── 损失权重 ──────────────────────────────────────────────────────────
-  loss_weight_position:     1.0
-  loss_weight_velocity:     0.0    
-  loss_weight_acceleration: 0.0   
-  loss_weight_stress:       0.0
-  loss_weight_vm:           0.0
 
   # ── 学习率调度 ────────────────────────────────────────────────────────
   scheduler: step_lr
