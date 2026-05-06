@@ -1,0 +1,23 @@
+name: "exp_08"
+description: "larger model"
+
+model:
+  name: "transolver_net"                        # registry key
+  params: "configs/params/transolver_net.yaml"  # base params file
+
+overrides:
+  model.hidden_dim: 256
+  model.dropout: 0.0
+  model.layers: 16            # number of transolver blocks
+  model.nmlp_layers: 4
+  model.num_heads: 16
+  model.slice_num: 64
+
+
+  train.lr: 0.001
+  train.min_lr: 1e-6
+  train.batch_size: 1
+  train.ntraining_steps: 1000
+  train.scheduler_step_size: 1000
+
+notes: "velocity -> acceleration, defualt optimizer, loss using Relative L2"
