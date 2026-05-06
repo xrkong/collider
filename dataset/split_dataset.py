@@ -16,11 +16,16 @@ can normalise on the fly however it wants.
 Output layout:
 
     <output_dir>/
-        train/train_data_000.h5   (window groups, raw values)
-        valid/valid_data_000.h5   (window groups, raw values)
-        test/test_data_000.h5     (full-trajectory groups, raw values)
+        train/train_data_000.h5   (window groups + sim_metadata group)
+        valid/valid_data_000.h5   (window groups + sim_metadata group)
+        test/test_data_000.h5     (full-trajectory groups + sim_metadata group)
         metadata.json
         metadata/metadata.json
+
+Each output h5 file contains a `sim_metadata/<sim_id>/` group with
+`barrier_idx` and `frontface_idx` for every sim that contributed at least
+one window to that file. Window groups carry `sim_id` in their attrs so the
+dataloader can look up the corresponding mask.
 
 To normalise downstream:
     x_norm = (x_raw - mean) / std
@@ -148,6 +153,26 @@ def _resolve_dt(h5_files: list[Path], user_dt: float | None) -> float | None:
 
 
 # ---------------------------------------------------------------------------
+# Per-sim metadata helpers (barrier / frontface masks)
+# ---------------------------------------------------------------------------
+
+def _read_sim_masks(h5_path: Path) -> dict[str, np.ndarray]:
+    """
+    Read per-sim node-level masks from a raw h5 file.
+
+    Returns a dict with int64 index arrays. Returns empty dict if the masks
+    aren't present (caller decides whether that's fatal).
+    """
+    masks: dict[str, np.ndarray] = {}
+    with h5py.File(h5_path, "r") as f:
+        for key in ("barrier_idx", "frontface_idx"):
+            ds_path = f"/metadata/{key}"
+            if ds_path in f:
+                masks[key] = f[ds_path][:].astype(np.int64)
+    return masks
+
+
+# ---------------------------------------------------------------------------
 # Statistics (computed for metadata only — NOT applied to written data)
 # ---------------------------------------------------------------------------
 
@@ -272,6 +297,28 @@ def _write_window(h5file, window_idx, data, attrs):
         grp.attrs[k] = v
 
 
+def _ensure_sim_metadata(
+    h5file: h5py.File,
+    sim_id: int,
+    sim_masks: dict[str, np.ndarray],
+):
+    """
+    Ensure /sim_metadata/<sim_id>/ exists in `h5file` and contains the
+    per-sim mask arrays. Idempotent — safe to call before every window write.
+
+    Stored once per output file per sim, regardless of how many windows the
+    sim contributes.
+    """
+    if not sim_masks:
+        return
+    grp_path = f"sim_metadata/{sim_id}"
+    if grp_path in h5file:
+        return
+    g = h5file.create_group(grp_path)
+    for key, arr in sim_masks.items():
+        g.create_dataset(key, data=arr)
+
+
 def _to_float32(arr: np.ndarray) -> np.ndarray:
     """Cast to float32 for storage; keeps physical units."""
     return arr.astype(np.float32, copy=False)
@@ -298,6 +345,7 @@ def build_dataset(
     train_ratio: float = 0.8,
     val_ratio: float = 0.1,
     windows_per_file: int = 500,
+    require_masks: bool = True,
 ):
     # ---------------- Validation ----------------
     if split_mode not in ("temporal", "by_simulation"):
@@ -336,6 +384,24 @@ def build_dataset(
         print(f"  split_gap          = {split_gap} windows")
     print(f"  max_frames_per_sim = {max_frames_per_sim}")
     print(f"  output: RAW (un-normalised) — stats stored in metadata for downstream use")
+
+    # -----------------------------------------------------------------------
+    # Pre-pass — load per-sim masks (small, do it once)
+    # -----------------------------------------------------------------------
+    print("\nLoading per-sim barrier / frontface masks...")
+    all_sim_masks: dict[int, dict[str, np.ndarray]] = {}
+    for sim_idx, h5_path in enumerate(h5_files):
+        masks = _read_sim_masks(h5_path)
+        if not masks:
+            msg = (f"  {h5_path.name}: no /metadata/barrier_idx or "
+                   f"/metadata/frontface_idx found")
+            if require_masks:
+                sys.exit(msg + "  (set require_masks=False to allow)")
+            print(msg + "  (skipping mask propagation for this sim)")
+        else:
+            print(f"  {h5_path.name}: barrier={masks.get('barrier_idx', np.array([])).size}, "
+                  f"frontface={masks.get('frontface_idx', np.array([])).size}")
+        all_sim_masks[sim_idx] = masks
 
     # -----------------------------------------------------------------------
     # PASS 1 — Compute stats from TRAINING data only (for metadata)
@@ -433,6 +499,8 @@ def build_dataset(
             print(f"  Skipping: not enough frames for one window of size {window_size}")
             continue
 
+        sim_masks = all_sim_masks.get(sim_idx, {})
+
         base_attrs = {
             "sim_id": sim_idx,
             "num_particles": N,
@@ -462,6 +530,7 @@ def build_dataset(
             # train
             for s, e in train_wins:
                 h5 = get_handle("train")
+                _ensure_sim_metadata(h5, sim_idx, sim_masks)
                 _write_window(
                     h5, global_idx["train"],
                     {k: _to_float32(raw[k][s:e]) for k in raw},
@@ -473,6 +542,7 @@ def build_dataset(
             # val
             for s, e in val_wins:
                 h5 = get_handle("valid")
+                _ensure_sim_metadata(h5, sim_idx, sim_masks)
                 _write_window(
                     h5, global_idx["valid"],
                     {k: _to_float32(raw[k][s:e]) for k in raw},
@@ -484,6 +554,7 @@ def build_dataset(
             # test trajectory (one per sim)
             if test_end - test_start >= window_size:
                 h5 = get_handle("test")
+                _ensure_sim_metadata(h5, sim_idx, sim_masks)
                 _write_window(
                     h5, global_idx["test"],
                     {k: _to_float32(raw[k][test_start:test_end]) for k in raw},
@@ -502,6 +573,7 @@ def build_dataset(
             if assignment in ("train", "valid"):
                 for s, e in windows:
                     h5 = get_handle(assignment)
+                    _ensure_sim_metadata(h5, sim_idx, sim_masks)
                     _write_window(
                         h5, global_idx[assignment],
                         {k: _to_float32(raw[k][s:e]) for k in raw},
@@ -512,6 +584,7 @@ def build_dataset(
                 print(f"  Wrote {len(windows)} {assignment} windows")
             else:  # test
                 h5 = get_handle("test")
+                _ensure_sim_metadata(h5, sim_idx, sim_masks)
                 _write_window(
                     h5, global_idx["test"],
                     {k: _to_float32(raw[k][:T_eff]) for k in raw},
@@ -563,6 +636,14 @@ def build_dataset(
             "val_windows":       global_idx["valid"],
             "test_trajectories": global_idx["test"],
             "test_traj_lengths": test_traj_lens,
+        },
+        # Per-sim mask sizes for quick sanity checking from metadata alone.
+        "sim_mask_info": {
+            str(sim_idx): {
+                key: int(arr.size) for key, arr in masks.items()
+            }
+            for sim_idx, masks in all_sim_masks.items()
+            if masks
         },
     }
 
@@ -631,6 +712,9 @@ def main():
     parser.add_argument("--train_ratio",      type=float, default=0.8)
     parser.add_argument("--val_ratio",        type=float, default=0.1)
     parser.add_argument("--windows_per_file", type=int,   default=500)
+    parser.add_argument("--allow_missing_masks", action="store_true",
+                        help="Don't fail if /metadata/barrier_idx or "
+                             "/metadata/frontface_idx is missing in an input file.")
 
     args = parser.parse_args()
 
@@ -648,6 +732,7 @@ def main():
         train_ratio=args.train_ratio,
         val_ratio=args.val_ratio,
         windows_per_file=args.windows_per_file,
+        require_masks=not args.allow_missing_masks,
     )
 
 

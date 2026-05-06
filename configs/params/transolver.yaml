@@ -4,7 +4,7 @@ model:
   # ── 空间维度 ──────────────────────────────────────────────────────────
   dim: 3
   input_sequence_length: 5
-  nnode_in_features: 15 # 5 frame * positions = 15
+  nnode_in_features: 25 # 5 frame * positions + distance + flag = 25
   nnode_out_features: 3 # 1 frame * acceleration = 3
 
   # ── 网络结构 ──────────────────────────────────────────────────────────

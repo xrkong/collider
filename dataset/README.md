@@ -5,6 +5,7 @@ Build barrier vehicle collision dataset from LS-DYNA d3plot files. Export the da
 conda environment:
 ```bash
 conda env create -f dataset/environment.yml
+conda activate dyna_builder
 ```
 
 
@@ -22,9 +23,9 @@ python dataset/d3plot_to_h5.py \
 Split dataset into train/val/test:
 ```bash
 python dataset/split_dataset.py \
-    --input_dir /home/kong/datasets/barrier/h5/T_lok_F_shape_barrier_9_3_100km_50_2 \
-    --output_dir /home/kong/datasets/barrier/split_data/T_lok_F_shape_barrier_9_3_100km_50_2 \
-    --5 5 \
+    --input_dir /home/kong/datasets/barrier/h5/T_lok_F_shape_barrier_9_3_100km \
+    --output_dir /home/kong/datasets/barrier/split_data/T_lok_F_shape_barrier_9_3_100km \
+    --context_length 5 \
     --prediction_horizon 1 \
     --frame_skip 1 \
     --split_mode temporal \

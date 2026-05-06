@@ -180,18 +180,6 @@ def build_velocity_input(normed_v: np.ndarray, t_last: int) -> torch.Tensor:
     return torch.from_numpy(np.ascontiguousarray(x)).float().unsqueeze(0)
 
 
-# def build_input_tensor(normed: dict, t: int) -> torch.Tensor:
-#     """Build (1, N, 75) input tensor from frames [t-4 .. t] (5 frames)."""
-#     assert t >= INPUT_FRAMES - 1, f"Not enough frames before t={t}"
-#     parts = []
-#     for feat in FEATURES:
-#         frames = normed[feat][t - INPUT_FRAMES + 1: t + 1]   # (5, N, C)
-#         parts.append(frames)
-#     x = np.concatenate(parts, axis=-1)   # (5, N, 15)
-#     x = x.reshape(x.shape[1], -1)        # (N, 75)
-#     return torch.from_numpy(x).float().unsqueeze(0)  # (1, N, 75)
-
-
 def build_velocity_input_from_window(window: np.ndarray) -> torch.Tensor:
     """从 (5, N, 3) 归一化速度窗口构造 (1, N, 15)."""
     N = window.shape[1]
@@ -524,9 +512,12 @@ def render_vis(
 
     # Exact raw limits (No padding) to avoid distortion
     all_pos  = np.concatenate([pred_pos, gt_pos], axis=0)
-    x_range  = (all_pos[:, :, 0].min(), all_pos[:, :, 0].max())
-    y_range  = (all_pos[:, :, 1].min(), all_pos[:, :, 1].max())
-    z_range  = (all_pos[:, :, 2].min(), all_pos[:, :, 2].max())
+    # x_range  = (all_pos[:, :, 0].min(), all_pos[:, :, 0].max())
+    # y_range  = (all_pos[:, :, 1].min(), all_pos[:, :, 1].max())
+    # z_range  = (all_pos[:, :, 2].min(), all_pos[:, :, 2].max())
+    x_range = (-14000, 20000)
+    y_range = (-10000, 8000)
+    z_range = (-500, 4000)
 
     # Visual Setup
     plt.rcParams['font.family'] = 'Times New Roman'
@@ -723,6 +714,7 @@ def main():
     print(f"[Rollout] Inference done in {time.time() - t0:.1f}s")
 
     # ── GIF ───────────────────────────────────────────────────────────────
+    _DPI = 120
     if args.gif:
         if onestep is not None:
             render_vis(
@@ -730,7 +722,7 @@ def main():
                 out_path          = str(out_dir / "onestep.gif"),
                 fps               = args.gif_fps,
                 max_frames        = args.gif_max_frames,
-                dpi               = 50,  # 提高 DPI 以获得极高的清晰度
+                dpi               = _DPI,  # 提高 DPI 以获得极高的清晰度
                 group_config_path = "configs/data/required_parts.config", # 指向你的配置文件
                 save_png_dir      = str(out_dir / "onestep_pngs")    # 生成同名文件夹存放 PNG
             )
@@ -740,7 +732,7 @@ def main():
                 out_path          = str(out_dir / "autoregressive.gif"),
                 fps               = args.gif_fps,
                 max_frames        = args.gif_max_frames,
-                dpi               = 50,  # 提高 DPI 以获得极高的清晰度
+                dpi               = _DPI,  # 提高 DPI 以获得极高的清晰度
                 group_config_path = "configs/data/required_parts.config", # 指向你的配置文件
                 save_png_dir      = str(out_dir / "autoregressive_pngs")    # 生成同名文件夹存放 PNG
             )

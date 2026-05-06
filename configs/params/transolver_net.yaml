@@ -31,6 +31,7 @@ train:
   loss_weight_acceleration: 1.0   
   loss_weight_stress:       0.0
   loss_weight_vm:           0.0
+  collision_weight: 5.0 
 
   # ── 学习率调度 ────────────────────────────────────────────────────────
   scheduler: step_lr
@@ -47,6 +48,8 @@ data:
   dataset_type: bvc 
   num_workers: 0
   pin_memory: true
+  collision_threshold: 100.0
+  normalize_dist: false
 
 wandb:
   project: barrier-vehicle-collision
