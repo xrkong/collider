@@ -42,8 +42,8 @@ train:
   keep_top_k: 3       # 保留 val_loss 最低的 K 个 checkpoint
 
 data:
-  base_path: "/home/kong/datasets/barrier/split_data/T_lok_F_shape_barrier_9_3_100km_50_2/"
-  metadata_path: "/home/kong/datasets/barrier/split_data/T_lok_F_shape_barrier_9_3_100km_50_2/metadata.json"
+  base_path: "/home/kong/datasets/barrier/split_data/T_lok_F_shape_barrier_9_3_100km/"
+  metadata_path: "/home/kong/datasets/barrier/split_data/T_lok_F_shape_barrier_9_3_100km/metadata.json"
   dataset_type: bvc 
   num_workers: 0
   pin_memory: true
