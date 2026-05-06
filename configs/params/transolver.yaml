@@ -1,14 +1,11 @@
-# 迁移自: sgnn/transolver/multi_scale_config.yaml
-# 改动内容: 拆分为 model / train / data 三段；将硬编码参数移入此文件
-
 model:
-  name: transolver_net
+  name: transolver
 
   # ── 空间维度 ──────────────────────────────────────────────────────────
   dim: 3
   input_sequence_length: 5
-  nnode_in_features: 75 # 5 frame * 15 features (pos 3 + vel 3 + acc 3 + stress 6) = 75
-  nnode_out_features: 15 
+  nnode_in_features: 15 # 5 frame * positions = 15
+  nnode_out_features: 3 # 1 frame * acceleration = 3
 
   # ── 网络结构 ──────────────────────────────────────────────────────────
   hidden_dim: 128
@@ -20,6 +17,9 @@ model:
   mlp_ratio: 2
   block_act: silu
 
+  # self, num_heads, hidden_dim, dropout, act='gelu',
+  #                mlp_ratio=4, last_layer=False, out_dim=1, slice_num=32
+
 train:
   optimizer: adam
   lr: 0.001
@@ -29,8 +29,11 @@ train:
   nsave_steps: 100       
 
   # ── 损失权重 ──────────────────────────────────────────────────────────
-  loss_weight_position: 1.0
-  loss_weight_strain: 0.0
+  loss_weight_position:     1.0
+  loss_weight_velocity:     0.0    
+  loss_weight_acceleration: 0.0   
+  loss_weight_stress:       0.0
+  loss_weight_vm:           0.0
 
   # ── 学习率调度 ────────────────────────────────────────────────────────
   scheduler: step_lr

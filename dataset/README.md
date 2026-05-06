@@ -24,7 +24,7 @@ Split dataset into train/val/test:
 python dataset/split_dataset.py \
     --input_dir /home/kong/datasets/barrier/h5/T_lok_F_shape_barrier_9_3_100km_50_2 \
     --output_dir /home/kong/datasets/barrier/split_data/T_lok_F_shape_barrier_9_3_100km_50_2 \
-    --context_length 5 \
+    --5 5 \
     --prediction_horizon 1 \
     --frame_skip 1 \
     --split_mode temporal \

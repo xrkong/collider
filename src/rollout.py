@@ -1,19 +1,19 @@
-"""Autoregressive rollout — runs long-horizon inference on test data.
+"""Rollout visualization — runs one-step and autoregressive inference on raw h5 data.
+
+Reads the original full-trajectory h5 (251 frames, not pre-windowed),
+renders left=pred / right=gt GIFs colored by part, saves PKL + console stats.
 
 Usage:
-    # From W&B artifact
-    python src/rollout.py \\
-        --artifact "my-project/transolver_net:best" \\
-        --input /scratch/datasets/dataset_v1/test/test_data.h5
+    python src/rollout.py \
+        --checkpoint outputs/checkpoints/exp_05/checkpoint-best.safetensors \
+        --experiment configs/experiments/exp_05_pos_vm_loss.yaml \
+        --raw-h5 /home/kong/datasets/barrier/h5/T_lok_F_shape_barrier_9_3_100km_50_2/output.h5 \
+        --mode both \
+        --gif --gif-fps 10 \
+        --color-by part
 
-    # From local checkpoint (no W&B needed)
-    python src/rollout.py \\
-        --checkpoint outputs/checkpoints/exp_001/checkpoint-best.safetensors \\
-        --experiment configs/experiments/exp_001.yaml \\
-        --input /scratch/datasets/dataset_v1/test/test_data.h5
-
-    # List all available W&B versions
-    python src/rollout.py --artifact "transolver_net" --list-versions
+    # color by Von Mises stress instead of part
+    python src/rollout.py ... --color-by vm
 """
 
 from __future__ import annotations
@@ -24,6 +24,8 @@ import pickle
 import sys
 import time
 from pathlib import Path
+from typing import Literal
+from PIL import Image
 
 import numpy as np
 import torch
@@ -32,15 +34,29 @@ import torch.nn.functional as F
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
-import models  # noqa: F401 — fills registry
+import models  # noqa: F401
 from models.registry import build_model
 from src.dataset import NormStats
 
 try:
-    import wandb
-    _WANDB = True
+    import h5py
+    _H5PY = True
 except ImportError:
-    _WANDB = False
+    _H5PY = False
+    print("ERROR: h5py required — pip install h5py")
+
+try:
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    import matplotlib.colors as mcolors
+    from matplotlib.lines import Line2D
+    from PIL import Image
+    import io
+    _VIS = True
+except ImportError:
+    _VIS = False
+    print("Warning: matplotlib/Pillow not installed — GIF will be skipped")
 
 try:
     from safetensors.torch import load_file as _st_load
@@ -48,12 +64,22 @@ try:
 except ImportError:
     _SAFETENSORS = False
 
+# ── Constants ─────────────────────────────────────────────────────────────────
+
+INPUT_FRAMES  = 5
+FEATURES      = ["positions", "velocity", "acceleration", "stress"]
+FEAT_DIMS     = {"positions": 3, "velocity": 3, "acceleration": 3, "stress": 6}
+FEAT_SLICES   = {
+    "positions":    (0,  3),
+    "velocity":     (3,  6),
+    "acceleration": (6,  9),
+    "stress":       (9,  15),
+}
 _STRESS_START = 9
 _STRESS_END   = 15
-_INPUT_FRAMES = 5
 
 
-# ── Shared: build model and load weights ──────────────────────────────────────
+# ── Model loading ─────────────────────────────────────────────────────────────
 
 def _build_and_load(model_name: str, cfg: dict, weights_path: Path) -> torch.nn.Module:
     model = build_model(model_name, cfg)
@@ -65,56 +91,8 @@ def _build_and_load(model_name: str, cfg: dict, weights_path: Path) -> torch.nn.
     return model
 
 
-# ── Loading path A: W&B artifact ─────────────────────────────────────────────
-
-def load_model_for_inference(artifact_str: str, device: torch.device):
-    """Download versioned artifact from W&B and reconstruct the model.
-
-    Returns:
-        Tuple[nn.Module, dict]: model in eval mode, config dict.
-    """
-    if not _WANDB:
-        raise ImportError("wandb is required: pip install wandb")
-
-    run      = wandb.init(job_type="inference")
-    artifact = run.use_artifact(artifact_str, type="model")
-    art_dir  = Path(artifact.download())
-
-    print(f"[Rollout] Artifact:   {artifact_str}")
-    print(f"[Rollout] Version:    {artifact.version}")
-    print(f"[Rollout] Git commit: {artifact.metadata.get('git_commit', 'unknown')}")
-    print(f"[Rollout] Val loss:   {artifact.metadata.get('val_loss', 'unknown')}")
-
-    meta_files = list(art_dir.glob("*.json"))
-    cfg: dict  = json.loads(meta_files[0].read_text()) if meta_files else {}
-
-    weights = list(art_dir.glob("*.safetensors")) + list(art_dir.glob("*.pt"))
-    if not weights:
-        raise FileNotFoundError(f"No weights file in artifact at {art_dir}")
-
-    model_name = artifact.metadata.get("model_name") or cfg.get("model", {}).get("name")
-    if not model_name:
-        raise ValueError("Cannot determine model name from artifact metadata.")
-
-    model = _build_and_load(model_name, cfg, weights[0])
-    model.to(device).eval()
-    print(f"[Rollout] Loaded '{model_name}' from W&B artifact")
-    return model, cfg
-
-
-# ── Loading path B: local checkpoint ─────────────────────────────────────────
-
-def load_model_from_checkpoint(checkpoint_path: str, experiment_path: str, device: torch.device):
-    """Load model from a local weights file + experiment yaml. No W&B needed.
-
-    Args:
-        checkpoint_path: e.g. ``outputs/checkpoints/exp_001/checkpoint-best.safetensors``
-        experiment_path: e.g. ``configs/experiments/exp_001.yaml``
-        device:          Target device.
-
-    Returns:
-        Tuple[nn.Module, dict]: model in eval mode, config dict.
-    """
+def load_model(checkpoint_path: str, experiment_path: str, device: torch.device):
+    """Load model from local checkpoint + experiment yaml."""
     from train import load_config
 
     ckpt_path = Path(checkpoint_path)
@@ -129,231 +107,669 @@ def load_model_from_checkpoint(checkpoint_path: str, experiment_path: str, devic
         with open(json_path) as f:
             meta = json.load(f)
         print(f"[Rollout] Checkpoint: {ckpt_path.name}")
-        print(f"[Rollout] Step:       {meta.get('step', 'unknown')}")
-        print(f"[Rollout] Val loss:   {meta.get('val_loss', 'unknown')}")
-        print(f"[Rollout] Git commit: {meta.get('git_commit', 'unknown')}")
-    else:
-        print(f"[Rollout] Checkpoint: {ckpt_path.name}")
+        print(f"[Rollout] Step:       {meta.get('step', '?')}")
+        print(f"[Rollout] Val loss:   {meta.get('val_loss', '?')}")
+        print(f"[Rollout] Git commit: {meta.get('git_commit', '?')}")
 
     model = _build_and_load(model_name, cfg, ckpt_path)
     model.to(device).eval()
-    print(f"[Rollout] Loaded '{model_name}' from local checkpoint")
+    print(f"[Rollout] Loaded '{model_name}' — device={device}")
     return model, cfg
 
 
-def list_artifact_versions(artifact_name: str):
-    """Print all versions and aliases for a model artifact."""
-    if not _WANDB:
-        raise ImportError("wandb is required: pip install wandb")
-    api = wandb.Api()
-    print(f"\nVersions for '{artifact_name}':")
-    for v in api.artifact_versions("model", artifact_name):
-        aliases = ", ".join(v.aliases) or "(none)"
-        print(f"  {v.version:6s}  aliases=[{aliases:20s}]  "
-              f"val_loss={v.metadata.get('val_loss', 'n/a')}")
+# ── Raw h5 loading ────────────────────────────────────────────────────────────
+
+def load_raw_h5(h5_path: str) -> dict:
+    """Load full trajectory and part metadata from raw h5.
+
+    Returns dict with:
+        positions:    (T, N, 3)  float32
+        velocity:     (T, N, 3)  float32
+        acceleration: (T, N, 3)  float32
+        stress:       (T, N, 6)  float32
+        times:        (T,)       float64
+        node_part_id:   (N,)     int64
+        node_part_name: (N,)     str
+        part_ids:       (P,)     int64
+        part_names:     (P,)     str
+    """
+    if not _H5PY:
+        raise ImportError("h5py required")
+
+    with h5py.File(h5_path, "r") as f:
+        data = {
+            "positions":    f["states/positions"][:].astype(np.float32),
+            "velocity":     f["states/velocity"][:].astype(np.float32),
+            "acceleration": f["states/acceleration"][:].astype(np.float32),
+            "stress":       f["states/stress"][:].astype(np.float32),
+            "times":        f["states/times"][:],
+            "node_part_id":  f["metadata/node_part_id"][:],
+            "node_part_name": np.array([
+                n.decode("utf-8").strip("\x00") if isinstance(n, bytes) else str(n)
+                for n in f["metadata/node_part_name"][:]
+            ]),
+            "part_ids":   f["metadata/part_ids"][:],
+            "part_names": np.array([
+                n.decode("utf-8").strip("\x00") if isinstance(n, bytes) else str(n)
+                for n in f["metadata/part_names"][:]
+            ]),
+        }
+
+    T, N, _ = data["positions"].shape
+    P       = len(data["part_ids"])
+    print(f"[Data] {T} frames, {N} nodes, {P} parts")
+    return data
+
+
+# ── Normalization helpers ─────────────────────────────────────────────────────
+
+def normalize_raw(data: dict, norm_stats: NormStats) -> dict:
+    """Z-score normalize all features in-place, return new dict."""
+    normed = {}
+    for feat in FEATURES:
+        normed[feat] = norm_stats.normalize(feat, data[feat])   # (T, N, C)
+    return normed
+
+
+def build_input_tensor(normed: dict, t: int) -> torch.Tensor:
+    """Build (1, N, 75) input tensor from frames [t-4 .. t] (5 frames)."""
+    assert t >= INPUT_FRAMES - 1, f"Not enough frames before t={t}"
+    parts = []
+    for feat in FEATURES:
+        frames = normed[feat][t - INPUT_FRAMES + 1: t + 1]   # (5, N, C)
+        parts.append(frames)
+    x = np.concatenate(parts, axis=-1)   # (5, N, 15)
+    x = x.reshape(x.shape[1], -1)        # (N, 75)
+    return torch.from_numpy(x).float().unsqueeze(0)  # (1, N, 75)
+
+
+def build_input_from_window(window: np.ndarray) -> torch.Tensor:
+    """Build (1, N, 75) from a (5, N, 15) normalized window array."""
+    N = window.shape[1]
+    x = window.reshape(N, -1)
+    return torch.from_numpy(x).float().unsqueeze(0)
+
+
+def reconstruct_absolute(pred_residual: torch.Tensor,
+                          last_frame_normed: np.ndarray,
+                          norm_stats: NormStats) -> dict:
+    """Convert normalized residual prediction back to physical-space absolute values.
+
+    pred_absolute (normalized) = pred_residual + last_frame_normed
+    then denormalize each feature.
+
+    Args:
+        pred_residual:    (N, 15) normalized residual from model
+        last_frame_normed: (N, 15) normalized last input frame
+        norm_stats:        NormStats for denormalization
+
+    Returns:
+        dict of {feat: np.ndarray (N, C)} in physical units
+    """
+    pred_norm = pred_residual.cpu().numpy() + last_frame_normed   # (N, 15)
+    result = {}
+    for feat, (s, e) in FEAT_SLICES.items():
+        result[feat] = norm_stats.denormalize(feat, pred_norm[:, s:e])
+    return result
 
 
 # ── Von Mises ─────────────────────────────────────────────────────────────────
 
-def _von_mises(stress: torch.Tensor) -> torch.Tensor:
+def von_mises_np(stress: np.ndarray) -> np.ndarray:
+    """Von Mises from (N, 6) Voigt stress → (N,)"""
     s = stress
-    return torch.sqrt(0.5 * (
-        (s[..., 0] - s[..., 1]) ** 2
-        + (s[..., 1] - s[..., 2]) ** 2
-        + (s[..., 2] - s[..., 0]) ** 2
-        + 6.0 * (s[..., 3] ** 2 + s[..., 4] ** 2 + s[..., 5] ** 2)
+    return np.sqrt(0.5 * (
+        (s[:, 0] - s[:, 1]) ** 2
+        + (s[:, 1] - s[:, 2]) ** 2
+        + (s[:, 2] - s[:, 0]) ** 2
+        + 6.0 * (s[:, 3] ** 2 + s[:, 4] ** 2 + s[:, 5] ** 2)
     ) + 1e-12)
 
 
-# ── Autoregressive rollout ────────────────────────────────────────────────────
+# ── Inference ─────────────────────────────────────────────────────────────────
 
 @torch.no_grad()
-def run_autoregressive_rollout(
-    model:       torch.nn.Module,
-    window_data: dict,
-    norm_stats:  NormStats,
-    device:      torch.device,
+def run_onestep(
+    model:      torch.nn.Module,
+    raw_data:   dict,
+    normed:     dict,
+    norm_stats: NormStats,
+    device:     torch.device,
 ) -> dict:
-    """Autoregressive rollout on one 6-frame window.
-
-    Seed: frames 0-4 → predict frame 5 → slide window → predict frame 6 ...
-    For 6-frame windows this is 1 prediction step.
-
-    Args:
-        model:       TransolverNet in eval mode.
-        window_data: Dict from BVCFullTrajectoryDataset.__getitem__.
-        norm_stats:  For physical-space metric computation.
-        device:      Torch device.
+    """One-step inference: always use GT past 5 frames as input.
 
     Returns:
-        Dict with pred/gt arrays and per-step RMSE.
+        pred_frames: list of (N, 15) physical-space predictions, length T-5
+        gt_frames:   list of (N, 15) physical-space GT,          length T-5
+        rmse_pos:    np.array (T-5,)
+        rmse_vm:     np.array (T-5,)
     """
-    FEATURES = ["positions", "velocity", "acceleration", "stress"]
+    T = raw_data["positions"].shape[0]
+    pred_frames, gt_frames = [], []
+    rmse_pos_steps, rmse_vm_steps = [], []
 
-    frames = torch.cat([
-        window_data[feat].to(device) for feat in FEATURES
-    ], dim=-1)                                          # (6, N, 15)
+    # Concat all features into (T, N, 15) normalized
+    normed_full = np.concatenate(
+        [normed[feat] for feat in FEATURES], axis=-1)   # (T, N, 15)
 
-    T, N, _        = frames.shape
-    current_window = frames[:_INPUT_FRAMES]             # (5, N, 15)
+    print(f"[One-step] Running {T - INPUT_FRAMES} steps ...")
 
-    pred_frames       = []
-    gt_frames         = [frames[t].cpu() for t in range(_INPUT_FRAMES, T)]
-    rmse_pos_steps    = []
-    rmse_stress_steps = []
-    rmse_vm_steps     = []
+    for t in range(INPUT_FRAMES, T):
+        # Input: frames [t-5 .. t-1]
+        x = build_input_tensor(normed, t - 1)   # (1, N, 75)
+        x = x.to(device)
 
-    for step in range(T - _INPUT_FRAMES):
-        x    = current_window.reshape(N, -1).unsqueeze(0)   # (1, N, 75)
-        pred = model(x).squeeze(0)                           # (N, 15)
-        gt   = frames[_INPUT_FRAMES + step]                  # (N, 15)
+        pred_res = model(x).squeeze(0)           # (N, 15) normalized residual
 
-        # Physical-space RMSE
-        pred_pos_raw      = norm_stats.denormalize_tensor("positions", pred[..., 0:3])
-        gt_pos_raw        = norm_stats.denormalize_tensor("positions", gt[..., 0:3])
-        rmse_pos          = torch.sqrt(F.mse_loss(pred_pos_raw, gt_pos_raw)).item()
+        last_frame = normed_full[t - 1]          # (N, 15) normalized
+        pred_abs   = reconstruct_absolute(pred_res, last_frame, norm_stats)
 
-        pred_stress_raw   = norm_stats.denormalize_tensor("stress", pred[..., _STRESS_START:_STRESS_END])
-        gt_stress_raw     = norm_stats.denormalize_tensor("stress", gt[..., _STRESS_START:_STRESS_END])
-        rmse_stress       = torch.sqrt(F.mse_loss(pred_stress_raw, gt_stress_raw)).item()
+        # GT in physical space
+        gt_abs = {feat: raw_data[feat][t] for feat in FEATURES}
 
-        pred_vm   = _von_mises(pred_stress_raw)
-        gt_vm     = _von_mises(gt_stress_raw)
-        rmse_vm   = torch.sqrt(F.mse_loss(pred_vm, gt_vm)).item()
+        # RMSE
+        pos_rmse = np.sqrt(np.mean((pred_abs["positions"] - gt_abs["positions"]) ** 2))
+        pred_vm  = von_mises_np(pred_abs["stress"])
+        gt_vm    = von_mises_np(gt_abs["stress"])
+        vm_rmse  = np.sqrt(np.mean((pred_vm - gt_vm) ** 2))
 
-        rmse_pos_steps.append(rmse_pos)
-        rmse_stress_steps.append(rmse_stress)
-        rmse_vm_steps.append(rmse_vm)
-        pred_frames.append(pred.cpu())
+        pred_concat = np.concatenate([pred_abs[f] for f in FEATURES], axis=-1)
+        gt_concat   = np.concatenate([gt_abs[f]   for f in FEATURES], axis=-1)
+        pred_frames.append(pred_concat)
+        gt_frames.append(gt_concat)
+        rmse_pos_steps.append(pos_rmse)
+        rmse_vm_steps.append(vm_rmse)
 
-        # Slide window: drop oldest frame, append prediction
-        current_window = torch.cat(
-            [current_window[1:], pred.unsqueeze(0)], dim=0)  # (5, N, 15)
+        if (t - INPUT_FRAMES + 1) % 50 == 0:
+            print(f"  step {t - INPUT_FRAMES + 1}/{T - INPUT_FRAMES} | "
+                  f"pos_rmse={pos_rmse:.3f} | vm_rmse={vm_rmse:.4f}")
 
     return {
-        "pred_frames":  torch.stack(pred_frames).numpy(),    # (steps, N, 15)
-        "gt_frames":    torch.stack(gt_frames).numpy(),
-        "rmse_pos":     np.array(rmse_pos_steps),
-        "rmse_stress":  np.array(rmse_stress_steps),
-        "rmse_vm":      np.array(rmse_vm_steps),
+        "pred_frames": np.stack(pred_frames),    # (T-5, N, 15)
+        "gt_frames":   np.stack(gt_frames),
+        "rmse_pos":    np.array(rmse_pos_steps),
+        "rmse_vm":     np.array(rmse_vm_steps),
+        "mode":        "onestep",
     }
 
 
-# ── Main inference ────────────────────────────────────────────────────────────
+@torch.no_grad()
+def run_autoregressive(
+    model:      torch.nn.Module,
+    raw_data:   dict,
+    normed:     dict,
+    norm_stats: NormStats,
+    device:     torch.device,
+) -> dict:
+    """Autoregressive inference: feed own predictions back as input.
 
-def run_inference(
-    model:       torch.nn.Module,
-    cfg:         dict,
-    input_path:  str,
-    output_path: str,
-    device:      torch.device,
+    Returns same structure as run_onestep.
+    """
+    T = raw_data["positions"].shape[0]
+    pred_frames, gt_frames = [], []
+    rmse_pos_steps, rmse_vm_steps = [], []
+
+    normed_full = np.concatenate(
+        [normed[feat] for feat in FEATURES], axis=-1)  # (T, N, 15)
+
+    # Seed: first INPUT_FRAMES frames from GT
+    current_window = normed_full[:INPUT_FRAMES].copy()  # (5, N, 15)
+
+    print(f"[Autoregressive] Running {T - INPUT_FRAMES} steps ...")
+
+    for t in range(INPUT_FRAMES, T):
+        x        = build_input_from_window(current_window).to(device)  # (1, N, 75)
+        pred_res = model(x).squeeze(0)                                   # (N, 15)
+
+        last_frame    = current_window[-1]   # (N, 15) normalized
+        pred_abs      = reconstruct_absolute(pred_res, last_frame, norm_stats)
+        pred_norm_abs = pred_res.cpu().numpy() + last_frame              # (N, 15) normalized
+
+        # GT in physical space
+        gt_abs = {feat: raw_data[feat][t] for feat in FEATURES}
+
+        # RMSE
+        pos_rmse = np.sqrt(np.mean((pred_abs["positions"] - gt_abs["positions"]) ** 2))
+        pred_vm  = von_mises_np(pred_abs["stress"])
+        gt_vm    = von_mises_np(gt_abs["stress"])
+        vm_rmse  = np.sqrt(np.mean((pred_vm - gt_vm) ** 2))
+
+        pred_concat = np.concatenate([pred_abs[f] for f in FEATURES], axis=-1)
+        gt_concat   = np.concatenate([gt_abs[f]   for f in FEATURES], axis=-1)
+        pred_frames.append(pred_concat)
+        gt_frames.append(gt_concat)
+        rmse_pos_steps.append(pos_rmse)
+        rmse_vm_steps.append(vm_rmse)
+
+        # Slide window: drop oldest, append normalized prediction
+        current_window = np.concatenate(
+            [current_window[1:], pred_norm_abs[np.newaxis]], axis=0)  # (5, N, 15)
+
+        if (t - INPUT_FRAMES + 1) % 50 == 0:
+            print(f"  step {t - INPUT_FRAMES + 1}/{T - INPUT_FRAMES} | "
+                  f"pos_rmse={pos_rmse:.3f} | vm_rmse={vm_rmse:.4f}")
+
+    return {
+        "pred_frames": np.stack(pred_frames),
+        "gt_frames":   np.stack(gt_frames),
+        "rmse_pos":    np.array(rmse_pos_steps),
+        "rmse_vm":     np.array(rmse_vm_steps),
+        "mode":        "autoregressive",
+    }
+
+
+# ── Last-frame baseline ───────────────────────────────────────────────────────
+
+def compute_baseline(raw_data: dict) -> dict:
+    """Last-frame copy baseline: predict frame t = frame t-1."""
+    T   = raw_data["positions"].shape[0]
+    pos = raw_data["positions"]   # (T, N, 3)
+    stress = raw_data["stress"]   # (T, N, 6)
+
+    rmse_pos, rmse_vm = [], []
+    for t in range(INPUT_FRAMES, T):
+        pos_rmse = np.sqrt(np.mean((pos[t - 1] - pos[t]) ** 2))
+        vm_pred  = von_mises_np(stress[t - 1])
+        vm_gt    = von_mises_np(stress[t])
+        rmse_pos.append(pos_rmse)
+        rmse_vm.append(np.sqrt(np.mean((vm_pred - vm_gt) ** 2)))
+
+    return {
+        "rmse_pos": np.array(rmse_pos),
+        "rmse_vm":  np.array(rmse_vm),
+    }
+
+
+# ── GIF rendering ─────────────────────────────────────────────────────────────
+import os
+import re
+
+def _get_grouped_colormap(node_part_id, node_part_name, config_path):
+    """根据自定义纯文本格式的 required_parts.config 将节点按组分配颜色"""
+    group_dict = {}
+    ordered_groups = []  # 记录组名的先后顺序，保证图例美观
+    
+    if config_path and Path(config_path).exists():
+        current_group = "Other"
+        with open(config_path, 'r', encoding='utf-8') as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                
+                # 1. 匹配分组标题，例如 "# 3. Front crash structure / load path"
+                # 正则解析：匹配以 # 开头，跟着任意空白，再跟着数字和一个点，提取后面的所有文字
+                header_match = re.match(r"^#\s*\d+\.\s*(.+)", line)
+                if header_match:
+                    current_group = header_match.group(1).strip()
+                    if current_group not in ordered_groups:
+                        ordered_groups.append(current_group)
+                    continue
+                
+                # 2. 忽略其他普通注释和无意义的分割线 (如 # ======)
+                if line.startswith('#'):
+                    continue
+                
+                # 3. 记录零件及其所属组别
+                part_name = line
+                group_dict[part_name] = current_group
+    else:
+        print(f"Warning: Group config not found at {config_path}. Using default part IDs.")
+        return _get_part_colormap(node_part_id)
+
+    # 确保 "Other" 组存在并放在图例最后
+    if "Other" not in ordered_groups:
+        ordered_groups.append("Other")
+        
+    # 生成颜色映射表 (根据实际组的数量分配离散颜色)
+    cmap = plt.get_cmap("tab20", len(ordered_groups))
+    group_to_color = {g: cmap(i) for i, g in enumerate(ordered_groups)}
+    
+    # 初始化所有节点的颜色数组
+    colors = np.zeros((len(node_part_id), 4))
+    unique_ids = np.unique(node_part_id)
+    
+    for pid in unique_ids:
+        mask = node_part_id == pid
+        if not mask.any(): continue
+        
+        pname = node_part_name[mask][0]
+        assigned_group = None
+        
+        # 查找所属组别
+        # 策略A：精确匹配
+        if pname in group_dict:
+            assigned_group = group_dict[pname]
+        else:
+            # 策略B：子串匹配（考虑到仿真软件导出的零件名可能带有 "ID_" 前缀等）
+            for cfg_part, g_name in group_dict.items():
+                if cfg_part in pname:
+                    assigned_group = g_name
+                    break
+        
+        # 如果都没找到，归入 Other
+        if assigned_group is None:
+            assigned_group = "Other"
+            
+        colors[mask] = group_to_color[assigned_group]
+        
+    return colors, group_to_color
+
+def _save_legend_svg(group_to_color, out_path):
+    """将图例单独渲染为无背景的 SVG 文件"""
+    fig = plt.figure(figsize=(3, len(group_to_color) * 0.3))
+    legend_elements = [
+        Line2D([0], [0], marker="s", color="w", markerfacecolor=c, 
+               markersize=10, label=g)
+        for g, c in group_to_color.items()
+    ]
+    fig.legend(handles=legend_elements, loc="center", 
+               fontsize=10, frameon=False, labelcolor="black")
+    plt.axis('off')
+    
+    # 确保保存为 SVG
+    svg_path = str(Path(out_path).with_suffix('.svg'))
+    fig.savefig(svg_path, format="svg", bbox_inches="tight", transparent=True)
+    plt.close(fig)
+    print(f"[Legend] Standalone SVG legend saved → {svg_path}")
+
+def _get_part_colormap(node_part_id: np.ndarray):
+    """Build stable part colormap from node_part_id array.
+
+    Returns:
+        colors:    (N, 4) RGBA per node, fixed across all frames
+        legend_elements: list of Line2D for legend
+        unique_ids: sorted unique part IDs
+    """
+    unique_ids   = np.unique(node_part_id)
+    n_parts      = len(unique_ids)
+    cmap         = plt.get_cmap("tab20", n_parts)
+    id_to_color  = {pid: cmap(i) for i, pid in enumerate(unique_ids)}
+    colors       = np.array([id_to_color[pid] for pid in node_part_id])  # (N, 4)
+    return colors, id_to_color, unique_ids
+
+
+def _get_vm_colormap(stress_frames: np.ndarray):
+    """Compute fixed vm_min, vm_max across all frames for stable color scale."""
+    all_vm = np.array([von_mises_np(stress_frames[t]) for t in range(len(stress_frames))])
+    vm_min, vm_max = float(all_vm.min()), float(all_vm.max())
+    return vm_min, vm_max
+
+def render_vis(
+    result:           dict,
+    raw_data:         dict,
+    out_path:         str,
+    fps:              int   = 10,
+    color_by:         str   = "part",
+    max_frames:       int   = 200,
+    dpi:              int   = 300,  # 默认提高到 300 保证清晰度
+    group_config_path: str  = None, # 传入你的 required_parts.config 路径
+    save_png_dir:     str   = None, # 如果传入路径，则额外保存高清 PNG 序列
 ):
-    """Run rollout over all windows in a test h5 file."""
-    from src.dataset import BVCFullTrajectoryDataset
+    """Render pred (left) vs gt (right) animation, with optional PNG export and grouped coloring."""
+    if not _VIS:
+        print("Warning: matplotlib/Pillow not available — skipping rendering")
+        return
 
-    norm_stats = NormStats(cfg["data"]["metadata_path"])
+    pred_frames = result["pred_frames"]
+    gt_frames   = result["gt_frames"]
+    rmse_pos    = result["rmse_pos"]
+    rmse_vm     = result["rmse_vm"]
+    mode        = result["mode"]
+    T           = min(len(pred_frames), max_frames)
 
-    test_cfg = {**cfg, "data": {**cfg["data"], "path": input_path}}
-    dataset  = BVCFullTrajectoryDataset(test_cfg)
-    print(f"[Rollout] {len(dataset)} windows in {input_path}")
+    node_part_id   = raw_data["node_part_id"]
+    node_part_name = raw_data["node_part_name"]
 
-    all_results      = []
-    mean_pos_rmse    = []
-    mean_stress_rmse = []
-    mean_vm_rmse     = []
+    pred_pos = pred_frames[:T, :, 0:3]
+    gt_pos   = gt_frames[:T,   :, 0:3]
 
-    t0 = time.time()
-    for i, window in enumerate(dataset):
-        result = run_autoregressive_rollout(model, window, norm_stats, device)
-        all_results.append({
-            "window_name": window["meta"]["window_name"],
-            "pred_frames": result["pred_frames"],
-            "gt_frames":   result["gt_frames"],
-            "rmse_pos":    result["rmse_pos"],
-            "rmse_stress": result["rmse_stress"],
-            "rmse_vm":     result["rmse_vm"],
-        })
-        mean_pos_rmse.append(result["rmse_pos"].mean())
-        mean_stress_rmse.append(result["rmse_stress"].mean())
-        mean_vm_rmse.append(result["rmse_vm"].mean())
+    # Exact raw limits (No padding) to avoid distortion
+    all_pos  = np.concatenate([pred_pos, gt_pos], axis=0)
+    x_range  = (all_pos[:, :, 0].min(), all_pos[:, :, 0].max())
+    y_range  = (all_pos[:, :, 1].min(), all_pos[:, :, 1].max())
+    z_range  = (all_pos[:, :, 2].min(), all_pos[:, :, 2].max())
 
-        if (i + 1) % 10 == 0 or i == 0:
-            print(f"[Rollout] {i+1}/{len(dataset)} | "
-                  f"pos_rmse={mean_pos_rmse[-1]:.5f} | "
-                  f"stress_rmse={mean_stress_rmse[-1]:.5f} | "
-                  f"vm_rmse={mean_vm_rmse[-1]:.5f}")
+    # Visual Setup
+    plt.rcParams['font.family'] = 'Times New Roman'
+    fig, axs = plt.subplots(2, 2, figsize=(10, 8), dpi=dpi)
+    fig.patch.set_facecolor("white")
+    
+    # ── Color & Legend Setup ───────────────────────────────────────────────
+    if color_by == "part":
+        if group_config_path:
+            # 采用按 Config 分组的着色方案
+            node_colors , group_to_color = _get_grouped_colormap(node_part_id, node_part_name, group_config_path)
+            # 生成独立 SVG 图例
+            legend_out = Path(out_path).parent / f"{mode}_legend.svg"
+            _save_legend_svg(group_to_color, legend_out)
+        else:
+            # 回退到原始策略
+            node_colors, _, _ = _get_part_colormap(node_part_id)
+            
+        vm_min = vm_max = None
+    else:  # color_by == "vm"
+        pred_stress = pred_frames[:T, :, _STRESS_START:_STRESS_END]
+        gt_stress   = gt_frames[:T,   :, _STRESS_START:_STRESS_END]
+        vm_min, vm_max = _get_vm_colormap(np.concatenate([pred_stress, gt_stress], axis=0))
+        cmap = plt.get_cmap("plasma")
 
-    elapsed = time.time() - t0
-    summary = {
-        "mean_pos_rmse":    float(np.mean(mean_pos_rmse)),
-        "mean_stress_rmse": float(np.mean(mean_stress_rmse)),
-        "mean_vm_rmse":     float(np.mean(mean_vm_rmse)),
-        "n_windows":        len(dataset),
-        "elapsed_s":        elapsed,
-    }
+    # ── Axes Setup (Equal aspect ratio for NO distortion) ──────────────────
+    for ax in axs.flat:
+        ax.set_facecolor("white")
+        ax.tick_params(colors="black", labelsize=6)
+        ax.set_aspect('equal', adjustable='box')
+        
+    for i in range(2):
+        axs[i, 0].set_xlim(x_range)
+        axs[i, 1].set_xlim(x_range)
+        if i == 0:  # Top row: X-Z plane
+            axs[i, 0].set_ylim(z_range)
+            axs[i, 1].set_ylim(z_range)
+        else:       # Bottom row: X-Y plane
+            axs[i, 0].set_ylim(y_range)
+            axs[i, 1].set_ylim(y_range)
 
-    Path(output_path).parent.mkdir(parents=True, exist_ok=True)
-    with open(output_path, "wb") as f:
-        pickle.dump({"summary": summary, "windows": all_results}, f)
+    axs[0, 0].set_ylabel("Z", color="black", fontsize=8)
+    axs[1, 0].set_ylabel("Y", color="black", fontsize=8)
+    axs[1, 0].set_xlabel("X", color="black", fontsize=8)
+    axs[1, 1].set_xlabel("X", color="black", fontsize=8)
 
-    print(f"\n[Rollout] Done in {elapsed:.1f}s")
-    print(f"[Rollout] mean_pos_rmse={summary['mean_pos_rmse']:.5f} | "
-          f"mean_vm_rmse={summary['mean_vm_rmse']:.5f}")
-    print(f"[Rollout] Saved → {output_path}")
+    # ── Initialize Scatter Plots ───────────────────────────────────────────
+    scatters = [[None, None], [None, None]]
+    for row in range(2):
+        for col in range(2):
+            pos = pred_pos[0] if col == 0 else gt_pos[0]
+            x_idx, y_idx = 0, (2 if row == 0 else 1)
+            
+            if color_by == "vm":
+                stress = pred_frames[0, :, _STRESS_START:_STRESS_END] if col == 0 else gt_frames[0, :, _STRESS_START:_STRESS_END]
+                vm  = von_mises_np(stress)
+                c   = cmap((vm - vm_min) / max(vm_max - vm_min, 1e-8))
+            else:
+                c = node_colors
 
-    if _WANDB and wandb.run:
-        wandb.log({f"rollout/{k}": v for k, v in summary.items()})
+            sc = axs[row, col].scatter(pos[:, x_idx], pos[:, y_idx], 
+                                       c=c, s=0.3, alpha=0.6, linewidths=0)
+            scatters[row][col] = sc
 
-    return summary
+    title_pred_xz = axs[0, 0].set_title("", color="black", fontsize=8, pad=3)
+    title_gt_xz   = axs[0, 1].set_title("", color="black", fontsize=8, pad=3)
+    axs[1, 0].set_title("PRED (X-Y Plane)", color="black", fontsize=8, pad=3)
+    axs[1, 1].set_title("GT (X-Y Plane)", color="black", fontsize=8, pad=3)
+
+    # 取消了原有的 fig.axes[0].legend() 避免画面遮挡
+    fig.canvas.draw()
+    
+    # ── Fast Rendering Loop & PNG export ───────────────────────────────────
+    print(f"[Vis] Rendering {T} frames ({mode}) at {dpi} DPI...")
+    gif_frames = []
+    
+    if save_png_dir:
+        Path(save_png_dir).mkdir(parents=True, exist_ok=True)
+
+    for t in range(T):
+        title_pred_xz.set_text(f"PRED [{mode}] (X-Z Plane)\nstep={t+1} | pos_rmse={rmse_pos[t]:.1f}mm | vm_rmse={rmse_vm[t]:.4f}")
+        title_gt_xz.set_text(f"GT (X-Z Plane)\nstep={t+1}")
+
+        for row in range(2):
+            for col in range(2):
+                pos = pred_pos[t] if col == 0 else gt_pos[t]
+                x_idx, y_idx = 0, (2 if row == 0 else 1)
+                
+                scatters[row][col].set_offsets(np.c_[pos[:, x_idx], pos[:, y_idx]])
+                
+                if color_by == "vm":
+                    stress = pred_frames[t, :, _STRESS_START:_STRESS_END] if col == 0 else gt_frames[t, :, _STRESS_START:_STRESS_END]
+                    vm  = von_mises_np(stress)
+                    c   = cmap((vm - vm_min) / max(vm_max - vm_min, 1e-8))
+                    scatters[row][col].set_facecolors(c)
+
+        # Update canvas
+        fig.canvas.draw()
+        rgba = np.asarray(fig.canvas.buffer_rgba())
+        pil_img = Image.fromarray(rgba).convert('RGB')
+        gif_frames.append(pil_img)
+        
+        # 导出逐帧超清 PNG
+        if save_png_dir:
+            pil_img.save(os.path.join(save_png_dir, f"frame_{t:04d}.png"))
+
+        if (t + 1) % 50 == 0:
+            print(f"  rendered {t+1}/{T} frames")
+
+    plt.close(fig)
+
+    # ── Save GIF ───────────────────────────────────────────────────────────
+    Path(out_path).parent.mkdir(parents=True, exist_ok=True)
+    gif_frames[0].save(
+        out_path,
+        save_all=True,
+        append_images=gif_frames[1:],
+        duration=int(1000 / fps),
+        loop=0,
+    )
+    print(f"[Vis] Saved GIF → {out_path} ({T} frames @ {fps}fps)")
+    if save_png_dir:
+        print(f"[Vis] Saved PNG sequence → {save_png_dir}")
+
+# ── Console summary ───────────────────────────────────────────────────────────
+
+def print_summary(onestep: dict | None, autoreg: dict | None, baseline: dict):
+    print("\n" + "=" * 60)
+    print("ROLLOUT SUMMARY")
+    print("=" * 60)
+    print(f"{'Mode':<20} {'mean_pos_rmse':>15} {'mean_vm_rmse':>14}")
+    print("-" * 60)
+
+    print(f"{'last-frame baseline':<20} "
+          f"{baseline['rmse_pos'].mean():>15.3f} "
+          f"{baseline['rmse_vm'].mean():>14.4f}")
+
+    if onestep is not None:
+        print(f"{'one-step':<20} "
+              f"{onestep['rmse_pos'].mean():>15.3f} "
+              f"{onestep['rmse_vm'].mean():>14.4f}")
+
+    if autoreg is not None:
+        print(f"{'autoregressive':<20} "
+              f"{autoreg['rmse_pos'].mean():>15.3f} "
+              f"{autoreg['rmse_vm'].mean():>14.4f}")
+
+    print("=" * 60)
+    print("(pos_rmse in physical units, vm_rmse in physical units)\n")
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────
 
 def main():
-    parser = argparse.ArgumentParser(description="BVC TransolverNet rollout")
-
-    src = parser.add_mutually_exclusive_group(required=True)
-    src.add_argument("--artifact",
-                     help='W&B artifact, e.g. "transolver_net:best"')
-    src.add_argument("--checkpoint",
-                     help="Local .safetensors file")
-
-    parser.add_argument("--experiment",
-                        help="Required with --checkpoint: experiment yaml path")
-    parser.add_argument("--input",         default=None, help="Test h5 file path")
-    parser.add_argument("--output",        default=None, help="Output .pkl path")
+    parser = argparse.ArgumentParser(description="BVC rollout visualization")
+    parser.add_argument("--checkpoint",  required=True,
+                        help="Local .safetensors checkpoint")
+    parser.add_argument("--experiment",  required=True,
+                        help="Experiment yaml, e.g. configs/experiments/exp_05.yaml")
+    parser.add_argument("--raw-h5",      required=True,
+                        help="Path to original (non-windowed) h5 trajectory")
+    parser.add_argument("--mode",
+                        choices=["onestep", "autoregressive", "both"],
+                        default="both")
+    parser.add_argument("--gif",         action="store_true",
+                        help="Render GIF animations")
+    parser.add_argument("--gif-fps",     type=int, default=10)
+    parser.add_argument("--gif-max-frames", type=int, default=200,
+                        help="Cap frames rendered (for speed)")
+    parser.add_argument("--color-by",
+                        choices=["part", "vm"], default="part")
     parser.add_argument("--device",
                         default="cuda" if torch.cuda.is_available() else "cpu")
-    parser.add_argument("--list-versions", action="store_true",
-                        help="List all W&B artifact versions (--artifact only)")
+    parser.add_argument("--output-dir",  default=None,
+                        help="Override output directory")
     args = parser.parse_args()
 
-    if args.list_versions:
-        list_artifact_versions(args.artifact.split(":")[0])
-        return
+    device     = torch.device(args.device)
+    model, cfg = load_model(args.checkpoint, args.experiment, device)
+    exp_name   = cfg["name"]
 
-    if not args.input:
-        parser.error("--input is required")
+    out_dir = Path(args.output_dir or
+                   PROJECT_ROOT / "outputs" / "rollouts" / exp_name)
+    out_dir.mkdir(parents=True, exist_ok=True)
 
-    if args.checkpoint and not args.experiment:
-        parser.error("--experiment is required when using --checkpoint")
+    # ── Load data ─────────────────────────────────────────────────────────
+    raw_data   = load_raw_h5(args.raw_h5)
+    norm_stats = NormStats(cfg["data"]["metadata_path"])
+    normed     = normalize_raw(raw_data, norm_stats)
 
-    device = torch.device(args.device)
+    # ── Baseline ──────────────────────────────────────────────────────────
+    baseline = compute_baseline(raw_data)
 
-    if args.artifact:
-        model, cfg = load_model_for_inference(args.artifact, device)
-    else:
-        model, cfg = load_model_from_checkpoint(args.checkpoint, args.experiment, device)
+    # ── Run inference ─────────────────────────────────────────────────────
+    onestep = autoreg = None
 
-    ver_tag  = (args.artifact or args.checkpoint).replace("/", "_").replace(":", "_")
-    out_path = args.output or str(
-        PROJECT_ROOT / "outputs" / "rollouts" / f"rollout_{ver_tag}.pkl"
-    )
+    t0 = time.time()
 
-    run_inference(model, cfg, args.input, out_path, device)
+    if args.mode in ("onestep", "both"):
+        onestep = run_onestep(model, raw_data, normed, norm_stats, device)
+        pkl_path = out_dir / "onestep.pkl"
+        with open(pkl_path, "wb") as f:
+            pickle.dump(onestep, f)
+        print(f"[Rollout] PKL saved → {pkl_path}")
 
-    if _WANDB and wandb.run:
-        wandb.finish()
+    if args.mode in ("autoregressive", "both"):
+        autoreg = run_autoregressive(model, raw_data, normed, norm_stats, device)
+        pkl_path = out_dir / "autoregressive.pkl"
+        with open(pkl_path, "wb") as f:
+            pickle.dump(autoreg, f)
+        print(f"[Rollout] PKL saved → {pkl_path}")
+
+    print(f"[Rollout] Inference done in {time.time() - t0:.1f}s")
+
+    # ── GIF ───────────────────────────────────────────────────────────────
+    if args.gif:
+        if onestep is not None:
+            render_vis(
+                onestep, raw_data,
+                out_path          = str(out_dir / "onestep.gif"),
+                fps               = args.gif_fps,
+                color_by          = args.color_by,
+                max_frames        = args.gif_max_frames,
+                dpi               = 50,  # 提高 DPI 以获得极高的清晰度
+                group_config_path = "configs/data/required_parts.config", # 指向你的配置文件
+                save_png_dir      = str(out_dir / "onestep_pngs")    # 生成同名文件夹存放 PNG
+            )
+        if autoreg is not None:
+            render_vis(
+                autoreg, raw_data,
+                out_path          = str(out_dir / "autoregressive.gif"),
+                fps               = args.gif_fps,
+                color_by          = args.color_by,
+                max_frames        = args.gif_max_frames,
+                dpi               = 50,  # 提高 DPI 以获得极高的清晰度
+                group_config_path = "configs/data/required_parts.config", # 指向你的配置文件
+                save_png_dir      = str(out_dir / "autoregressive_pngs")    # 生成同名文件夹存放 PNG
+            )
+
+    # ── Summary ───────────────────────────────────────────────────────────
+    print_summary(onestep, autoreg, baseline)
 
 
 if __name__ == "__main__":

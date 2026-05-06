@@ -1,4 +1,4 @@
-name: "exp_06"
+name: "default"
 description: "Pure transolver with input of velocity, output of acceleration"
 
 model:

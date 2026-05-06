@@ -30,7 +30,6 @@ def build_mlp(
         mlp.add_module(f"Act-{i}", acts[i]())
     return mlp
 
-
 @register("transolver_net")
 class TransolverNet(nn.Module):
     """MLP encoder → Transolver blocks → MLP decoder (single-frame input).

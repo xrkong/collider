@@ -11,6 +11,7 @@ import torch.nn as nn
 import numpy as np
 from timm.models.layers import trunc_normal_
 from einops import rearrange
+from models.registry import register
 
 ACTIVATION = {
     'gelu': nn.GELU, 'tanh': nn.Tanh, 'sigmoid': nn.Sigmoid,
@@ -77,7 +78,7 @@ class MLP(nn.Module):
             x = layer(x) + x if self.res else layer(x)
         return self.linear_post(x)
 
-
+@register("transolver")
 class Transolver_block(nn.Module):
     """Transformer encoder block with physics-informed slice attention."""
 

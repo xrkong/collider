@@ -1,6 +1,3 @@
-# 新模型复制此文件，修改 model 部分的参数。
-# train 和 data 部分按需修改；大多数实验只需在 configs/experiments/ 里写 overrides。
-
 model:
   hidden_dim: 512
   num_layers: 6

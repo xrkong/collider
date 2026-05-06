@@ -32,9 +32,9 @@ from src.dataset import NormStats, build_dataloader
 
 try:
     import wandb
-    _WANDB = True
+    _WANDB_AVAILABLE = True
 except ImportError:
-    _WANDB = False
+    _WANDB_AVAILABLE = False
 
 try:
     from safetensors.torch import load_file as _st_load
@@ -67,7 +67,7 @@ def load_model_from_artifact(artifact_str: str):
     Returns:
         Tuple[nn.Module, dict]: (model, cfg)
     """
-    if not _WANDB:
+    if not _WANDB_AVAILABLE:
         raise ImportError("wandb is required: pip install wandb")
 
     run      = wandb.init(job_type="eval")
@@ -145,9 +145,12 @@ def _von_mises(stress: torch.Tensor) -> torch.Tensor:
         + 6.0 * (s[..., 3] ** 2 + s[..., 4] ** 2 + s[..., 5] ** 2)
     ) + 1e-12)
 
+_POS_S, _POS_E = 0, 3
+_VEL_S, _VEL_E = 3, 6
+_ACC_S, _ACC_E = 6, 9
+_STR_S, _STR_E = 9, 15
 
 # ── Evaluation loop ───────────────────────────────────────────────────────────
-
 @torch.no_grad()
 def run_evaluation(
     model:      torch.nn.Module,
@@ -155,7 +158,11 @@ def run_evaluation(
     output_dir: str,
     device:     torch.device,
 ):
-    """Run full test-set evaluation and save metrics.json."""
+    """Run full test-set evaluation and save metrics.json.
+
+    Reports per-quantity losses (consistent with training), physical-space
+    RMSE for position & stress, and a last-frame-copy baseline for context.
+    """
     out_dir = Path(output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -165,57 +172,134 @@ def run_evaluation(
     test_loader = build_dataloader(cfg, split="test")
     print(f"[Eval] Test set: {len(test_loader.dataset)} windows")
 
-    total_loss = total_mse = total_vm = 0.0
-    total_pos_rmse = total_stress_rmse = 0.0
-    n_batches  = 0
+    # ── Loss weights (read from cfg, same as training) ────────────────────
+    train_cfg = cfg["train"]
+    loss_w_pos    = float(train_cfg.get("loss_weight_position",     1.0))
+    loss_w_vel    = float(train_cfg.get("loss_weight_velocity",     0.0))
+    loss_w_acc    = float(train_cfg.get("loss_weight_acceleration", 0.0))
+    loss_w_stress = float(train_cfg.get("loss_weight_stress",       1.0))
+    loss_w_vm     = float(train_cfg.get("loss_weight_vm",           1.0))
+
+    # ── Sample-weighted accumulators (more accurate than batch-mean) ──────
+    # We accumulate sum-of-squared-errors and total element count, then
+    # take sqrt at the end for true RMSE. Loss values use sample-count weighting.
+    n_samples = 0          # total windows seen (B summed over batches)
+    sums = {
+        # weighted MSE losses (× B per batch)
+        "loss":        0.0,
+        "loss_pos":    0.0,
+        "loss_vel":    0.0,
+        "loss_acc":    0.0,
+        "loss_stress": 0.0,
+        "loss_vm":     0.0,
+        # baseline (last-frame copy, no model)
+        "baseline_loss_pos":    0.0,
+        "baseline_loss_stress": 0.0,
+    }
+    # squared-error sums for true physical-space RMSE
+    sse_pos_phys     = 0.0
+    sse_stress_phys  = 0.0
+    sse_vm_phys      = 0.0
+    n_elem_pos       = 0
+    n_elem_stress    = 0
+    n_elem_vm        = 0
 
     for x, y in test_loader:
         x, y = x.to(device), y.to(device)
-        pred = model(x)
+        bs   = x.size(0)
 
-        loss_mse  = F.mse_loss(pred, y).item()
-        pred_vm   = _von_mises(pred[..., _STRESS_START:_STRESS_END])
-        target_vm = _von_mises(y[...,   _STRESS_START:_STRESS_END])
-        loss_vm   = F.mse_loss(pred_vm, target_vm).item()
+        # ── Model forward + residual reconstruction (same as training) ────
+        pred_residual = model(x)
+        last_frame    = x[..., -15:]
+        pred          = pred_residual + last_frame
 
-        pred_pos_raw      = norm_stats.denormalize_tensor("positions", pred[..., 0:3])
-        target_pos_raw    = norm_stats.denormalize_tensor("positions", y[..., 0:3])
-        pos_rmse          = torch.sqrt(F.mse_loss(pred_pos_raw, target_pos_raw)).item()
+        # ── Per-quantity losses (normalized space) ────────────────────────
+        loss_pos    = F.mse_loss(pred[..., _POS_S:_POS_E], y[..., _POS_S:_POS_E]).item()
+        loss_vel    = F.mse_loss(pred[..., _VEL_S:_VEL_E], y[..., _VEL_S:_VEL_E]).item()
+        loss_acc    = F.mse_loss(pred[..., _ACC_S:_ACC_E], y[..., _ACC_S:_ACC_E]).item()
 
-        pred_stress_raw   = norm_stats.denormalize_tensor("stress", pred[..., _STRESS_START:_STRESS_END])
-        target_stress_raw = norm_stats.denormalize_tensor("stress", y[...,   _STRESS_START:_STRESS_END])
-        stress_rmse       = torch.sqrt(F.mse_loss(pred_stress_raw, target_stress_raw)).item()
+        pred_stress = pred[..., _STR_S:_STR_E]
+        true_stress = y[...,    _STR_S:_STR_E]
+        loss_stress = F.mse_loss(pred_stress, true_stress).item()
+        loss_vm     = F.mse_loss(_von_mises(pred_stress), _von_mises(true_stress)).item()
 
-        total_loss        += loss_mse + loss_vm
-        total_mse         += loss_mse
-        total_vm          += loss_vm
-        total_pos_rmse    += pos_rmse
-        total_stress_rmse += stress_rmse
-        n_batches         += 1
+        loss_total  = (loss_w_pos    * loss_pos
+                     + loss_w_vel    * loss_vel
+                     + loss_w_acc    * loss_acc
+                     + loss_w_stress * loss_stress
+                     + loss_w_vm     * loss_vm)
 
-    metrics = {
-        "test/loss":        total_loss        / n_batches,
-        "test/loss_mse":    total_mse         / n_batches,
-        "test/loss_vm":     total_vm          / n_batches,
-        "test/pos_rmse":    total_pos_rmse    / n_batches,
-        "test/stress_rmse": total_stress_rmse / n_batches,
-        "n_windows":        len(test_loader.dataset),
-    }
+        # ── Last-frame-copy baseline (pred = last_frame, residual = 0) ────
+        baseline_loss_pos    = F.mse_loss(last_frame[..., _POS_S:_POS_E],
+                                          y[...,         _POS_S:_POS_E]).item()
+        baseline_loss_stress = F.mse_loss(last_frame[..., _STR_S:_STR_E],
+                                          y[...,         _STR_S:_STR_E]).item()
 
+        # ── Physical-space errors (denormalized) ──────────────────────────
+        # Note: key must match metadata — adjust "position" / "positions" to your NormStats.
+        pred_pos_phys   = norm_stats.denormalize_tensor("positions", pred[..., _POS_S:_POS_E])
+        true_pos_phys   = norm_stats.denormalize_tensor("positions", y[...,    _POS_S:_POS_E])
+        pred_str_phys   = norm_stats.denormalize_tensor("stress",   pred_stress)
+        true_str_phys   = norm_stats.denormalize_tensor("stress",   true_stress)
+
+        sse_pos_phys    += ((pred_pos_phys - true_pos_phys) ** 2).sum().item()
+        sse_stress_phys += ((pred_str_phys - true_str_phys) ** 2).sum().item()
+        n_elem_pos      += pred_pos_phys.numel()
+        n_elem_stress   += pred_str_phys.numel()
+
+        # VM in physical space
+        pred_vm_phys    = _von_mises(pred_str_phys)
+        true_vm_phys    = _von_mises(true_str_phys)
+        sse_vm_phys    += ((pred_vm_phys - true_vm_phys) ** 2).sum().item()
+        n_elem_vm      += pred_vm_phys.numel()
+
+        # ── Accumulate (weighted by batch size) ───────────────────────────
+        sums["loss"]                  += loss_total            * bs
+        sums["loss_pos"]              += loss_pos              * bs
+        sums["loss_vel"]              += loss_vel              * bs
+        sums["loss_acc"]              += loss_acc              * bs
+        sums["loss_stress"]           += loss_stress           * bs
+        sums["loss_vm"]               += loss_vm               * bs
+        sums["baseline_loss_pos"]     += baseline_loss_pos     * bs
+        sums["baseline_loss_stress"]  += baseline_loss_stress  * bs
+        n_samples                     += bs
+
+    # ── Final metrics ─────────────────────────────────────────────────────
+    metrics = {f"test/{k}": v / n_samples for k, v in sums.items()}
+
+    # True element-wise RMSE in physical units (m, Pa, etc.)
+    metrics["test/pos_rmse_phys"]    = (sse_pos_phys    / n_elem_pos)    ** 0.5
+    metrics["test/stress_rmse_phys"] = (sse_stress_phys / n_elem_stress) ** 0.5
+    metrics["test/vm_rmse_phys"]     = (sse_vm_phys     / n_elem_vm)     ** 0.5
+
+    # How much better is the model vs. just copying the last frame?
+    eps = 1e-12
+    metrics["test/pos_skill_score"] = (
+        1.0 - metrics["test/loss_pos"] / (metrics["test/baseline_loss_pos"] + eps)
+    )
+    metrics["test/stress_skill_score"] = (
+        1.0 - metrics["test/loss_stress"] / (metrics["test/baseline_loss_stress"] + eps)
+    )
+
+    metrics["n_windows"] = len(test_loader.dataset)
+
+    # ── Save & print ──────────────────────────────────────────────────────
     metrics_path = out_dir / "metrics.json"
     with open(metrics_path, "w") as f:
         json.dump(metrics, f, indent=2)
 
     print("\n[Eval] Test results:")
     for k, v in metrics.items():
-        print(f"  {k}: {v:.6f}" if isinstance(v, float) else f"  {k}: {v}")
+        if isinstance(v, float):
+            print(f"  {k}: {v:.6f}")
+        else:
+            print(f"  {k}: {v}")
     print(f"[Eval] Saved → {metrics_path}")
 
-    if _WANDB and wandb.run:
+    if _WANDB_AVAILABLE and wandb.run:
         wandb.log(metrics)
 
     return metrics
-
 
 # ── Entry point ───────────────────────────────────────────────────────────────
 
@@ -249,7 +333,7 @@ def main():
 
     run_evaluation(model, cfg, args.output_dir, device)
 
-    if _WANDB and wandb.run:
+    if _WANDB_AVAILABLE and wandb.run:
         wandb.finish()
 
 

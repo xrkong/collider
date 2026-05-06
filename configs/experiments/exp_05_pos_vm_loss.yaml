@@ -15,5 +15,7 @@ overrides:
   model.loss_weight_position:     1.0
   model.loss_weight_velocity:     0.1    
   model.loss_weight_acceleration: 0.01
+  model.loss_weight_stress:       0.0
+  model.loss_weight_vm:           0.0
 
 notes: "Position and VM stress loss experiment."
