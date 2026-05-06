@@ -297,26 +297,26 @@ def _write_window(h5file, window_idx, data, attrs):
         grp.attrs[k] = v
 
 
-def _ensure_sim_metadata(
-    h5file: h5py.File,
-    sim_id: int,
-    sim_masks: dict[str, np.ndarray],
-):
-    """
-    Ensure /sim_metadata/<sim_id>/ exists in `h5file` and contains the
-    per-sim mask arrays. Idempotent — safe to call before every window write.
+# def _ensure_sim_metadata(
+#     h5file: h5py.File,
+#     sim_id: int,
+#     sim_masks: dict[str, np.ndarray],
+# ):
+#     """
+#     Ensure /sim_metadata/<sim_id>/ exists in `h5file` and contains the
+#     per-sim mask arrays. Idempotent — safe to call before every window write.
 
-    Stored once per output file per sim, regardless of how many windows the
-    sim contributes.
-    """
-    if not sim_masks:
-        return
-    grp_path = f"sim_metadata/{sim_id}"
-    if grp_path in h5file:
-        return
-    g = h5file.create_group(grp_path)
-    for key, arr in sim_masks.items():
-        g.create_dataset(key, data=arr)
+#     Stored once per output file per sim, regardless of how many windows the
+#     sim contributes.
+#     """
+#     if not sim_masks:
+#         return
+#     grp_path = f"sim_metadata/{sim_id}"
+#     if grp_path in h5file:
+#         return
+#     g = h5file.create_group(grp_path)
+#     for key, arr in sim_masks.items():
+#         g.create_dataset(key, data=arr)
 
 
 def _to_float32(arr: np.ndarray) -> np.ndarray:
@@ -530,7 +530,7 @@ def build_dataset(
             # train
             for s, e in train_wins:
                 h5 = get_handle("train")
-                _ensure_sim_metadata(h5, sim_idx, sim_masks)
+                # _ensure_sim_metadata(h5, sim_idx, sim_masks)
                 _write_window(
                     h5, global_idx["train"],
                     {k: _to_float32(raw[k][s:e]) for k in raw},
@@ -542,7 +542,7 @@ def build_dataset(
             # val
             for s, e in val_wins:
                 h5 = get_handle("valid")
-                _ensure_sim_metadata(h5, sim_idx, sim_masks)
+                # _ensure_sim_metadata(h5, sim_idx, sim_masks)
                 _write_window(
                     h5, global_idx["valid"],
                     {k: _to_float32(raw[k][s:e]) for k in raw},
@@ -554,7 +554,7 @@ def build_dataset(
             # test trajectory (one per sim)
             if test_end - test_start >= window_size:
                 h5 = get_handle("test")
-                _ensure_sim_metadata(h5, sim_idx, sim_masks)
+                # _ensure_sim_metadata(h5, sim_idx, sim_masks)
                 _write_window(
                     h5, global_idx["test"],
                     {k: _to_float32(raw[k][test_start:test_end]) for k in raw},
@@ -573,7 +573,7 @@ def build_dataset(
             if assignment in ("train", "valid"):
                 for s, e in windows:
                     h5 = get_handle(assignment)
-                    _ensure_sim_metadata(h5, sim_idx, sim_masks)
+                    # _ensure_sim_metadata(h5, sim_idx, sim_masks)
                     _write_window(
                         h5, global_idx[assignment],
                         {k: _to_float32(raw[k][s:e]) for k in raw},
@@ -584,7 +584,7 @@ def build_dataset(
                 print(f"  Wrote {len(windows)} {assignment} windows")
             else:  # test
                 h5 = get_handle("test")
-                _ensure_sim_metadata(h5, sim_idx, sim_masks)
+                # _ensure_sim_metadata(h5, sim_idx, sim_masks)
                 _write_window(
                     h5, global_idx["test"],
                     {k: _to_float32(raw[k][:T_eff]) for k in raw},
@@ -623,6 +623,7 @@ def build_dataset(
             "val_ratio":           val_ratio,
             "test_ratio":          round(1.0 - train_ratio - val_ratio, 4),
             "normalised":          False,
+            "source":              str(input_dir.resolve()),
         },
         # Per-field mean/std computed from training data — apply downstream as:
         #   x_norm = (x_raw - mean) / std
@@ -648,8 +649,7 @@ def build_dataset(
     }
 
     (output_dir / "metadata").mkdir(parents=True, exist_ok=True)
-    for meta_path in [output_dir / "metadata.json",
-                      output_dir / "metadata" / "metadata.json"]:
+    for meta_path in [output_dir / "metadata.json"]:
         with open(meta_path, "w") as f:
             json.dump(metadata, f, indent=2)
         print(f"Metadata saved to {meta_path}")

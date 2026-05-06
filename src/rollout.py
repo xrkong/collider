@@ -5,15 +5,12 @@ renders left=pred / right=gt GIFs colored by part, saves PKL + console stats.
 
 Usage:
     python src/rollout.py \
-        --checkpoint outputs/checkpoints/exp_05/checkpoint-best.safetensors \
-        --experiment configs/experiments/exp_05_pos_vm_loss.yaml \
-        --raw-h5 /home/kong/datasets/barrier/h5/T_lok_F_shape_barrier_9_3_100km_50_2/output.h5 \
+        --checkpoint outputs/checkpoints/exp_10/checkpoint-best.safetensors \
+        --experiment configs/experiments/exp_10.yaml \
+        --raw-h5 /home/kong/datasets/barrier/h5/T_lok_F_shape_barrier_9_3_100km/output.h5 \
         --mode both \
-        --gif --gif-fps 10 \
-        --color-by part
+        --gif --gif-fps 10 
 
-    # color by Von Mises stress instead of part
-    python src/rollout.py ... --color-by vm
 """
 
 from __future__ import annotations
@@ -24,7 +21,7 @@ import pickle
 import sys
 import time
 from pathlib import Path
-from typing import Literal
+from typing import Literal, Optional
 from PIL import Image
 
 import numpy as np
@@ -66,13 +63,12 @@ except ImportError:
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 INPUT_FRAMES  = 5
-FEATURES      = ["positions", "velocity", "acceleration", "stress"]
-FEAT_DIMS     = {"positions": 3, "velocity": 3, "acceleration": 3, "stress": 6}
+FEATURES      = ["positions", "velocity", "acceleration"]
+FEAT_DIMS     = {"positions": 3, "velocity": 3, "acceleration": 3}
 FEAT_SLICES   = {
     "positions":    (0,  3),
     "velocity":     (3,  6),
     "acceleration": (6,  9),
-    "stress":       (9,  15),
 }
 
 INPUT_FRAMES   = 5
@@ -142,7 +138,6 @@ def load_raw_h5(h5_path: str) -> dict:
             "positions":    f["states/positions"][:].astype(np.float32),
             "velocity":     f["states/velocity"][:].astype(np.float32),
             "acceleration": f["states/acceleration"][:].astype(np.float32),
-            "stress":       f["states/stress"][:].astype(np.float32),
             "times":        f["states/times"][:],
             "node_part_id":  f["metadata/node_part_id"][:],
             "node_part_name": np.array([
@@ -233,17 +228,31 @@ def reconstruct_absolute(pred_residual: torch.Tensor,
     return result
 
 
-# ── Von Mises ─────────────────────────────────────────────────────────────────
+# ── Signed Distance Field ────────────────────────────────────────────────────────
 
-def von_mises_np(stress: np.ndarray) -> np.ndarray:
-    """Von Mises from (N, 6) Voigt stress → (N,)"""
-    s = stress
-    return np.sqrt(0.5 * (
-        (s[:, 0] - s[:, 1]) ** 2
-        + (s[:, 1] - s[:, 2]) ** 2
-        + (s[:, 2] - s[:, 0]) ** 2
-        + 6.0 * (s[:, 3] ** 2 + s[:, 4] ** 2 + s[:, 5] ** 2)
-    ) + 1e-12)
+def compute_sdf_batch(xy: torch.Tensor, 
+                    barrier_angle_deg: float=-25.4, 
+                    barrier_anchor: Optional[torch.Tensor] = None) -> torch.Tensor:
+    """
+    sdf: signed distance field
+    car_points: (N, T, 2) 
+    barrier_angle_deg: 护栏角度 (标量) impace degree -25.4
+    barrier_anchor: (3,) 护栏基准点，必须在 GPU 上 xy=(0,2000)
+
+    """
+    device = xy.device
+    if barrier_anchor is None:
+        barrier_anchor = torch.tensor([0.0, 2000.0], device=device)
+    else:
+        barrier_anchor = barrier_anchor.to(device)
+
+    angle_rad = torch.deg2rad(torch.tensor(barrier_angle_deg, device=device))
+    normal_2d = torch.tensor([-torch.sin(angle_rad), torch.cos(angle_rad)], device=device)
+    
+    diff_2d = xy - barrier_anchor[:2]
+    distances = (diff_2d * normal_2d).sum(dim=-1)
+    
+    return distances
 
 
 # ── Inference ─────────────────────────────────────────────────────────────────
@@ -264,9 +273,16 @@ def run_onestep(model, raw_data, normed, norm_stats, device) -> dict:
     pred_pos_list, gt_pos_list, rmse_pos_steps = [], [], []
 
     for t in range(INPUT_FRAMES, T):
-        # 输入: 归一化速度 [t-5 .. t-1]
         x_in        = build_velocity_input(normed_v, t - 1).to(device)
-        a_pred_norm = model(x_in).squeeze(0)            # (N, 3)
+
+        input_pos = normed["positions"][t - INPUT_FRAMES + 1: t + 1].transpose(1, 0, 2) # (N,T,3)
+
+        x_sdf = compute_sdf_batch(torch.from_numpy(input_pos[..., 0:2])).to(device)
+
+        
+        x = torch.cat([x_in, x_sdf.unsqueeze(0) ], dim=-1)
+
+        a_pred_norm = model(x).squeeze(0)            # (N, 3)
 
         # 上一帧 GT 速度 / 位置 (物理量) — one-step 模式始终用 GT
         v_last = raw_data["velocity"][t - 1]
@@ -289,7 +305,6 @@ def run_onestep(model, raw_data, normed, norm_stats, device) -> dict:
         "pred_frames": _pack_pos_only(pred_pos_list),
         "gt_frames":   _pack_pos_only(gt_pos_list),
         "rmse_pos":    np.array(rmse_pos_steps),
-        "rmse_vm":     np.zeros(len(rmse_pos_steps)),   # 不再预测应力
         "mode":        "onestep",
     }
 
@@ -312,8 +327,15 @@ def run_autoregressive(model, raw_data, normed, norm_stats, device) -> dict:
     x_phys = raw_data["positions"][INPUT_FRAMES - 1].copy()        # (N, 3)
 
     for t in range(INPUT_FRAMES, T):
-        x_in        = build_velocity_input_from_window(v_window_norm).to(device)
-        a_pred_norm = model(x_in).squeeze(0)                       # (N, 3)
+        x_in        = build_velocity_input_from_window(v_window_norm).to(device) # (1,N,T*C)
+
+        x_sdf = raw_data["positions"][t - INPUT_FRAMES + 1: t + 1].transpose(1, 0, 2) # (N,T,3)
+        x_sdf = torch.from_numpy(x_sdf) # (N,T,3)
+        x_sdf = compute_sdf_batch(x_sdf[..., 0:2]).to(device) # (N,T,2)
+        
+        x = torch.cat([x_in, x_sdf.unsqueeze(0) ], dim=-1)
+
+        a_pred_norm = model(x).squeeze(0)            # (N, 3)
 
         dt = dt_mean if uniform_dt else float(times[t] - times[t - 1])
         _, v_phys_new, x_phys_new = integrate_accel(
@@ -341,7 +363,6 @@ def run_autoregressive(model, raw_data, normed, norm_stats, device) -> dict:
         "pred_frames": _pack_pos_only(pred_pos_list),
         "gt_frames":   _pack_pos_only(gt_pos_list),
         "rmse_pos":    np.array(rmse_pos_steps),
-        "rmse_vm":     np.zeros(len(rmse_pos_steps)),
         "mode":        "autoregressive",
     }
 
@@ -350,20 +371,15 @@ def run_autoregressive(model, raw_data, normed, norm_stats, device) -> dict:
 def compute_baseline(raw_data: dict) -> dict:
     """Last-frame copy baseline: predict frame t = frame t-1."""
     T   = raw_data["positions"].shape[0]
-    pos = raw_data["positions"]   # (T, N, 3)
-    stress = raw_data["stress"]   # (T, N, 6)
+    pos = raw_data["positions"]   # (T, N, 3) # (T, N, 6)
 
     rmse_pos, rmse_vm = [], []
     for t in range(INPUT_FRAMES, T):
         pos_rmse = np.sqrt(np.mean((pos[t - 1] - pos[t]) ** 2))
-        vm_pred  = von_mises_np(stress[t - 1])
-        vm_gt    = von_mises_np(stress[t])
         rmse_pos.append(pos_rmse)
-        rmse_vm.append(np.sqrt(np.mean((vm_pred - vm_gt) ** 2)))
 
     return {
-        "rmse_pos": np.array(rmse_pos),
-        "rmse_vm":  np.array(rmse_vm),
+        "rmse_pos": np.array(rmse_pos)
     }
 
 
@@ -476,12 +492,6 @@ def _get_part_colormap(node_part_id: np.ndarray):
     return colors, id_to_color, unique_ids
 
 
-def _get_vm_colormap(stress_frames: np.ndarray):
-    """Compute fixed vm_min, vm_max across all frames for stable color scale."""
-    all_vm = np.array([von_mises_np(stress_frames[t]) for t in range(len(stress_frames))])
-    vm_min, vm_max = float(all_vm.min()), float(all_vm.max())
-    return vm_min, vm_max
-
 def render_vis(
     result:           dict,
     raw_data:         dict,
@@ -500,7 +510,6 @@ def render_vis(
     pred_frames = result["pred_frames"]
     gt_frames   = result["gt_frames"]
     rmse_pos    = result["rmse_pos"]
-    rmse_vm     = result["rmse_vm"]
     mode        = result["mode"]
     T           = min(len(pred_frames), max_frames)
 
@@ -587,7 +596,7 @@ def render_vis(
         Path(save_png_dir).mkdir(parents=True, exist_ok=True)
 
     for t in range(T):
-        title_pred_xz.set_text(f"PRED [{mode}] (X-Z Plane)\nstep={t+1} | pos_rmse={rmse_pos[t]:.1f}mm | vm_rmse={rmse_vm[t]:.4f}")
+        title_pred_xz.set_text(f"PRED [{mode}] (X-Z Plane)\nstep={t+1} | pos_rmse={rmse_pos[t]:.1f}mm")
         title_gt_xz.set_text(f"GT (X-Z Plane)\nstep={t+1}")
 
         for row in range(2):
@@ -635,18 +644,15 @@ def print_summary(onestep: dict | None, autoreg: dict | None, baseline: dict):
     print("-" * 60)
 
     print(f"{'last-frame baseline':<20} "
-          f"{baseline['rmse_pos'].mean():>15.3f} "
-          f"{baseline['rmse_vm'].mean():>14.4f}")
+          f"{baseline['rmse_pos'].mean():>15.3f} ")
 
     if onestep is not None:
         print(f"{'one-step':<20} "
-              f"{onestep['rmse_pos'].mean():>15.3f} "
-              f"{onestep['rmse_vm'].mean():>14.4f}")
+              f"{onestep['rmse_pos'].mean():>15.3f} ")
 
     if autoreg is not None:
         print(f"{'autoregressive':<20} "
-              f"{autoreg['rmse_pos'].mean():>15.3f} "
-              f"{autoreg['rmse_vm'].mean():>14.4f}")
+              f"{autoreg['rmse_pos'].mean():>15.3f} ")
 
     print("=" * 60)
     print("(pos_rmse in physical units, vm_rmse in physical units)\n")

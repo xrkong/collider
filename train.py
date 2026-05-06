@@ -6,7 +6,7 @@ import os
 import subprocess
 import sys
 from pathlib import Path
-from xml.parsers.expat import model
+from typing import Optional
 
 import torch
 import torch.nn.functional as F
@@ -198,7 +198,29 @@ def compute_loss(pred: torch.Tensor, target: torch.Tensor) -> tuple[torch.Tensor
     loss = relative_l2_loss(pred, target)
     return loss, {"loss_acc_relL2": loss.item}
 
+def compute_sdf_batch(xy: torch.Tensor, 
+                    barrier_angle_deg: float=-25.4, 
+                    barrier_anchor: Optional[torch.Tensor] = None) -> torch.Tensor:
+    """
+    sdf: signed distance field
+    car_points: (B, N, 2) 整个 Batch 的车辆点云，必须已经在 GPU 上
+    barrier_angle_deg: 护栏角度 (标量) impace degree -25.4
+    barrier_anchor: (2,) 护栏基准点，必须在 GPU 上 xy=(0,2000)
 
+    """
+    device = xy.device
+    if barrier_anchor is None:
+        barrier_anchor = torch.tensor([0.0, 2000.0], device=device)
+    else:
+        barrier_anchor = barrier_anchor.to(device)
+
+    angle_rad = torch.deg2rad(torch.tensor(barrier_angle_deg, device=device))
+    normal_2d = torch.tensor([-torch.sin(angle_rad), torch.cos(angle_rad)], device=device)
+    
+    diff_2d = xy - barrier_anchor[:2]
+    distances = (diff_2d * normal_2d).sum(dim=-1)
+    
+    return distances
 
 
 # ── Validation loop ───────────────────────────────────────────────────────────
@@ -207,8 +229,13 @@ def compute_loss(pred: torch.Tensor, target: torch.Tensor) -> tuple[torch.Tensor
 def run_validation(model, val_loader, device) -> dict:
     model.eval()
     total, n_batches = 0.0, 0
-    for x, y in val_loader:
-        x, y = x.to(device), y.to(device)
+    for x, y, x_pos in val_loader:
+        x, y, x_pos = x.to(device), y.to(device), x_pos.to(device)   # x: (B,N,T*C) vel, y: (B,N,3), x_pos: (B,N,3)
+        x_sdf = compute_sdf_batch(x_pos[...,:2]) # 
+        x_sdf = x_sdf.transpose(1, 2) # (B,T,N) -> (B,N,T)
+
+        x = torch.cat([x, x_sdf], dim=-1)
+
         pred = model(x)
         loss, _ = compute_loss(pred, y)
         total += loss.item()
@@ -241,11 +268,7 @@ def train(cfg: dict, git_commit: str = "unknown"):
         lr=float(train_cfg["lr"]),
         weight_decay=float(train_cfg.get("weight_decay", 0.01)),
     )
-    # scheduler = torch.optim.lr_scheduler.StepLR(
-    #     optimizer,
-    #     step_size=int(train_cfg.get("scheduler_step_size", 5000)),
-    #     gamma=float(train_cfg.get("scheduler_gamma", 0.8)),
-    # )
+
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
         optimizer,
         T_max=int(train_cfg.get("scheduler_step_size", 10000)), 
@@ -283,14 +306,18 @@ def train(cfg: dict, git_commit: str = "unknown"):
 
     try:
         while step < nsteps:
-            for x, y in train_loader:
+            for x, y, x_pos in train_loader:
                 if step >= nsteps:
                     break
+                
+                x, y, x_pos = x.to(device), y.to(device), x_pos.to(device)   # x: (B,N,T*C) vel, y: (B,N,3), x_pos: (B,N,3)
+                x_sdf = compute_sdf_batch(x_pos[...,:2]) # (B, N)
+                x_sdf = x_sdf.transpose(1, 2) # (B,T,N) -> (B,N,T)
 
-                x, y = x.to(device), y.to(device)   # x: (B,N,D_vel), y: (B,N,D_acc)
+                x = torch.cat([x, x_sdf], dim=-1)
 
                 # ── Forward ───────────────────────────────────────────────
-                pred = model(x)                      # (B, N, D_acc)
+                pred = model(x)                      # (B, N, 4)
 
                 # ── Loss (Relative L2 on acceleration) ────────────────────
                 loss, _ = compute_loss(pred, y)

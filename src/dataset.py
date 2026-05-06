@@ -144,22 +144,22 @@ class BVCDataset(BaseDataset):
     Per-frame collision features (per node):
         [dist_to_nearest_barrier, is_collision_flag (0/1)]
 
-    Input layout per node (25 dims):
-        [vx_t0, vy_t0, vz_t0, dist_t0, flag_t0,
-         vx_t1, vy_t1, vz_t1, dist_t1, flag_t1,
+    Input layout per node (15 dims):
+        [vx_t0, vy_t0, vz_t0,
+         vx_t1, vy_t1, vz_t1, 
          ...,
-         vx_t4, vy_t4, vz_t4, dist_t4, flag_t4]
+         vx_t4, vy_t4, vz_t4]
 
     Args:
         cfg: Must have:
             - cfg["data"]["path"]
             - cfg["data"]["metadata_path"]
             - cfg["data"]["normalize"]            (default True)
-            - cfg["data"]["collision_threshold"]  (default 100.0, units = positions)
-            - cfg["data"]["normalize_dist"]       (default True; z-score the dist channel)
     """
 
     INPUT_FEATURE  = "velocity"
+    SDF_FEATURE = "positions"  # positions needed for sdf
+
     TARGET_FEATURE = "acceleration"
     INPUT_FRAMES   = 5
     TARGET_FRAME   = 5  # 6th frame, 0-indexed
@@ -183,10 +183,6 @@ class BVCDataset(BaseDataset):
                 print("Warning: normalize=True but metadata_path not set — skipping normalization")
 
         # ── Collision feature config ──
-        self.collision_threshold = float(data_cfg.get("collision_threshold", 100.0))
-        self.normalize_dist      = bool(data_cfg.get("normalize_dist", True))
-        # Stats for the dist channel — computed lazily on the first batch.
-        # Stored as floats; you may also pre-compute and pass in via cfg.
         self._dist_mean: Optional[float] = data_cfg.get("dist_mean")
         self._dist_std:  Optional[float] = data_cfg.get("dist_std")
 
@@ -196,17 +192,8 @@ class BVCDataset(BaseDataset):
         if not self._keys:
             raise ValueError(f"No window groups found in {self.h5_path}")
 
-        # ── Per-sim barrier_idx (small, eager-load) ──
-        self._barrier_idx_per_sim = _load_sim_masks(self.h5_path)
-        if not self._barrier_idx_per_sim:
-            raise ValueError(
-                f"No /sim_metadata/<sim_id>/barrier_idx found in {self.h5_path}. "
-                f"Re-run the dataset builder with mask propagation enabled."
-            )
-        print(f"[Dataset] Loaded barrier masks for {len(self._barrier_idx_per_sim)} sim(s); "
-              f"collision_threshold={self.collision_threshold}, "
-              f"normalize_dist={self.normalize_dist}")
-
+        # ── Retrival of barrier_idx from source data 
+        
         # File handle — opened lazily per worker
         self._file: Optional[h5py.File] = None
 
@@ -240,7 +227,7 @@ class BVCDataset(BaseDataset):
             vel_norm = vel
 
         # ── Positions for the same 5 frames (for collision feature) ──
-        pos = grp["positions"][:self.INPUT_FRAMES].astype(np.float32)         # (5, N, 3)
+        pos = grp[self.SDF_FEATURE][:self.INPUT_FRAMES].astype(np.float32)         # (5, N, 3)
         # Note: use RAW positions (not normalized) because the threshold is
         # in physical units. If you ever change to normalized positions,
         # threshold and dist_mean/std must be in the same space.
@@ -260,7 +247,7 @@ class BVCDataset(BaseDataset):
 
         # (T, N, C) → (N, T, C) → (N, T*C)
         N = per_frame.shape[1]
-        x = per_frame.transpose(1, 0, 2).reshape(N, -1)   # (N, 25)
+        x = per_frame.transpose(1, 0, 2).reshape(N, -1)   # (N, TxC)
 
         # ── Target: acceleration at 6th frame ──
         acc = grp[self.TARGET_FEATURE][self.TARGET_FRAME].astype(np.float32)  # (N, 3)
@@ -270,7 +257,7 @@ class BVCDataset(BaseDataset):
 
         # ── Also return the collision flag at target frame for loss weighting ──
         # Compute flag at the target frame (frame 5)
-        pos_target = grp["positions"][self.TARGET_FRAME:self.TARGET_FRAME + 1].astype(np.float32)  # (1, N, 3)
+        # pos_target = grp["positions"][self.TARGET_FRAME:self.TARGET_FRAME + 1].astype(np.float32)  # (1, N, 3)
         # coll_target = compute_collision_features_numpy(
         #     pos_target, barrier_idx, threshold=self.collision_threshold
         # )  # (1, N, 2)
@@ -278,7 +265,8 @@ class BVCDataset(BaseDataset):
 
         return (
             torch.from_numpy(np.ascontiguousarray(x)),
-            torch.from_numpy(np.ascontiguousarray(y))
+            torch.from_numpy(np.ascontiguousarray(y)),
+            torch.from_numpy(np.ascontiguousarray(pos))
         )
 
     def __del__(self):
@@ -326,7 +314,7 @@ class BVCFullTrajectoryDataset(BaseDataset):
             if meta_path:
                 self._stats = NormStats(meta_path)
 
-        self.collision_threshold = float(data_cfg.get("collision_threshold", 100.0))
+        # self.collision_threshold = float(data_cfg.get("collision_threshold", 100.0))
 
         with h5py.File(self.h5_path, "r") as f:
             self._keys = sorted(k for k in f.keys() if k.startswith("window_"))

@@ -29,7 +29,7 @@ For other versions, refer to [PyG installation guide](https://pytorch-geometric.
 
 ### 3. Training
 ```
-python train.py --experiment configs/experiments/exp_06.yaml --skip-git-check
+python train.py --experiment configs/experiments/exp_10.yaml --skip-git-check
 ```
 
 
@@ -46,10 +46,10 @@ python src/evaluate.py \
 ### 5. Rollout 
 ```
 python src/rollout.py \
-    --checkpoint outputs/checkpoints/exp_07/checkpoint-best.safetensors \
-    --experiment configs/experiments/exp_07.yaml \
-    --raw-h5 /home/kong/datasets/barrier/h5/T_lok_F_shape_barrier_9_3_100km_50_2/output.h5 \
-    --mode autoregressive \
+    --checkpoint outputs/checkpoints/exp_10/checkpoint-best.safetensors \
+    --experiment configs/experiments/exp_10.yaml \
+    --raw-h5 /home/kong/datasets/barrier/h5/T_lok_F_shape_barrier_9_3_100km/output.h5 \
+    --mode both \
     --gif --gif-fps 10 
 ```
 

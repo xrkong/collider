@@ -1,5 +1,5 @@
-name: "exp_10"
-description: "deeper model with 32 layers"
+name: "exp_11"
+description: "new pipeline, add sdf, rollout implemented."
 
 model:
   name: "transolver_net"                        # registry key
@@ -16,9 +16,9 @@ overrides:
   model.nnode_out_features: 3
 
   train.lr: 0.001
-  train.min_lr: 5e-5
+  train.min_lr: 1e-6
   train.batch_size: 1
-  train.ntraining_steps: 1000
-  train.scheduler_step_size: 1000
+  train.ntraining_steps: 10000
+  train.scheduler_step_size: 10000
 
 notes: "velocity -> acceleration, defualt optimizer, loss using Relative L2"
