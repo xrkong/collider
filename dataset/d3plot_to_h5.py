@@ -428,6 +428,14 @@ def main() -> None:
     sel_part_mask = _build_selected_part_mask(part_names, patterns)
     sel_part_idx  = np.where(sel_part_mask)[0].astype(np.int64)
 
+    # frontface_mask = _build_selected_part_mask(["frontface"], patterns)
+    # frontface_idx  = np.where(frontface_mask)[0].astype(np.int64)
+    # print(f"Frontface parts: {len(frontface_idx)}  →  matched {len(frontface_idx)}/{len(part_names)} parts")
+
+    # barrier_mask   = _build_selected_part_mask(["concrete_fine_mesh"], patterns)
+    # barrier_idx    = np.where(barrier_mask)[0].astype(np.int64)
+    # print(f"Barrier parts: {len(barrier_idx)}  →  matched {len(barrier_idx)}/{len(part_names)} parts")
+
     print(f"Patterns: {len(patterns)}  →  matched {len(sel_part_idx)}/{len(part_names)} parts")
     for i in sel_part_idx:
         print(f"  part_idx={int(i):4d}  part_id={int(part_ids_full[i]):6d}"
@@ -534,6 +542,33 @@ def main() -> None:
     mg.attrs["stress_components"]   = "sxx,syy,szz,sxy,syz,sxz"
     mg.attrs["velocity_source"]     = "pending"       # updated below
     mg.attrs["acceleration_source"] = "pending"
+
+    # add front face / barrier part mask for distance calc 
+    part_names_str = [str(n).strip() for n in node_part_name]
+
+    barrier_patterns   = ["concrete_fine_mesh"]
+    car_collision_patterns = ["frontface"]
+
+    barrier_mask   = _build_selected_part_mask(part_names_str, barrier_patterns)
+    frontface_mask = _build_selected_part_mask(part_names_str, car_collision_patterns)
+
+    barrier_idx   = np.where(barrier_mask)[0].astype(np.int64)
+    frontface_idx = np.where(frontface_mask)[0].astype(np.int64)
+
+    assert barrier_idx.size   > 0, "barrier mask is empty, check your patterns"
+    assert frontface_idx.size > 0, "frontface mask is empty, check your patterns"
+    assert not (barrier_mask & frontface_mask).any(), "barrier and frontface overlap, check your patterns"
+
+    mg.create_dataset("barrier_idx",        data=barrier_idx)
+    mg.create_dataset("frontface_idx",      data=frontface_idx)
+    mg.create_dataset("barrier_patterns",   data=np.asarray(barrier_patterns, dtype="S"))
+    mg.create_dataset("frontface_patterns", data=np.asarray(car_collision_patterns, dtype="S"))
+    mg.attrs["n_barrier_nodes"]   = int(barrier_idx.size)
+    mg.attrs["n_frontface_nodes"] = int(frontface_idx.size)
+
+    print(f"[h5] barrier:   {barrier_idx.size}/{n_nodes}")
+    print(f"[h5] frontface: {frontface_idx.size}/{n_nodes}")
+
 
     # ══════════════════════════════════════════════════════════════════════════
     # Pass 2/2 – Extract fields frame by frame (globally time-ordered)
