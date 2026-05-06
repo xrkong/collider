@@ -181,13 +181,14 @@ def relative_l2_loss(pred: torch.Tensor, target: torch.Tensor, eps: float = 1e-8
 
     pred, target: (B, N, D)  — same shape
     Returns: scalar
+    def relative_l2(pred, target, eps=1e-6):
+    return ((pred - target)**2 / (target**2 + eps)).mean()
     """
-    B = pred.shape[0]
-    diff = (pred - target).reshape(B, -1)
-    targ = target.reshape(B, -1)
-    num = torch.linalg.norm(diff, dim=-1)
-    den = torch.linalg.norm(targ, dim=-1).clamp(min=eps)
-    return (num / den).mean()
+
+    squared_diff = (pred - target) ** 2
+    denominator = (target ** 2) + eps
+    
+    return (squared_diff / denominator).mean()
 
 def compute_loss(pred: torch.Tensor, target: torch.Tensor) -> tuple[torch.Tensor, dict]:
     """Acceleration-only relative L2 loss.
