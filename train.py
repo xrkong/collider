@@ -39,6 +39,7 @@ except ImportError:
 # ── Git check ─────────────────────────────────────────────────────────────────
 
 def check_git_clean() -> str:
+    """Abort if working tree has uncommitted changes; return short commit hash."""
     status = subprocess.run(
         ["git", "status", "--porcelain"],
         capture_output=True, text=True, cwd=str(REPO_ROOT),
@@ -62,6 +63,7 @@ def check_git_clean() -> str:
 # ── Config loading ────────────────────────────────────────────────────────────
 
 def _deep_set(d: dict, dotted_key: str, value):
+    """Set a nested dict value using dot notation e.g. ``"train.lr"``."""
     parts = dotted_key.split(".")
     for part in parts[:-1]:
         d = d.setdefault(part, {})
@@ -69,6 +71,19 @@ def _deep_set(d: dict, dotted_key: str, value):
 
 
 def load_config(experiment_path: str) -> dict:
+    """Load and merge experiment config.
+
+    1. Read experiment yaml.
+    2. Read the model params yaml it references.
+    3. Apply overrides on top.
+    4. Inject experiment name and model name.
+
+    Args:
+        experiment_path: Path to ``configs/experiments/*.yaml``.
+
+    Returns:
+        Merged config dict with sections: ``model``, ``train``, ``data``, ``wandb``.
+    """
     exp_path = Path(experiment_path)
     if not exp_path.is_absolute():
         exp_path = PROJECT_ROOT / exp_path
@@ -94,6 +109,7 @@ def load_config(experiment_path: str) -> dict:
 # ── W&B setup ─────────────────────────────────────────────────────────────────
 
 def setup_wandb(cfg: dict, git_commit: str):
+    """Initialise W&B run. Returns run or None if disabled."""
     wandb_cfg = cfg.get("wandb", {})
     if not _WANDB_AVAILABLE or not wandb_cfg.get("log", True):
         return None
@@ -110,6 +126,7 @@ def setup_wandb(cfg: dict, git_commit: str):
 # ── Checkpoint helpers ────────────────────────────────────────────────────────
 
 def _save_checkpoint(model: torch.nn.Module, path: Path, metadata: dict | None = None):
+    """Save model weights as safetensors (fallback: .pt). Saves metadata json alongside."""
     path.parent.mkdir(parents=True, exist_ok=True)
     if _SAFETENSORS:
         st_path   = path.with_suffix(".safetensors")
@@ -125,6 +142,7 @@ def _save_checkpoint(model: torch.nn.Module, path: Path, metadata: dict | None =
 # ── W&B Artifact upload ───────────────────────────────────────────────────────
 
 def upload_artifact(cfg: dict, run, git_commit: str, val_loss: float):
+    """Upload best checkpoint + config to W&B Artifacts."""
     if run is None:
         return
 
@@ -158,134 +176,52 @@ def upload_artifact(cfg: dict, run, git_commit: str, val_loss: float):
 
 
 # ── Loss functions ────────────────────────────────────────────────────────────
-def relative_l2_loss(
-    pred: torch.Tensor,
-    target: torch.Tensor,
-    eps: float = 1e-3,
-    weight: torch.Tensor | None = None,
-) -> torch.Tensor:
-    """Per-element relative L2.
+def relative_l2_loss(pred: torch.Tensor, target: torch.Tensor, eps: float = 1e-3) -> torch.Tensor:
+    """Per-sample relative L2, averaged over batch.
 
-    pred, target: (B, N, D)
-    weight:       (B, N) or None — per-node weight (e.g. collision flag scaling)
-    Returns scalar.
+    pred, target: (B, N, D)  — same shape
+    Returns: scalar
+    def relative_l2(pred, target, eps=1e-6):
+    return ((pred - target)**2 / (target**2 + eps)).mean()
     """
+
     squared_diff = (pred - target) ** 2
-    denominator  = (target ** 2) + eps
-    per_elem     = squared_diff / denominator   # (B, N, D)
+    denominator = (target ** 2) + eps
+    
+    return (squared_diff / denominator).mean()
 
-    if weight is None:
-        return per_elem.mean()
+def compute_loss(pred: torch.Tensor, target: torch.Tensor) -> tuple[torch.Tensor, dict]:
+    """Acceleration-only relative L2 loss.
 
-    # weight: (B, N) → (B, N, 1) to broadcast over D
-    w = weight.unsqueeze(-1)
-    # Weighted mean: sum(w * per_elem) / sum(w * D)  (D = per_elem.shape[-1])
-    numer = (w * per_elem).sum()
-    denom = w.sum() * per_elem.shape[-1] + 1e-8
-    return numer / denom
-
-
-def compute_loss(
-    pred: torch.Tensor,
-    target: torch.Tensor,
-    target_flag: torch.Tensor | None = None,
-    collision_weight: float = 1.0,
-) -> tuple[torch.Tensor, dict]:
-    """Acceleration-only relative L2 loss with optional collision weighting.
-
-    Args:
-        pred:             (B, N, D_acc)
-        target:           (B, N, D_acc)
-        target_flag:      (B, N) 0/1 — 1 means colliding at target frame
-        collision_weight: extra weight applied to colliding nodes
-                          (1.0 = no weighting; e.g. 5.0 = colliding nodes
-                          contribute 5× to the loss)
-
-    Returns:
-        (scalar_loss, metric_dict)
+    pred, target: (B, N, D_acc)
     """
-    metrics: dict = {}
+    loss = relative_l2_loss(pred, target)
+    return loss, {"loss_acc_relL2": loss.item}
 
-    # Always log the unweighted loss for comparability
-    base_loss = relative_l2_loss(pred, target)
-    metrics["loss_acc_relL2_unweighted"] = base_loss.item()
 
-    if target_flag is None or collision_weight == 1.0:
-        return base_loss, {**metrics, "loss_acc_relL2": base_loss.item()}
-
-    # weight = 1 + (collision_weight - 1) * flag
-    #   non-colliding nodes: weight = 1
-    #   colliding nodes:     weight = collision_weight
-    weight = 1.0 + (collision_weight - 1.0) * target_flag.float()
-    weighted_loss = relative_l2_loss(pred, target, weight=weight)
-
-    # Diagnostic: log the loss restricted to colliding nodes only
-    with torch.no_grad():
-        if target_flag.sum() > 0:
-            colliding_loss = relative_l2_loss(pred, target, weight=target_flag.float())
-            metrics["loss_acc_relL2_colliding"] = colliding_loss.item()
-        non_coll = 1.0 - target_flag.float()
-        if non_coll.sum() > 0:
-            non_coll_loss = relative_l2_loss(pred, target, weight=non_coll)
-            metrics["loss_acc_relL2_non_colliding"] = non_coll_loss.item()
-        metrics["fraction_colliding"] = float(target_flag.float().mean().item())
-
-    metrics["loss_acc_relL2"] = weighted_loss.item()
-    return weighted_loss, metrics
 
 
 # ── Validation loop ───────────────────────────────────────────────────────────
 
 @torch.no_grad()
-def run_validation(model, val_loader, device, collision_weight: float = 1.0) -> dict:
+def run_validation(model, val_loader, device) -> dict:
     model.eval()
-    total_unweighted = 0.0
-    total_colliding = 0.0
-    total_non_coll  = 0.0
-    n_batches = 0
-    n_coll_batches = 0
-    n_non_coll_batches = 0
-
-    for batch in val_loader:
-        # Backward-compatible: accept (x, y) or (x, y, flag)
-        if len(batch) == 3:
-            x, y, flag = batch
-            flag = flag.to(device)
-        else:
-            x, y = batch
-            flag = None
-
+    total, n_batches = 0.0, 0
+    for x, y in val_loader:
         x, y = x.to(device), y.to(device)
         pred = model(x)
-        _, metrics = compute_loss(pred, y, flag, collision_weight)
-
-        total_unweighted += metrics.get("loss_acc_relL2_unweighted", 0.0)
-        if "loss_acc_relL2_colliding" in metrics:
-            total_colliding += metrics["loss_acc_relL2_colliding"]
-            n_coll_batches += 1
-        if "loss_acc_relL2_non_colliding" in metrics:
-            total_non_coll += metrics["loss_acc_relL2_non_colliding"]
-            n_non_coll_batches += 1
+        loss, _ = compute_loss(pred, y)
+        total += loss.item()
         n_batches += 1
-
-    out = {"loss": total_unweighted / max(n_batches, 1)}
-    if n_coll_batches > 0:
-        out["loss_colliding"] = total_colliding / n_coll_batches
-    if n_non_coll_batches > 0:
-        out["loss_non_colliding"] = total_non_coll / n_non_coll_batches
-    return out
-
+    return {"loss": total / max(n_batches, 1)}
 
 # ── Main training loop ────────────────────────────────────────────────────────
 def train(cfg: dict, git_commit: str = "unknown"):
-    """TransolverNet training loop (velocity + collision → acceleration).
+    """TransolverNet training loop (velocity → acceleration, relative L2).
 
     Data flow:
-        BVCDataset  →  (x: B, N, 25)         5 frames × [vel(3) + dist(1) + flag(1)]
-                       (y: B, N, 3)          acceleration target
-                       (flag: B, N)          collision flag at target frame
-                    →  TransolverNet         (B, N, 3)
-                    →  relative L2 loss      (optionally collision-weighted)
+        BVCDataset  →  (x: B,N,D_vel)  →  TransolverNet  →  (pred: B,N,D_acc)
+                       (y: B,N,D_acc)  →  relative L2 loss
     """
     device    = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     train_cfg = cfg["train"]
@@ -305,10 +241,15 @@ def train(cfg: dict, git_commit: str = "unknown"):
         lr=float(train_cfg["lr"]),
         weight_decay=float(train_cfg.get("weight_decay", 0.01)),
     )
+    # scheduler = torch.optim.lr_scheduler.StepLR(
+    #     optimizer,
+    #     step_size=int(train_cfg.get("scheduler_step_size", 5000)),
+    #     gamma=float(train_cfg.get("scheduler_gamma", 0.8)),
+    # )
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
         optimizer,
-        T_max=int(train_cfg.get("scheduler_step_size", 10000)),
-        eta_min=float(train_cfg.get("min_lr", 1e-6)),
+        T_max=int(train_cfg.get("scheduler_step_size", 10000)), 
+        eta_min=float(train_cfg.get("min_lr", 1e-6))     
     )
 
     # ── Data ──────────────────────────────────────────────────────────────
@@ -318,9 +259,6 @@ def train(cfg: dict, git_commit: str = "unknown"):
           f"val={len(val_loader.dataset)} windows")
 
     grad_clip = float(train_cfg.get("grad_clip", 1.0))
-    collision_weight = float(train_cfg.get("collision_weight", 1.0))
-    if collision_weight != 1.0:
-        print(f"[Train] Collision-weighted loss enabled: weight={collision_weight}")
 
     # ── Checkpoint state ──────────────────────────────────────────────────
     save_dir      = PROJECT_ROOT / "outputs" / "checkpoints" / cfg["name"]
@@ -345,25 +283,17 @@ def train(cfg: dict, git_commit: str = "unknown"):
 
     try:
         while step < nsteps:
-            for batch in train_loader:
+            for x, y in train_loader:
                 if step >= nsteps:
                     break
 
-                # Backward-compatible unpack
-                if len(batch) == 3:
-                    x, y, flag = batch
-                    flag = flag.to(device)
-                else:
-                    x, y = batch
-                    flag = None
-
-                x, y = x.to(device), y.to(device)
+                x, y = x.to(device), y.to(device)   # x: (B,N,D_vel), y: (B,N,D_acc)
 
                 # ── Forward ───────────────────────────────────────────────
-                pred = model(x)                           # (B, N, 3)
+                pred = model(x)                      # (B, N, D_acc)
 
-                # ── Loss ──────────────────────────────────────────────────
-                loss, loss_metrics = compute_loss(pred, y, flag, collision_weight)
+                # ── Loss (Relative L2 on acceleration) ────────────────────
+                loss, _ = compute_loss(pred, y)
 
                 # ── Backward ──────────────────────────────────────────────
                 optimizer.zero_grad()
@@ -380,22 +310,14 @@ def train(cfg: dict, git_commit: str = "unknown"):
                     "train/loss":            loss.item(),
                     "lr":                    lr_now,
                 }
-                # forward all per-step diagnostics
-                for k, v in loss_metrics.items():
-                    wandb_log[f"train/{k}"] = v
 
                 if step % 10 == 0:
-                    extras = ""
-                    if "loss_acc_relL2_colliding" in loss_metrics:
-                        extras = (f" | coll={loss_metrics['loss_acc_relL2_colliding']:.4f}"
-                                  f" | non_coll={loss_metrics['loss_acc_relL2_non_colliding']:.4f}"
-                                  f" | f_coll={loss_metrics['fraction_colliding']:.3f}")
                     print(f"[Train] Step {step}/{nsteps} | "
-                          f"loss={loss.item():.5f} | lr={lr_now:.2e}{extras}")
+                          f"loss={loss.item():.5f} | lr={lr_now:.2e}")
 
                 # ── Validation + checkpoint ───────────────────────────────
                 if step % nsave == 0:
-                    val_metrics = run_validation(model, val_loader, device, collision_weight)
+                    val_metrics = run_validation(model, val_loader, device)
                     val_loss = val_metrics["loss"]
 
                     meta_payload = {
@@ -405,11 +327,14 @@ def train(cfg: dict, git_commit: str = "unknown"):
                         "experiment": cfg["name"],
                     }
 
+                    # Always save latest
                     _save_checkpoint(model, save_dir / "checkpoint-latest", meta_payload)
 
+                    # Save per-step checkpoint
                     step_name = f"model-step-{step:06d}"
                     _save_checkpoint(model, save_dir / step_name, meta_payload)
 
+                    # Prune to top-K by val_loss
                     ckpt_history.append({"step": step, "val_loss": val_loss, "file": step_name})
                     ckpt_history.sort(key=lambda r: r["val_loss"])
                     for stale in ckpt_history[keep_top_k:]:
@@ -420,6 +345,7 @@ def train(cfg: dict, git_commit: str = "unknown"):
                     ckpt_history = ckpt_history[:keep_top_k]
                     manifest_path.write_text(json.dumps(ckpt_history, indent=2))
 
+                    # Save best
                     if val_loss < best_val_loss:
                         best_val_loss = val_loss
                         _save_checkpoint(model, save_dir / "checkpoint-best", meta_payload)
@@ -427,13 +353,9 @@ def train(cfg: dict, git_commit: str = "unknown"):
                     else:
                         tick = ""
 
-                    coll_str = ""
-                    if "loss_colliding" in val_metrics:
-                        coll_str = (f" | coll={val_metrics['loss_colliding']:.5f}"
-                                    f" | non_coll={val_metrics['loss_non_colliding']:.5f}")
                     print(f"[Val]   Step {step} | "
                           f"val_loss={val_loss:.5f} | "
-                          f"best={best_val_loss:.5f}{coll_str} {tick}")
+                          f"best={best_val_loss:.5f} {tick}")
 
                     wandb_log.update({f"val/{k}": v for k, v in val_metrics.items()})
                     model.train()
@@ -446,7 +368,6 @@ def train(cfg: dict, git_commit: str = "unknown"):
 
     print(f"[Train] Done — best val_loss: {best_val_loss:.5f}")
     return best_val_loss
-
 
 # ── Entry point ───────────────────────────────────────────────────────────────
 

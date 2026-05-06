@@ -14,7 +14,6 @@ try:
 except ImportError:
     raise ImportError("h5py is required: pip install h5py")
 
-from src.utils.collision_features import compute_collision_features_numpy
 
 
 # ── Normalization stats ───────────────────────────────────────────────────────
@@ -247,17 +246,17 @@ class BVCDataset(BaseDataset):
         # threshold and dist_mean/std must be in the same space.
 
         # ── Collision features ──
-        barrier_idx = self._resolve_barrier_idx(grp)
-        coll_feat = compute_collision_features_numpy(
-            pos, barrier_idx, threshold=self.collision_threshold
-        )  # (5, N, 2)
+        # barrier_idx = self._resolve_barrier_idx(grp)
+        # coll_feat = compute_collision_features_numpy(
+        #     pos, barrier_idx, threshold=self.collision_threshold
+        # )  # (5, N, 2)
 
-        if self.normalize_dist and self._dist_mean is not None and self._dist_std is not None:
-            coll_feat = _normalize_dist_feature(coll_feat, self._dist_mean, self._dist_std)
+        # if self.normalize_dist and self._dist_mean is not None and self._dist_std is not None:
+        #     coll_feat = _normalize_dist_feature(coll_feat, self._dist_mean, self._dist_std)
 
         # ── Concatenate per-frame features: [vel(3) | dist(1) | flag(1)] = 5 dims ──
         # Shape: (5, N, 5)
-        per_frame = np.concatenate([vel_norm, coll_feat], axis=-1)
+        per_frame = np.concatenate([vel_norm], axis=-1)
 
         # (T, N, C) → (N, T, C) → (N, T*C)
         N = per_frame.shape[1]
@@ -272,15 +271,14 @@ class BVCDataset(BaseDataset):
         # ── Also return the collision flag at target frame for loss weighting ──
         # Compute flag at the target frame (frame 5)
         pos_target = grp["positions"][self.TARGET_FRAME:self.TARGET_FRAME + 1].astype(np.float32)  # (1, N, 3)
-        coll_target = compute_collision_features_numpy(
-            pos_target, barrier_idx, threshold=self.collision_threshold
-        )  # (1, N, 2)
-        target_flag = coll_target[0, :, 1]  # (N,)
+        # coll_target = compute_collision_features_numpy(
+        #     pos_target, barrier_idx, threshold=self.collision_threshold
+        # )  # (1, N, 2)
+        # target_flag = coll_target[0, :, 1]  # (N,)
 
         return (
             torch.from_numpy(np.ascontiguousarray(x)),
-            torch.from_numpy(np.ascontiguousarray(y)),
-            torch.from_numpy(np.ascontiguousarray(target_flag)),
+            torch.from_numpy(np.ascontiguousarray(y))
         )
 
     def __del__(self):
@@ -303,8 +301,6 @@ class BVCFullTrajectoryDataset(BaseDataset):
           "velocity":     FloatTensor (T, N, 3),
           "acceleration": FloatTensor (T, N, 3),
           "stress":       FloatTensor (T, N, 6),
-          "collision":    FloatTensor (T, N, 2),  # [dist, flag] per frame
-          "barrier_idx":  LongTensor  (N_b,),     # indices of barrier nodes
           "meta":         {"window_name": str, "window_idx": int, "sim_id": int},
         }
 
@@ -358,7 +354,7 @@ class BVCFullTrajectoryDataset(BaseDataset):
         wname = self._keys[idx]
         grp   = f[wname]
         sim_id = int(grp.attrs["sim_id"])
-        barrier_idx = self._barrier_idx_per_sim[sim_id]
+        # barrier_idx = self._barrier_idx_per_sim[sim_id]
 
         data: Dict[str, object] = {}
         # Need RAW positions to compute collision; keep a reference
@@ -371,11 +367,11 @@ class BVCFullTrajectoryDataset(BaseDataset):
                 arr = self._stats.normalize(feat, arr)
             data[feat] = torch.from_numpy(arr)
 
-        coll = compute_collision_features_numpy(
-            raw_pos, barrier_idx, threshold=self.collision_threshold
-        )  # (T, N, 2)
-        data["collision"]   = torch.from_numpy(coll)
-        data["barrier_idx"] = torch.from_numpy(barrier_idx.astype(np.int64))
+        # coll = compute_collision_features_numpy(
+        #     raw_pos, barrier_idx, threshold=self.collision_threshold
+        # )  # (T, N, 2)
+        # data["collision"]   = torch.from_numpy(coll)
+        # data["barrier_idx"] = torch.from_numpy(barrier_idx.astype(np.int64))
         data["meta"] = {"window_name": wname, "window_idx": idx, "sim_id": sim_id}
         return data
 
