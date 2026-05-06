@@ -46,18 +46,13 @@ python src/evaluate.py \
 ### 5. Rollout 
 ```
 python src/rollout.py \
-    --checkpoint outputs/checkpoints/exp_05/checkpoint-best.safetensors \
-    --experiment configs/experiments/exp_05_pos_vm_loss.yaml \
-    --input /home/kong/datasets/barrier/split_data/T_lok_F_shape_barrier_9_3_100km_50_2/train/train_data_000.h5
+    --checkpoint outputs/checkpoints/exp_07/checkpoint-best.safetensors \
+    --experiment configs/experiments/exp_07.yaml \
+    --raw-h5 /home/kong/datasets/barrier/h5/T_lok_F_shape_barrier_9_3_100km_50_2/output.h5 \
+    --mode autoregressive \
+    --gif --gif-fps 10 
 ```
 
-```
-python src/rollout.py \
-    --checkpoint outputs/checkpoints/exp_05/checkpoint-best.safetensors \
-    --experiment configs/experiments/exp_05_pos_vm_loss.yaml \
-    --raw-h5 /home/kong/datasets/barrier/split_data/T_lok_F_shape_barrier_9_3_100km_50_2/train/train_data_000.h5 \
-    --gif --gif-n-windows 3 --gif-fps 5
-```
 
 ### 6. Uploading Model to Weights & Biases (W&B)
 ```

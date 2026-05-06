@@ -65,7 +65,6 @@ except ImportError:
     _SAFETENSORS = False
 
 # ── Constants ─────────────────────────────────────────────────────────────────
-
 INPUT_FRAMES  = 5
 FEATURES      = ["positions", "velocity", "acceleration", "stress"]
 FEAT_DIMS     = {"positions": 3, "velocity": 3, "acceleration": 3, "stress": 6}
@@ -75,8 +74,10 @@ FEAT_SLICES   = {
     "acceleration": (6,  9),
     "stress":       (9,  15),
 }
-_STRESS_START = 9
-_STRESS_END   = 15
+
+INPUT_FRAMES   = 5
+INPUT_FEATURE  = "velocity"
+TARGET_FEATURE = "acceleration"
 
 
 # ── Model loading ─────────────────────────────────────────────────────────────
@@ -170,24 +171,55 @@ def normalize_raw(data: dict, norm_stats: NormStats) -> dict:
         normed[feat] = norm_stats.normalize(feat, data[feat])   # (T, N, C)
     return normed
 
-
-def build_input_tensor(normed: dict, t: int) -> torch.Tensor:
-    """Build (1, N, 75) input tensor from frames [t-4 .. t] (5 frames)."""
-    assert t >= INPUT_FRAMES - 1, f"Not enough frames before t={t}"
-    parts = []
-    for feat in FEATURES:
-        frames = normed[feat][t - INPUT_FRAMES + 1: t + 1]   # (5, N, C)
-        parts.append(frames)
-    x = np.concatenate(parts, axis=-1)   # (5, N, 15)
-    x = x.reshape(x.shape[1], -1)        # (N, 75)
-    return torch.from_numpy(x).float().unsqueeze(0)  # (1, N, 75)
+def build_velocity_input(normed_v: np.ndarray, t_last: int) -> torch.Tensor:
+    """从归一化速度的 [t_last-4 .. t_last] 5 帧构造 (1, N, 15)。
+    Layout 与训练 dataset 完全一致: per-node row = [v_t0_xyz, ..., v_t4_xyz]."""
+    frames = normed_v[t_last - INPUT_FRAMES + 1: t_last + 1]      # (5, N, 3)
+    N = frames.shape[1]
+    x = frames.transpose(1, 0, 2).reshape(N, -1)                  # (N, 15)
+    return torch.from_numpy(np.ascontiguousarray(x)).float().unsqueeze(0)
 
 
-def build_input_from_window(window: np.ndarray) -> torch.Tensor:
-    """Build (1, N, 75) from a (5, N, 15) normalized window array."""
+# def build_input_tensor(normed: dict, t: int) -> torch.Tensor:
+#     """Build (1, N, 75) input tensor from frames [t-4 .. t] (5 frames)."""
+#     assert t >= INPUT_FRAMES - 1, f"Not enough frames before t={t}"
+#     parts = []
+#     for feat in FEATURES:
+#         frames = normed[feat][t - INPUT_FRAMES + 1: t + 1]   # (5, N, C)
+#         parts.append(frames)
+#     x = np.concatenate(parts, axis=-1)   # (5, N, 15)
+#     x = x.reshape(x.shape[1], -1)        # (N, 75)
+#     return torch.from_numpy(x).float().unsqueeze(0)  # (1, N, 75)
+
+
+def build_velocity_input_from_window(window: np.ndarray) -> torch.Tensor:
+    """从 (5, N, 3) 归一化速度窗口构造 (1, N, 15)."""
     N = window.shape[1]
-    x = window.reshape(N, -1)
-    return torch.from_numpy(x).float().unsqueeze(0)
+    x = window.transpose(1, 0, 2).reshape(N, -1)                  # (N, 15)
+    return torch.from_numpy(np.ascontiguousarray(x)).float().unsqueeze(0)
+
+def integrate_accel(
+    a_pred_norm: torch.Tensor,    # (N, 3)  模型直接输出
+    v_last_phys: np.ndarray,      # (N, 3)  物理量
+    x_last_phys: np.ndarray,      # (N, 3)
+    dt:          float,
+    norm_stats:  NormStats,
+):
+    """半隐式 Euler: a -> v_new -> x_new. 返回都是物理量 (N, 3)."""
+    a_phys     = norm_stats.denormalize("acceleration", a_pred_norm.cpu().numpy())
+    v_new_phys = v_last_phys + a_phys * dt
+    x_new_phys = x_last_phys + v_new_phys * dt        # 用新速度积分位置
+    return a_phys, v_new_phys, x_new_phys
+
+
+def _pack_pos_only(pos_list):
+    """把 list-of-(N,3) 打包成 (T, N, 15),只填位置通道,兼容现有渲染。"""
+    T = len(pos_list)
+    N = pos_list[0].shape[0]
+    arr = np.zeros((T, N, 15), dtype=np.float32)
+    for i, p in enumerate(pos_list):
+        arr[i, :, 0:3] = p
+    return arr
 
 
 def reconstruct_absolute(pred_residual: torch.Tensor,
@@ -227,136 +259,103 @@ def von_mises_np(stress: np.ndarray) -> np.ndarray:
 
 
 # ── Inference ─────────────────────────────────────────────────────────────────
-
 @torch.no_grad()
-def run_onestep(
-    model:      torch.nn.Module,
-    raw_data:   dict,
-    normed:     dict,
-    norm_stats: NormStats,
-    device:     torch.device,
-) -> dict:
-    """One-step inference: always use GT past 5 frames as input.
+def run_onestep(model, raw_data, normed, norm_stats, device) -> dict:
+    T  = raw_data["positions"].shape[0]
+    times = raw_data["times"]
+    dt_arr = np.diff(times)
+    dt_mean = float(dt_arr.mean())
+    if dt_arr.std() / max(abs(dt_mean), 1e-12) > 1e-3:
+        print(f"[Warn] dt 非均匀: mean={dt_mean:.6g}, std={dt_arr.std():.3g} — 用每步对应 dt")
+        uniform_dt = False
+    else:
+        uniform_dt = True
+    print(f"[One-step] dt ≈ {dt_mean:.6g}, steps = {T - INPUT_FRAMES}")
 
-    Returns:
-        pred_frames: list of (N, 15) physical-space predictions, length T-5
-        gt_frames:   list of (N, 15) physical-space GT,          length T-5
-        rmse_pos:    np.array (T-5,)
-        rmse_vm:     np.array (T-5,)
-    """
-    T = raw_data["positions"].shape[0]
-    pred_frames, gt_frames = [], []
-    rmse_pos_steps, rmse_vm_steps = [], []
-
-    # Concat all features into (T, N, 15) normalized
-    normed_full = np.concatenate(
-        [normed[feat] for feat in FEATURES], axis=-1)   # (T, N, 15)
-
-    print(f"[One-step] Running {T - INPUT_FRAMES} steps ...")
+    normed_v = normed["velocity"]                       # (T, N, 3)
+    pred_pos_list, gt_pos_list, rmse_pos_steps = [], [], []
 
     for t in range(INPUT_FRAMES, T):
-        # Input: frames [t-5 .. t-1]
-        x = build_input_tensor(normed, t - 1)   # (1, N, 75)
-        x = x.to(device)
+        # 输入: 归一化速度 [t-5 .. t-1]
+        x_in        = build_velocity_input(normed_v, t - 1).to(device)
+        a_pred_norm = model(x_in).squeeze(0)            # (N, 3)
 
-        pred_res = model(x).squeeze(0)           # (N, 15) normalized residual
+        # 上一帧 GT 速度 / 位置 (物理量) — one-step 模式始终用 GT
+        v_last = raw_data["velocity"][t - 1]
+        x_last = raw_data["positions"][t - 1]
+        dt     = dt_mean if uniform_dt else float(times[t] - times[t - 1])
 
-        last_frame = normed_full[t - 1]          # (N, 15) normalized
-        pred_abs   = reconstruct_absolute(pred_res, last_frame, norm_stats)
+        _, _, x_new = integrate_accel(a_pred_norm, v_last, x_last, dt, norm_stats)
 
-        # GT in physical space
-        gt_abs = {feat: raw_data[feat][t] for feat in FEATURES}
+        x_gt = raw_data["positions"][t]
+        rmse = float(np.sqrt(np.mean((x_new - x_gt) ** 2)))
 
-        # RMSE
-        pos_rmse = np.sqrt(np.mean((pred_abs["positions"] - gt_abs["positions"]) ** 2))
-        pred_vm  = von_mises_np(pred_abs["stress"])
-        gt_vm    = von_mises_np(gt_abs["stress"])
-        vm_rmse  = np.sqrt(np.mean((pred_vm - gt_vm) ** 2))
-
-        pred_concat = np.concatenate([pred_abs[f] for f in FEATURES], axis=-1)
-        gt_concat   = np.concatenate([gt_abs[f]   for f in FEATURES], axis=-1)
-        pred_frames.append(pred_concat)
-        gt_frames.append(gt_concat)
-        rmse_pos_steps.append(pos_rmse)
-        rmse_vm_steps.append(vm_rmse)
+        pred_pos_list.append(x_new)
+        gt_pos_list.append(x_gt)
+        rmse_pos_steps.append(rmse)
 
         if (t - INPUT_FRAMES + 1) % 50 == 0:
-            print(f"  step {t - INPUT_FRAMES + 1}/{T - INPUT_FRAMES} | "
-                  f"pos_rmse={pos_rmse:.3f} | vm_rmse={vm_rmse:.4f}")
+            print(f"  step {t-INPUT_FRAMES+1}/{T-INPUT_FRAMES} | pos_rmse={rmse:.3f}")
 
     return {
-        "pred_frames": np.stack(pred_frames),    # (T-5, N, 15)
-        "gt_frames":   np.stack(gt_frames),
+        "pred_frames": _pack_pos_only(pred_pos_list),
+        "gt_frames":   _pack_pos_only(gt_pos_list),
         "rmse_pos":    np.array(rmse_pos_steps),
-        "rmse_vm":     np.array(rmse_vm_steps),
+        "rmse_vm":     np.zeros(len(rmse_pos_steps)),   # 不再预测应力
         "mode":        "onestep",
     }
 
-
 @torch.no_grad()
-def run_autoregressive(
-    model:      torch.nn.Module,
-    raw_data:   dict,
-    normed:     dict,
-    norm_stats: NormStats,
-    device:     torch.device,
-) -> dict:
-    """Autoregressive inference: feed own predictions back as input.
+def run_autoregressive(model, raw_data, normed, norm_stats, device) -> dict:
+    T     = raw_data["positions"].shape[0]
+    times = raw_data["times"]
+    dt_arr = np.diff(times)
+    dt_mean = float(dt_arr.mean())
+    uniform_dt = (dt_arr.std() / max(abs(dt_mean), 1e-12)) <= 1e-3
+    print(f"[Autoregressive] dt ≈ {dt_mean:.6g}, steps = {T - INPUT_FRAMES}")
 
-    Returns same structure as run_onestep.
-    """
-    T = raw_data["positions"].shape[0]
-    pred_frames, gt_frames = [], []
-    rmse_pos_steps, rmse_vm_steps = [], []
+    pred_pos_list, gt_pos_list, rmse_pos_steps = [], [], []
 
-    normed_full = np.concatenate(
-        [normed[feat] for feat in FEATURES], axis=-1)  # (T, N, 15)
-
-    # Seed: first INPUT_FRAMES frames from GT
-    current_window = normed_full[:INPUT_FRAMES].copy()  # (5, N, 15)
-
-    print(f"[Autoregressive] Running {T - INPUT_FRAMES} steps ...")
+    # ── 初始化 ──
+    # 速度窗口 (归一化, 模型输入用)
+    v_window_norm = normed["velocity"][:INPUT_FRAMES].copy()       # (5, N, 3)
+    # 物理速度 / 位置当前状态
+    v_phys = raw_data["velocity"][INPUT_FRAMES - 1].copy()         # (N, 3)
+    x_phys = raw_data["positions"][INPUT_FRAMES - 1].copy()        # (N, 3)
 
     for t in range(INPUT_FRAMES, T):
-        x        = build_input_from_window(current_window).to(device)  # (1, N, 75)
-        pred_res = model(x).squeeze(0)                                   # (N, 15)
+        x_in        = build_velocity_input_from_window(v_window_norm).to(device)
+        a_pred_norm = model(x_in).squeeze(0)                       # (N, 3)
 
-        last_frame    = current_window[-1]   # (N, 15) normalized
-        pred_abs      = reconstruct_absolute(pred_res, last_frame, norm_stats)
-        pred_norm_abs = pred_res.cpu().numpy() + last_frame              # (N, 15) normalized
+        dt = dt_mean if uniform_dt else float(times[t] - times[t - 1])
+        _, v_phys_new, x_phys_new = integrate_accel(
+            a_pred_norm, v_phys, x_phys, dt, norm_stats)
 
-        # GT in physical space
-        gt_abs = {feat: raw_data[feat][t] for feat in FEATURES}
+        x_gt = raw_data["positions"][t]
+        rmse = float(np.sqrt(np.mean((x_phys_new - x_gt) ** 2)))
 
-        # RMSE
-        pos_rmse = np.sqrt(np.mean((pred_abs["positions"] - gt_abs["positions"]) ** 2))
-        pred_vm  = von_mises_np(pred_abs["stress"])
-        gt_vm    = von_mises_np(gt_abs["stress"])
-        vm_rmse  = np.sqrt(np.mean((pred_vm - gt_vm) ** 2))
+        pred_pos_list.append(x_phys_new)
+        gt_pos_list.append(x_gt)
+        rmse_pos_steps.append(rmse)
 
-        pred_concat = np.concatenate([pred_abs[f] for f in FEATURES], axis=-1)
-        gt_concat   = np.concatenate([gt_abs[f]   for f in FEATURES], axis=-1)
-        pred_frames.append(pred_concat)
-        gt_frames.append(gt_concat)
-        rmse_pos_steps.append(pos_rmse)
-        rmse_vm_steps.append(vm_rmse)
-
-        # Slide window: drop oldest, append normalized prediction
-        current_window = np.concatenate(
-            [current_window[1:], pred_norm_abs[np.newaxis]], axis=0)  # (5, N, 15)
+        # ── 更新状态 ──
+        v_phys = v_phys_new
+        x_phys = x_phys_new
+        # 把新速度归一化后滑窗
+        v_new_norm = norm_stats.normalize("velocity", v_phys_new[None])[0]   # (N, 3)
+        v_window_norm = np.concatenate(
+            [v_window_norm[1:], v_new_norm[None]], axis=0)                   # (5, N, 3)
 
         if (t - INPUT_FRAMES + 1) % 50 == 0:
-            print(f"  step {t - INPUT_FRAMES + 1}/{T - INPUT_FRAMES} | "
-                  f"pos_rmse={pos_rmse:.3f} | vm_rmse={vm_rmse:.4f}")
+            print(f"  step {t-INPUT_FRAMES+1}/{T-INPUT_FRAMES} | pos_rmse={rmse:.3f}")
 
     return {
-        "pred_frames": np.stack(pred_frames),
-        "gt_frames":   np.stack(gt_frames),
+        "pred_frames": _pack_pos_only(pred_pos_list),
+        "gt_frames":   _pack_pos_only(gt_pos_list),
         "rmse_pos":    np.array(rmse_pos_steps),
-        "rmse_vm":     np.array(rmse_vm_steps),
+        "rmse_vm":     np.zeros(len(rmse_pos_steps)),
         "mode":        "autoregressive",
     }
-
 
 # ── Last-frame baseline ───────────────────────────────────────────────────────
 
@@ -500,7 +499,6 @@ def render_vis(
     raw_data:         dict,
     out_path:         str,
     fps:              int   = 10,
-    color_by:         str   = "part",
     max_frames:       int   = 200,
     dpi:              int   = 300,  # 默认提高到 300 保证清晰度
     group_config_path: str  = None, # 传入你的 required_parts.config 路径
@@ -535,24 +533,17 @@ def render_vis(
     fig, axs = plt.subplots(2, 2, figsize=(10, 8), dpi=dpi)
     fig.patch.set_facecolor("white")
     
-    # ── Color & Legend Setup ───────────────────────────────────────────────
-    if color_by == "part":
-        if group_config_path:
-            # 采用按 Config 分组的着色方案
-            node_colors , group_to_color = _get_grouped_colormap(node_part_id, node_part_name, group_config_path)
-            # 生成独立 SVG 图例
-            legend_out = Path(out_path).parent / f"{mode}_legend.svg"
-            _save_legend_svg(group_to_color, legend_out)
-        else:
-            # 回退到原始策略
-            node_colors, _, _ = _get_part_colormap(node_part_id)
-            
-        vm_min = vm_max = None
-    else:  # color_by == "vm"
-        pred_stress = pred_frames[:T, :, _STRESS_START:_STRESS_END]
-        gt_stress   = gt_frames[:T,   :, _STRESS_START:_STRESS_END]
-        vm_min, vm_max = _get_vm_colormap(np.concatenate([pred_stress, gt_stress], axis=0))
-        cmap = plt.get_cmap("plasma")
+
+    if group_config_path:
+        # 采用按 Config 分组的着色方案
+        node_colors , group_to_color = _get_grouped_colormap(node_part_id, node_part_name, group_config_path)
+        # 生成独立 SVG 图例
+        legend_out = Path(out_path).parent / f"{mode}_legend.svg"
+        _save_legend_svg(group_to_color, legend_out)
+    else:
+        # 回退到原始策略
+        node_colors, _, _ = _get_part_colormap(node_part_id)
+
 
     # ── Axes Setup (Equal aspect ratio for NO distortion) ──────────────────
     for ax in axs.flat:
@@ -582,12 +573,8 @@ def render_vis(
             pos = pred_pos[0] if col == 0 else gt_pos[0]
             x_idx, y_idx = 0, (2 if row == 0 else 1)
             
-            if color_by == "vm":
-                stress = pred_frames[0, :, _STRESS_START:_STRESS_END] if col == 0 else gt_frames[0, :, _STRESS_START:_STRESS_END]
-                vm  = von_mises_np(stress)
-                c   = cmap((vm - vm_min) / max(vm_max - vm_min, 1e-8))
-            else:
-                c = node_colors
+    
+            c = node_colors
 
             sc = axs[row, col].scatter(pos[:, x_idx], pos[:, y_idx], 
                                        c=c, s=0.3, alpha=0.6, linewidths=0)
@@ -618,12 +605,6 @@ def render_vis(
                 x_idx, y_idx = 0, (2 if row == 0 else 1)
                 
                 scatters[row][col].set_offsets(np.c_[pos[:, x_idx], pos[:, y_idx]])
-                
-                if color_by == "vm":
-                    stress = pred_frames[t, :, _STRESS_START:_STRESS_END] if col == 0 else gt_frames[t, :, _STRESS_START:_STRESS_END]
-                    vm  = von_mises_np(stress)
-                    c   = cmap((vm - vm_min) / max(vm_max - vm_min, 1e-8))
-                    scatters[row][col].set_facecolors(c)
 
         # Update canvas
         fig.canvas.draw()
@@ -698,8 +679,6 @@ def main():
     parser.add_argument("--gif-fps",     type=int, default=10)
     parser.add_argument("--gif-max-frames", type=int, default=200,
                         help="Cap frames rendered (for speed)")
-    parser.add_argument("--color-by",
-                        choices=["part", "vm"], default="part")
     parser.add_argument("--device",
                         default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--output-dir",  default=None,
@@ -750,7 +729,6 @@ def main():
                 onestep, raw_data,
                 out_path          = str(out_dir / "onestep.gif"),
                 fps               = args.gif_fps,
-                color_by          = args.color_by,
                 max_frames        = args.gif_max_frames,
                 dpi               = 50,  # 提高 DPI 以获得极高的清晰度
                 group_config_path = "configs/data/required_parts.config", # 指向你的配置文件
@@ -761,7 +739,6 @@ def main():
                 autoreg, raw_data,
                 out_path          = str(out_dir / "autoregressive.gif"),
                 fps               = args.gif_fps,
-                color_by          = args.color_by,
                 max_frames        = args.gif_max_frames,
                 dpi               = 50,  # 提高 DPI 以获得极高的清晰度
                 group_config_path = "configs/data/required_parts.config", # 指向你的配置文件
