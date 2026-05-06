@@ -176,7 +176,7 @@ def upload_artifact(cfg: dict, run, git_commit: str, val_loss: float):
 
 
 # ── Loss functions ────────────────────────────────────────────────────────────
-def relative_l2_loss(pred: torch.Tensor, target: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
+def relative_l2_loss(pred: torch.Tensor, target: torch.Tensor, eps: float = 1e-3) -> torch.Tensor:
     """Per-sample relative L2, averaged over batch.
 
     pred, target: (B, N, D)  — same shape
