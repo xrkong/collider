@@ -272,7 +272,7 @@ def train(cfg: dict, git_commit: str = "unknown"):
     )
 
     # ── Data ──────────────────────────────────────────────────────────────
-    train_loader = build_dataloader(cfg, split="train")
+    train_loader = build_dataloader(cfg, split="valid") # 跑最小的训练集，验证loss能不能降到最低。
     val_loader   = build_dataloader(cfg, split="valid")
     print(f"[Train] train={len(train_loader.dataset)} windows, "
           f"val={len(val_loader.dataset)} windows")
