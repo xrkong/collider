@@ -222,7 +222,7 @@ def compute_sdf_batch(xy: torch.Tensor,
     diff_2d = xy - barrier_anchor[:2]
     distances = (diff_2d * normal_2d).sum(dim=-1)
     
-    return distances
+    return distances / 1000.0  
 
 
 # ── Validation loop ───────────────────────────────────────────────────────────
