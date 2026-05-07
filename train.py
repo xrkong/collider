@@ -195,8 +195,10 @@ def compute_loss(pred: torch.Tensor, target: torch.Tensor) -> tuple[torch.Tensor
 
     pred, target: (B, N, D_acc)
     """
-    loss = relative_l2_loss(pred, target)
-    return loss, {"loss_acc_relL2": loss.item}
+    loss_criterion = torch.nn.MSELoss(reduction='none')
+    loss_per_var = loss_criterion(pred, target).mean(dim=0)
+    loss = loss_per_var.mean()
+    return loss, {"loss_MSE": loss.item}
 
 def compute_sdf_batch(xy: torch.Tensor, 
                     barrier_angle_deg: float=-25.4, 
@@ -274,6 +276,19 @@ def train(cfg: dict, git_commit: str = "unknown"):
     val_loader   = build_dataloader(cfg, split="valid")
     print(f"[Train] train={len(train_loader.dataset)} windows, "
           f"val={len(val_loader.dataset)} windows")
+    
+    # all_targets = []
+    # for batch in train_loader:
+    #     _, y, _ = batch
+    #     all_targets.append(y.flatten())
+    # all_targets = torch.cat(all_targets)
+
+    # print(f"target 统计:")
+    # print(f"  绝对值最小: {all_targets.abs().min():.6f}")
+    # print(f"  绝对值中位数: {all_targets.abs().median():.6f}")
+    # print(f"  |target| < 1e-3 占比: {(all_targets.abs() < 1e-3).float().mean():.4%}")
+    # print(f"  |target| < 1e-2 占比: {(all_targets.abs() < 1e-2).float().mean():.4%}")
+    # print(f"  |target| < 1e-1 占比: {(all_targets.abs() < 1e-1).float().mean():.4%}")
 
     grad_clip = float(train_cfg.get("grad_clip", 1.0))
 
