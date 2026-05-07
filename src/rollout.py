@@ -8,7 +8,7 @@ Usage:
         --checkpoint outputs/checkpoints/exp_10/checkpoint-best.safetensors \
         --experiment configs/experiments/exp_10.yaml \
         --raw-h5 /home/kong/datasets/barrier/h5/T_lok_F_shape_barrier_9_3_100km/output.h5 \
-        --mode both \
+        --mode autoregressive \
         --gif --gif-fps 10 
 
 """
