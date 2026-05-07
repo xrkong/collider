@@ -1,5 +1,5 @@
 name: "exp_14t"
-description: "just train and val on same small datset for sanity check."
+description: "small dataset, 10 frames."
 model:
   name: "transolver_net"                        # registry key
   params: "configs/params/transolver_net.yaml"  # base params file
@@ -13,11 +13,16 @@ overrides:
   model.slice_num: 64
   model.nnode_in_features: 20
   model.nnode_out_features: 3
+  model.input_sequence_length: 10
+  model.nnode_in_features: 40 # 10 x (3+1)
 
   train.lr: 0.001
   train.min_lr: 1e-6
   train.batch_size: 1
   train.ntraining_steps: 2000
   train.scheduler_step_size: 2000
+
+  data.base_path: "/home/kong/datasets/barrier/split_data/T_lok_F_shape_barrier_9_3_100km_10/"
+  data.metadata_path: "/home/kong/datasets/barrier/split_data/T_lok_F_shape_barrier_9_3_100km_10/metadata.json"
 
 notes: "velocity -> acceleration, defualt optimizer, loss using Relative L2"
