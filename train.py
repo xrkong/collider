@@ -195,7 +195,7 @@ def compute_loss(pred: torch.Tensor, target: torch.Tensor) -> tuple[torch.Tensor
 
     pred, target: (B, N, D_acc)
     """
-    loss_criterion = torch.nn.MSELoss(reduction='none')
+    loss_criterion = torch.nn.L1Loss(reduction='none')
     loss_per_var = loss_criterion(pred, target).mean(dim=0)
     loss = loss_per_var.mean()
     return loss, {"loss_MSE": loss.item}
@@ -296,7 +296,9 @@ def train(cfg: dict, git_commit: str = "unknown"):
         optimizer,
         max_lr=float(train_cfg.get("lr", 1e-3)),
         total_steps=int(train_cfg["ntraining_steps"]),
-        final_div_factor=1000.,
+        pct_start=0.05,           # warmup 短一点,快进入退火
+        final_div_factor=1e6,   
+        div_factor=25,
     )
 
     # ── Checkpoint state ──────────────────────────────────────────────────
