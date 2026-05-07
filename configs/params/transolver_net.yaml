@@ -25,17 +25,8 @@ train:
   ntraining_steps: 10000
   nsave_steps: 100       
 
-  # ── 损失权重 ──────────────────────────────────────────────────────────
-  loss_weight_position:     1.0
-  loss_weight_velocity:     0.0    
-  loss_weight_acceleration: 1.0   
-  loss_weight_stress:       0.0
-  loss_weight_vm:           0.0
-
   # ── 学习率调度 ────────────────────────────────────────────────────────
-  scheduler: step_lr
-  scheduler_step_size: 5000
-  scheduler_gamma: 0.8
+
 
   # ── 其他训练参数 ───────────────────────────────────────────────────────
   grad_clip: 1.0

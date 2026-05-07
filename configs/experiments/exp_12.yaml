@@ -1,5 +1,5 @@
 name: "exp_12"
-description: "try transolver++ ."
+description: "back to transolver block. Try torch.optim.lr_scheduler.OneCycleLR"
 
 model:
   name: "transolver_net"                        # registry key

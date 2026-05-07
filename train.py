@@ -269,12 +269,6 @@ def train(cfg: dict, git_commit: str = "unknown"):
         weight_decay=float(train_cfg.get("weight_decay", 0.01)),
     )
 
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-        optimizer,
-        T_max=int(train_cfg.get("scheduler_step_size", 10000)), 
-        eta_min=float(train_cfg.get("min_lr", 1e-6))     
-    )
-
     # ── Data ──────────────────────────────────────────────────────────────
     train_loader = build_dataloader(cfg, split="train")
     val_loader   = build_dataloader(cfg, split="valid")
@@ -282,6 +276,13 @@ def train(cfg: dict, git_commit: str = "unknown"):
           f"val={len(val_loader.dataset)} windows")
 
     grad_clip = float(train_cfg.get("grad_clip", 1.0))
+
+    scheduler = torch.optim.lr_scheduler.OneCycleLR(
+        optimizer,
+        max_lr=float(train_cfg.get("lr", 1e-3)),
+        total_steps=int(train_cfg["ntraining_steps"]),
+        final_div_factor=1000.,
+    )
 
     # ── Checkpoint state ──────────────────────────────────────────────────
     save_dir      = PROJECT_ROOT / "outputs" / "checkpoints" / cfg["name"]

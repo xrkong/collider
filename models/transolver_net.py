@@ -72,7 +72,7 @@ class TransolverNet(nn.Module):
         for i in range(layers):
             is_last = (i == layers - 1)  
             self.blocks.append(
-                Transolver_plus_block(
+                Transolver_block(
                     num_heads=num_heads, 
                     hidden_dim=latent_dim, 
                     dropout=dropout,
