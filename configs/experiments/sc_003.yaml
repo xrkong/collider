@@ -6,7 +6,7 @@ model:
 
 overrides:
   model.hidden_dim: 384
-  model.dropout: 1e-3
+  model.dropout: 0.001
   model.layers: 8            # number of transolver blocks
   model.nmlp_layers: 8
   model.num_heads: 8
