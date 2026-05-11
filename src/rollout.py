@@ -5,8 +5,8 @@ renders left=pred / right=gt GIFs colored by part, saves PKL + console stats.
 
 Usage:
     python src/rollout.py \
-        --checkpoint outputs/checkpoints/exp_14t/checkpoint-best.safetensors \
-        --experiment configs/experiments/exp_14t.yaml \
+        --checkpoint outputs/checkpoints/sc_003/checkpoint-best.safetensors \
+        --experiment configs/experiments/sc_003.yaml \
         --raw-h5 /home/kong/datasets/barrier/h5/T_lok_F_shape_barrier_9_3_100km/output.h5 \
         --mode autoregressive \
         --gif --gif-fps 10 
