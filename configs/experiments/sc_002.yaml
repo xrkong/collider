@@ -1,26 +1,27 @@
-name: "exp_14t"
-description: "small dataset, 10 frames."
+name: "sc_002"
+description: "1 case for 10k steps to overfit, 10 frames for santiy check. try pass x and use sdf as loss"
 model:
   name: "transolver_net"                        # registry key
   params: "configs/params/transolver_net.yaml"  # base params file
 
 overrides:
-  model.hidden_dim: 128
+  model.hidden_dim: 256
   model.dropout: 0.0
-  model.layers: 32            # number of transolver blocks
-  model.nmlp_layers: 4
-  model.num_heads: 16
-  model.slice_num: 64
+  model.layers: 8            # number of transolver blocks
+  model.nmlp_layers: 8
+  model.num_heads: 8
+  model.slice_num: 32
   
-  model.nnode_out_features: 3
+
   model.input_sequence_length: 10
   model.nnode_in_features: 40 # 10 x (3+1)
+  model.nnode_out_features: 3
 
   train.lr: 0.001
   train.min_lr: 1e-6
-  train.batch_size: 1
-  train.ntraining_steps: 1000
-  train.scheduler_step_size: 1000
+  train.batch_size: 3
+  train.ntraining_steps: 5000
+  train.scheduler_step_size: 5000
 
   data.base_path: "/home/kong/datasets/barrier/split_data/T_lok_F_shape_barrier_9_3_100km_10/"
   data.metadata_path: "/home/kong/datasets/barrier/split_data/T_lok_F_shape_barrier_9_3_100km_10/metadata.json"

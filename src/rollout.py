@@ -5,8 +5,8 @@ renders left=pred / right=gt GIFs colored by part, saves PKL + console stats.
 
 Usage:
     python src/rollout.py \
-        --checkpoint outputs/checkpoints/exp_10/checkpoint-best.safetensors \
-        --experiment configs/experiments/exp_10.yaml \
+        --checkpoint outputs/checkpoints/exp_14t/checkpoint-best.safetensors \
+        --experiment configs/experiments/exp_14t.yaml \
         --raw-h5 /home/kong/datasets/barrier/h5/T_lok_F_shape_barrier_9_3_100km/output.h5 \
         --mode autoregressive \
         --gif --gif-fps 10 
@@ -62,7 +62,7 @@ except ImportError:
     _SAFETENSORS = False
 
 # ── Constants ─────────────────────────────────────────────────────────────────
-INPUT_FRAMES  = 5
+INPUT_FRAMES  = 10
 FEATURES      = ["positions", "velocity", "acceleration"]
 FEAT_DIMS     = {"positions": 3, "velocity": 3, "acceleration": 3}
 FEAT_SLICES   = {
@@ -71,7 +71,7 @@ FEAT_SLICES   = {
     "acceleration": (6,  9),
 }
 
-INPUT_FRAMES   = 5
+INPUT_FRAMES   = 10
 INPUT_FEATURE  = "velocity"
 TARGET_FEATURE = "acceleration"
 

@@ -161,8 +161,8 @@ class BVCDataset(BaseDataset):
     SDF_FEATURE = "positions"  # positions needed for sdf
 
     TARGET_FEATURE = "acceleration"
-    INPUT_FRAMES   = 5
-    TARGET_FRAME   = 5  # 6th frame, 0-indexed
+    INPUT_FRAMES   = 10
+    TARGET_FRAME   = 10  # 11th frame, 0-indexed
 
     def __init__(self, cfg: dict):
         super().__init__(cfg)

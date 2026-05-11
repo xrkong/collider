@@ -191,14 +191,14 @@ def relative_l2_loss(pred: torch.Tensor, target: torch.Tensor, eps: float = 1e-3
     return (squared_diff / denominator).mean()
 
 def compute_loss(pred: torch.Tensor, target: torch.Tensor) -> tuple[torch.Tensor, dict]:
-    """Acceleration-only relative L2 loss.
+    """Acceleration-only relative L1 loss.
 
     pred, target: (B, N, D_acc)
     """
     loss_criterion = torch.nn.L1Loss(reduction='none')
     loss_per_var = loss_criterion(pred, target).mean(dim=0)
     loss = loss_per_var.mean()
-    return loss, {"loss_MSE": loss.item}
+    return loss, {"loss_L1": loss.item()}
 
 def compute_sdf_batch(xy: torch.Tensor, 
                     barrier_angle_deg: float=-25.4, 
@@ -272,8 +272,8 @@ def train(cfg: dict, git_commit: str = "unknown"):
     )
 
     # ── Data ──────────────────────────────────────────────────────────────
-    train_loader = build_dataloader(cfg, split="valid") # 跑最小的训练集，验证loss能不能降到最低。
-    val_loader   = build_dataloader(cfg, split="valid")
+    train_loader = build_dataloader(cfg, split="train") # 跑最小的训练集，验证loss能不能降到最低。
+    val_loader   = build_dataloader(cfg, split="train")
     print(f"[Train] train={len(train_loader.dataset)} windows, "
           f"val={len(val_loader.dataset)} windows")
     

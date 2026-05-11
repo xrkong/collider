@@ -24,15 +24,15 @@ Split dataset into train/val/test:
 ```bash
 python dataset/split_dataset.py \
     --input_dir /home/kong/datasets/barrier/h5/T_lok_F_shape_barrier_9_3_100km \
-    --output_dir /home/kong/datasets/barrier/split_data/T_lok_F_shape_barrier_9_3_100km \
-    --context_length 5 \
+    --output_dir /home/kong/datasets/barrier/split_data/T_lok_F_shape_barrier_9_3_100km_10 \
+    --context_length 10 \
     --prediction_horizon 1 \
     --frame_skip 1 \
     --split_mode temporal \
-    --split_gap 6 \
+    --split_gap 10 \
     --stride 1 \
-    --train_ratio 0.8 \
-    --val_ratio 0.2 \
+    --train_ratio 0.7 \
+    --val_ratio 0.3 \
     --windows_per_file 500
 ```
 
