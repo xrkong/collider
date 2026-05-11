@@ -1,5 +1,5 @@
-name: "sc_003"
-description: "add noise 1e-3. others as same as sc_002: reduce bz to 2, increate hidden dim to 384, slice num to 128."
+name: "sc_004"
+description: "add noise 1e-2. others as same as sc_002: reduce bz to 2, increate hidden dim to 384, slice num to 128."
 model:
   name: "transolver_net"                        # registry key
   params: "configs/params/transolver_net.yaml"  # base params file
