@@ -370,43 +370,186 @@ class BVCFullTrajectoryDataset(BaseDataset):
             except Exception:
                 pass
 
+# ── BVC Trajectory-Sliced Training Dataset ────────────────────────────────────
+class BVCSlicedDataset(BaseDataset):
+    """Full-trajectory dataset with sliced-window sampling for push-forward training.
+    
+    Loads one or more full trajectories into memory at init. Each __getitem__ 
+    returns a window starting at index t:
+        - frames [t, t + input_frames):                    velocity input (normalized)
+        - frames [t + input_frames, t + input_frames + K): K acceleration targets (normalized)
+        - frames [t, t + input_frames):                    raw positions for first-step SDF
+        - frames [t + input_frames, t + input_frames + K): raw positions for push-forward SDF
+        - frame  t + input_frames - 1:                     raw velocity (for integration)
+    
+    Args:
+        cfg requires:
+            - cfg["data"]["paths"]: list[str] or single str — h5 file paths
+            - cfg["data"]["metadata_path"]: for global normalization stats
+            - cfg["data"]["input_frames"]: int, default 5
+            - cfg["data"]["normalize"]: bool, default True
+            - cfg["train"]["push_forward_k"]: int, default 1
+    """
+    
+    INPUT_KEY  = "states/velocity"
+    POS_KEY    = "states/positions"
+    TARGET_KEY = "states/acceleration"
+    
+    def __init__(self, cfg: dict):
+        super().__init__(cfg)
+        data_cfg  = cfg["data"]
+        train_cfg = cfg.get("train", {})
+        
+        # ── Resolve paths ──
+        paths = data_cfg.get("paths") or data_cfg.get("path")
+        if paths is None:
+            raise ValueError("BVCSlicedDataset requires cfg['data']['paths'] or ['path']")
+        if isinstance(paths, str):
+            paths = [paths]
+        self.h5_paths = [Path(p) for p in paths]
+        for p in self.h5_paths:
+            if not p.exists():
+                raise FileNotFoundError(f"H5 file not found: {p}")
+        
+        # ── Config ──
+        self.input_frames = int(data_cfg.get("input_frames", 5))
+        self.K = int(train_cfg.get("push_forward_k", 1))
+        if self.K < 1:
+            raise ValueError(f"push_forward_k must be >= 1, got {self.K}")
+        self.window_len = self.input_frames + self.K
+        
+        # ── Normalization (always from metadata.json) ──
+        self._stats: Optional[NormStats] = None
+        if data_cfg.get("normalize", True):
+            meta_path = data_cfg.get("metadata_path")
+            if not meta_path:
+                raise ValueError("normalize=True requires metadata_path in cfg")
+            self._stats = NormStats(meta_path)
+            print(f"[BVCSlicedDataset] Normalization stats loaded from {meta_path}")
+        
+        # ── Load trajectories into memory ──
+        # Pre-normalize velocity and acceleration (used directly as input/target).
+        # Keep positions raw (SDF computed in physical units downstream).
+        # Keep raw velocity too (needed in physical units for integration).
+        self._trajectories: list[dict] = []
+        for p in self.h5_paths:
+            with h5py.File(p, "r") as f:
+                vel  = f[self.INPUT_KEY][:].astype(np.float32)    # (T, N, 3)
+                acc  = f[self.TARGET_KEY][:].astype(np.float32)   # (T, N, 3)
+                pos  = f[self.POS_KEY][:].astype(np.float32)      # (T, N, 3)
+            
+            T = vel.shape[0]
+            if T < self.window_len:
+                raise ValueError(
+                    f"Trajectory {p} has only {T} frames, need >= {self.window_len} "
+                    f"(input_frames={self.input_frames} + K={self.K})"
+                )
+            
+            if self._stats is not None:
+                vel_norm = self._stats.normalize("velocity",     vel)
+                acc_norm = self._stats.normalize("acceleration", acc)
+            else:
+                vel_norm = vel
+                acc_norm = acc
+            
+            self._trajectories.append({
+                "vel_norm":  vel_norm,   # (T, N, 3) normalized
+                "vel_phys":  vel,        # (T, N, 3) physical, for integration
+                "acc_norm":  acc_norm,   # (T, N, 3) normalized target
+                "pos_phys":  pos,        # (T, N, 3) physical, for SDF
+                "T":         T,
+                "path":      str(p),
+            })
+        
+        # ── Build (traj_idx, start_idx) index ──
+        # Each valid start spans [0, T - window_len], inclusive.
+        self._index_map: list[tuple[int, int]] = []
+        for ti, traj in enumerate(self._trajectories):
+            n_starts = traj["T"] - self.window_len + 1
+            for si in range(n_starts):
+                self._index_map.append((ti, si))
+        
+        print(f"[BVCSlicedDataset] {len(self._trajectories)} trajectory(ies), "
+              f"{len(self._index_map)} total windows")
+        print(f"[BVCSlicedDataset] input_frames={self.input_frames}, K={self.K}, "
+              f"window_len={self.window_len}")
+    
+    def __len__(self) -> int:
+        return len(self._index_map)
+    
+    def __getitem__(self, idx):
+        traj_idx, start = self._index_map[idx]
+        traj = self._trajectories[traj_idx]
+        T_in = self.input_frames
+        K    = self.K
+        end  = start + T_in + K
+        
+        # ── Input velocity (normalized, flattened) ──
+        vel_in = traj["vel_norm"][start : start + T_in]            # (T_in, N, 3)
+        N = vel_in.shape[1]
+        x_vel = vel_in.transpose(1, 0, 2).reshape(N, -1)           # (N, T_in*3)
+        
+        # ── Last input frame physical velocity (for integration) ──
+        v_last_phys = traj["vel_phys"][start + T_in - 1]           # (N, 3)
+        
+        # ── Future acceleration targets (K frames, normalized) ──
+        acc_future = traj["acc_norm"][start + T_in : end]          # (K, N, 3)
+        future_acc = acc_future.transpose(1, 0, 2)                 # (N, K, 3)
+        
+        # ── Positions (raw, for SDF) ──
+        input_pos  = traj["pos_phys"][start : start + T_in]        # (T_in, N, 3)
+        future_pos = traj["pos_phys"][start + T_in : end]          # (K, N, 3)
+        future_pos = future_pos.transpose(1, 0, 2)                 # (N, K, 3)
+
+
+        input_pos = input_pos.transpose(1, 0, 2)                 # (T_in, N, 3)->(N, T_in, 3)
+        
+        return (
+            torch.from_numpy(np.ascontiguousarray(x_vel)),         # (N, T_in*3)
+            torch.from_numpy(np.ascontiguousarray(future_acc)),    # (N, K, 3)
+            torch.from_numpy(np.ascontiguousarray(input_pos)),     # (N, T_in, 3)
+            torch.from_numpy(np.ascontiguousarray(future_pos)),    # (N, K, 3)
+            torch.from_numpy(np.ascontiguousarray(v_last_phys)),   # (N, 3)
+        )
+
 
 # ── DataLoader factory ────────────────────────────────────────────────────────
 
 _DATASET_MAP = {
     "bvc":            BVCDataset,
     "bvc_trajectory": BVCFullTrajectoryDataset,
+    "bvc_sliced":     BVCSlicedDataset,
 }
 
-
 def build_dataloader(cfg: dict, split: str = "train") -> torch.utils.data.DataLoader:
-    """Build a DataLoader for the given split.
-
-    Returns batches:
-        x: (B, N, 25)        — 5 frames of [velocity(3) | dist(1) | flag(1)]
-        y: (B, N, 3)         — acceleration target
-        target_flag: (B, N)  — collision flag at target frame (for loss weighting)
-    """
     data_cfg  = cfg.get("data", {})
     train_cfg = cfg.get("train", {})
-
+    
     dataset_type = data_cfg.get("dataset_type", "bvc")
     dataset_cls  = _DATASET_MAP.get(dataset_type)
     if dataset_cls is None:
-        raise ValueError(
-            f"Unknown dataset_type '{dataset_type}'. "
-            f"Available: {list(_DATASET_MAP.keys())}"
-        )
-
-    base_path = Path(data_cfg.get("base_path", "dataset/data_processed"))
-    h5_path   = base_path / f"{split}" / f"{split}_data_000.h5"  # TODO: support multiple files per split
-
-    split_cfg = {**cfg, "data": {**data_cfg, "path": str(h5_path)}}
-    dataset   = dataset_cls(split_cfg)
-
-    is_train  = (split == "train")
+        raise ValueError(f"Unknown dataset_type '{dataset_type}'")
+    
+    if dataset_type == "bvc_sliced":
+        # New-style: explicit paths in config; supports per-split override.
+        # e.g. data.train_paths / data.val_paths, or single data.paths for both.
+        split_paths = data_cfg.get(f"{split}_paths") or data_cfg.get("paths")
+        if split_paths is None:
+            raise ValueError(
+                f"bvc_sliced requires data.{split}_paths or data.paths in cfg"
+            )
+        split_cfg = {**cfg, "data": {**data_cfg, "paths": split_paths}}
+    else:
+        # Legacy pre-windowed
+        base_path = Path(data_cfg.get("base_path", "dataset/data_processed"))
+        h5_path   = base_path / f"{split}" / f"{split}_data_000.h5"
+        split_cfg = {**cfg, "data": {**data_cfg, "path": str(h5_path)}}
+    
+    dataset = dataset_cls(split_cfg)
+    
+    is_train   = (split == "train")
     batch_size = train_cfg.get("batch_size", 1) if is_train else 1
-
+    
     return torch.utils.data.DataLoader(
         dataset,
         batch_size  = batch_size,

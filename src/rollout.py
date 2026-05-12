@@ -62,7 +62,7 @@ except ImportError:
     _SAFETENSORS = False
 
 # ── Constants ─────────────────────────────────────────────────────────────────
-INPUT_FRAMES  = 10
+INPUT_FRAMES  = 5
 FEATURES      = ["positions", "velocity", "acceleration"]
 FEAT_DIMS     = {"positions": 3, "velocity": 3, "acceleration": 3}
 FEAT_SLICES   = {
@@ -71,7 +71,6 @@ FEAT_SLICES   = {
     "acceleration": (6,  9),
 }
 
-INPUT_FRAMES   = 10
 INPUT_FEATURE  = "velocity"
 TARGET_FEATURE = "acceleration"
 
@@ -190,6 +189,8 @@ def integrate_accel(
 ):
     """半隐式 Euler: a -> v_new -> x_new. 返回都是物理量 (N, 3)."""
     a_phys     = norm_stats.denormalize("acceleration", a_pred_norm.cpu().numpy())
+    # bias = np.array([96257.18, -36023.75, 1812.44], dtype=np.float32)
+    # a_phys = a_phys - bias
     v_new_phys = v_last_phys + a_phys * dt
     x_new_phys = x_last_phys + v_new_phys * dt        # 用新速度积分位置
     return a_phys, v_new_phys, x_new_phys
@@ -252,7 +253,7 @@ def compute_sdf_batch(xy: torch.Tensor,
     diff_2d = xy - barrier_anchor[:2]
     distances = (diff_2d * normal_2d).sum(dim=-1)
     
-    return distances
+    return distances / 1000.0
 
 
 # ── Inference ─────────────────────────────────────────────────────────────────
@@ -338,7 +339,7 @@ def run_autoregressive(model, raw_data, normed, norm_stats, device) -> dict:
         a_pred_norm = model(x).squeeze(0)            # (N, 3)
 
         dt = dt_mean if uniform_dt else float(times[t] - times[t - 1])
-        _, v_phys_new, x_phys_new = integrate_accel(
+        a_phys_new, v_phys_new, x_phys_new = integrate_accel(
             a_pred_norm, v_phys, x_phys, dt, norm_stats)
 
         x_gt = raw_data["positions"][t]
@@ -355,6 +356,17 @@ def run_autoregressive(model, raw_data, normed, norm_stats, device) -> dict:
         v_new_norm = norm_stats.normalize("velocity", v_phys_new[None])[0]   # (N, 3)
         v_window_norm = np.concatenate(
             [v_window_norm[1:], v_new_norm[None]], axis=0)                   # (5, N, 3)
+
+        # print(f"归一化 0 → v: {v_new_norm}")
+        # print(f"real 物理v: {v_phys_new}")
+
+        # print(f"step {t}: a_pred_norm |mean|={a_pred_norm.abs().mean():.4f}, "
+        #         f"|max|={a_pred_norm.abs().max():.4f}, "
+        #         f"v_phys |max|={np.abs(v_phys).max():.1f}, "
+        #         f"v_gt |max|={np.abs(raw_data['velocity'][t - 1]).max():.1f}, "
+        #         f"pos_rmse={rmse:.1f}")
+        # print(norm_stats.stats["acceleration"]["mean"])
+        # print(norm_stats.stats["acceleration"]["std"])
 
         if (t - INPUT_FRAMES + 1) % 50 == 0:
             print(f"  step {t-INPUT_FRAMES+1}/{T-INPUT_FRAMES} | pos_rmse={rmse:.3f}")

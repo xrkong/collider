@@ -24,6 +24,8 @@ train:
   batch_size: 8
   ntraining_steps: 1000
   nsave_steps: 100       
+  push_forward_k: 1
+  
 
   # ── 其他训练参数 ───────────────────────────────────────────────────────
   grad_clip: 1.0
@@ -32,11 +34,14 @@ train:
 data:
   base_path: "/home/kong/datasets/barrier/split_data/T_lok_F_shape_barrier_9_3_100km/"
   metadata_path: "/home/kong/datasets/barrier/split_data/T_lok_F_shape_barrier_9_3_100km/metadata.json"
-  dataset_type: bvc 
+  dataset_type: bvc_sliced
+  input_frames: 5
+  normalize: true
   num_workers: 0
-  pin_memory: true
-  collision_threshold: 100.0
-  normalize_dist: false
+  dt: 0.004
+  # pin_memory: true
+  # collision_threshold: 100.0
+  # normalize_dist: false
 
 wandb:
   project: barrier-vehicle-collision

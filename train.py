@@ -10,6 +10,7 @@ from typing import Optional
 
 import torch
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint
 import yaml
 
 # ── Project root ──────────────────────────────────────────────────────────────
@@ -174,6 +175,45 @@ def upload_artifact(cfg: dict, run, git_commit: str, val_loss: float):
     run.log_artifact(artifact)
     print(f"[Artifact] Uploaded '{model_name}' to W&B Artifacts")
 
+def push_forward_step(
+    v_window_norm:   torch.Tensor,    # (B, N, T_in, 3)  normalized velocity window
+    a_pred_norm:     torch.Tensor,    # (B, N, 3)         normalized predicted acceleration
+    v_phys_last:     torch.Tensor,    # (B, N, 3)         physical velocity at end of window
+    acc_mean:        torch.Tensor,    # (3,)
+    acc_std:         torch.Tensor,    # (3,)
+    vel_mean:        torch.Tensor,    # (3,)
+    vel_std:         torch.Tensor,    # (3,)
+    dt:              float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """One integration step: a_pred -> v_new -> slide window.
+    
+    Returns:
+        v_window_norm_new: (B, N, T_in, 3)  shifted window with v_new appended
+        v_phys_new:        (B, N, 3)         new physical velocity (for next step)
+    """
+    # Denormalize acceleration to physical
+    a_phys = a_pred_norm * acc_std + acc_mean        # (B, N, 3)
+    # Semi-implicit Euler
+    v_phys_new = v_phys_last + a_phys * dt           # (B, N, 3)
+    # Re-normalize for next input
+    v_new_norm = (v_phys_new - vel_mean) / vel_std   # (B, N, 3)
+    # Slide window: drop oldest frame, append new
+    v_window_norm_new = torch.cat(
+        [v_window_norm[:, :, 1:, :], v_new_norm.unsqueeze(2)],
+        dim=2,
+    )  # (B, N, T_in, 3)
+    return v_window_norm_new, v_phys_new
+
+
+def build_sdf_window(
+    pos_window: torch.Tensor,    # (B, N, T_in, 3)  physical positions
+) -> torch.Tensor:
+    """Compute SDF for every frame in the position window.
+    
+    Returns: (B, N, T_in)  SDF per node per frame
+    """
+    return compute_sdf_batch(pos_window[..., :2])  
+
 
 # ── Loss functions ────────────────────────────────────────────────────────────
 def relative_l2_loss(pred: torch.Tensor, target: torch.Tensor, eps: float = 1e-3) -> torch.Tensor:
@@ -226,20 +266,27 @@ def compute_sdf_batch(xy: torch.Tensor,
 
 
 # ── Validation loop ───────────────────────────────────────────────────────────
-
 @torch.no_grad()
 def run_validation(model, val_loader, device) -> dict:
     model.eval()
     total, n_batches = 0.0, 0
-    for x, y, x_pos in val_loader:
-        x, y, x_pos = x.to(device), y.to(device), x_pos.to(device)   # x: (B,N,T*C) vel, y: (B,N,3), x_pos: (B,N,3)
-        x_sdf = compute_sdf_batch(x_pos[...,:2]) # 
-        x_sdf = x_sdf.transpose(1, 2) # (B,T,N) -> (B,N,T)
+    for batch in val_loader:
+        x_vel, future_acc, input_pos, future_pos, v_last_phys = batch
+        x_vel      = x_vel.to(device)
+        future_acc = future_acc.to(device)
+        input_pos  = input_pos.to(device)
+        
+        # Validation: one-step only (k=0)
+        B, N, _ = x_vel.shape
+        T_in    = input_pos.shape[2]
+        
+        x_sdf = compute_sdf_batch(input_pos[..., :2])   # (B, N, T_in)
+        x_in  = torch.cat([x_vel, x_sdf], dim=-1)
+        
+        pred = model(x_in)
 
-        x = torch.cat([x, x_sdf], dim=-1)
-
-        pred = model(x)
-        loss, _ = compute_loss(pred, y)
+        target = future_acc[:, :, 0, :]                  # first step target
+        loss, _ = compute_loss(pred, target)
         total += loss.item()
         n_batches += 1
     return {"loss": total / max(n_batches, 1)}
@@ -255,6 +302,7 @@ def train(cfg: dict, git_commit: str = "unknown"):
     device    = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     train_cfg = cfg["train"]
     model_cfg = cfg["model"]
+    data_cfg  = cfg["data"]
 
     print(f"[Train] Device: {device}")
 
@@ -274,8 +322,19 @@ def train(cfg: dict, git_commit: str = "unknown"):
     # ── Data ──────────────────────────────────────────────────────────────
     train_loader = build_dataloader(cfg, split="train") # 跑最小的训练集，验证loss能不能降到最低。
     val_loader   = build_dataloader(cfg, split="train")
-    print(f"[Train] train={len(train_loader.dataset)} windows, "
-          f"val={len(val_loader.dataset)} windows")
+
+    # ── Push-forward & noise config ──────────────────────────────────────
+    push_K     = int(train_cfg.get("push_forward_k", 1))
+    noise_std  = float(train_cfg.get("noise_std", 0.0))
+    dt         = float(data_cfg.get("dt", 0.004))
+    print(f"[Train] push_forward_k = {push_K}, noise_std = {noise_std}, dt = {dt}")
+    
+    # ── Pre-load normalization stats as GPU tensors (for in-graph denorm/renorm) ──
+    norm_stats = NormStats(cfg["data"]["metadata_path"])
+    acc_mean = torch.from_numpy(norm_stats._mean["acceleration"]).to(device).float()  # (3,)
+    acc_std  = torch.from_numpy(norm_stats._std ["acceleration"]).to(device).float()
+    vel_mean = torch.from_numpy(norm_stats._mean["velocity"    ]).to(device).float()
+    vel_std  = torch.from_numpy(norm_stats._std ["velocity"    ]).to(device).float()
     
     # all_targets = []
     # for batch in train_loader:
@@ -324,62 +383,114 @@ def train(cfg: dict, git_commit: str = "unknown"):
 
     try:
         while step < nsteps:
-            for x, y, x_pos in train_loader:
+            for batch in train_loader:
                 if step >= nsteps:
                     break
                 
-                x, y, x_pos = x.to(device), y.to(device), x_pos.to(device)   # x: (B,N,T*C) vel, y: (B,N,3), x_pos: (B,N,3)
-                x_sdf = compute_sdf_batch(x_pos[...,:2]) # (B, N)
-                x_sdf = x_sdf.transpose(1, 2) # (B,T,N) -> (B,N,T)
-
-                x = torch.cat([x, x_sdf], dim=-1)
-
-                # ── Forward ───────────────────────────────────────────────
-                pred = model(x)                      # (B, N, 4)
-
-                # ── Loss (Relative L2 on acceleration) ────────────────────
-                loss, _ = compute_loss(pred, y)
-
+                # ── Unpack batch (5 tensors from new BVCSlicedDataset) ────
+                x_vel, future_acc, input_pos, future_pos, v_last_phys = batch
+                # x_vel:       (B, N, T_in*3)   normalized velocity, flattened
+                # future_acc:  (B, N, K, 3)     K-step normalized acceleration targets
+                # input_pos:   (B, N, T_in, 3)  raw input positions
+                # future_pos:  (B, N, K, 3)     raw future positions (for SDF rolling)
+                # v_last_phys: (B, N, 3)        physical velocity at last input frame
+                
+                x_vel       = x_vel.to(device)
+                future_acc  = future_acc.to(device)
+                input_pos   = input_pos.to(device)
+                future_pos  = future_pos.to(device)
+                v_last_phys = v_last_phys.to(device)
+                
+                B, N, _ = x_vel.shape
+                T_in    = input_pos.shape[2]
+                
+                # Reshape x_vel back to (B, N, T_in, 3) for window manipulation
+                v_window_norm = x_vel.view(B, N, T_in, 3)        # (B, N, T_in, 3)
+                pos_window    = input_pos                          # (B, N, T_in, 3)
+                v_phys_curr   = v_last_phys                        # (B, N, 3)
+                
+                # ── Push-forward K-step training loop ─────────────────────
+                total_loss = 0.0
+                step_losses = []   # for per-step logging
+                
+                for k in range(push_K):
+                    # Noise injection: add to velocity window only on input
+                    if noise_std > 0:
+                        v_window_input = v_window_norm + torch.randn_like(v_window_norm) * noise_std
+                    else:
+                        v_window_input = v_window_norm
+                    
+                    # Build model input: flatten T_in dim into channels, concat SDF
+                    x_vel_flat = v_window_input.reshape(B, N, -1)         # (B, N, T_in*3)
+                    x_sdf      = build_sdf_window(pos_window)             # (B, N, T_in)
+                    x_in       = torch.cat([x_vel_flat, x_sdf], dim=-1)   # (B, N, T_in*4)
+                    
+                    # Forward
+                    # a_pred = model(x_in)                                  # (B, N, 3)
+                    a_pred = checkpoint(model, x_in, use_reentrant=False)
+                    
+                    # Loss for this step
+                    target_k = future_acc[:, :, k, :]                     # (B, N, 3)
+                    loss_k, _ = compute_loss(a_pred, target_k)
+                    total_loss = total_loss + loss_k
+                    step_losses.append(loss_k.item())
+                    
+                    # If not last step, prepare next iteration
+                    if k < push_K - 1:
+                        v_window_norm, v_phys_curr = push_forward_step(
+                            v_window_norm, a_pred, v_phys_curr,
+                            acc_mean, acc_std, vel_mean, vel_std, dt,
+                        )
+                        # Slide position window: use GT future position for SDF
+                        new_pos = future_pos[:, :, k:k+1, :]               # (B, N, 1, 3)
+                        pos_window = torch.cat(
+                            [pos_window[:, :, 1:, :], new_pos],
+                            dim=2,
+                        )                                                  # (B, N, T_in, 3)
+                
+                loss = total_loss / push_K
+                
                 # ── Backward ──────────────────────────────────────────────
                 optimizer.zero_grad()
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
                 optimizer.step()
                 scheduler.step()
-
+                
                 step  += 1
                 lr_now = scheduler.get_last_lr()[0]
-
+                
                 # ── Step log ──────────────────────────────────────────────
                 wandb_log = {
-                    "train/loss":            loss.item(),
-                    "lr":                    lr_now,
+                    "train/loss":  loss.item(),
+                    "lr":          lr_now,
                 }
-
+                # Per-step push-forward losses (only useful if K > 1)
+                for k, lk in enumerate(step_losses):
+                    wandb_log[f"train/loss_step{k}"] = lk
+                
                 if step % 10 == 0:
+                    step_str = " | ".join(f"k{i}={lk:.4f}" for i, lk in enumerate(step_losses))
                     print(f"[Train] Step {step}/{nsteps} | "
-                          f"loss={loss.item():.5f} | lr={lr_now:.2e}")
-
+                          f"loss={loss.item():.5f} | {step_str} | lr={lr_now:.2e}")
+                
                 # ── Validation + checkpoint ───────────────────────────────
                 if step % nsave == 0:
                     val_metrics = run_validation(model, val_loader, device)
                     val_loss = val_metrics["loss"]
-
+                    
                     meta_payload = {
                         "step":       step,
                         "val_loss":   val_loss,
                         "git_commit": git_commit,
                         "experiment": cfg["name"],
                     }
-
-                    # Always save latest
+                    
                     _save_checkpoint(model, save_dir / "checkpoint-latest", meta_payload)
-
-                    # Save per-step checkpoint
+                    
                     step_name = f"model-step-{step:06d}"
                     _save_checkpoint(model, save_dir / step_name, meta_payload)
-
-                    # Prune to top-K by val_loss
+                    
                     ckpt_history.append({"step": step, "val_loss": val_loss, "file": step_name})
                     ckpt_history.sort(key=lambda r: r["val_loss"])
                     for stale in ckpt_history[keep_top_k:]:
@@ -389,28 +500,26 @@ def train(cfg: dict, git_commit: str = "unknown"):
                                 p.unlink()
                     ckpt_history = ckpt_history[:keep_top_k]
                     manifest_path.write_text(json.dumps(ckpt_history, indent=2))
-
-                    # Save best
+                    
                     if val_loss < best_val_loss:
                         best_val_loss = val_loss
                         _save_checkpoint(model, save_dir / "checkpoint-best", meta_payload)
                         tick = "✓ NEW BEST"
                     else:
                         tick = ""
-
-                    print(f"[Val]   Step {step} | "
-                          f"val_loss={val_loss:.5f} | "
+                    
+                    print(f"[Val]   Step {step} | val_loss={val_loss:.5f} | "
                           f"best={best_val_loss:.5f} {tick}")
-
+                    
                     wandb_log.update({f"val/{k}": v for k, v in val_metrics.items()})
                     model.train()
-
+                
                 if wandb_run:
                     wandb_run.log(wandb_log, step=step)
-
+    
     except KeyboardInterrupt:
         print("[Train] Interrupted by user")
-
+    
     print(f"[Train] Done — best val_loss: {best_val_loss:.5f}")
     return best_val_loss
 
