@@ -1,5 +1,5 @@
 name: "sc_009"
-description: "change loss to acceleration-only MSE loss, k = 2"
+description: "change loss to acceleration-only MSE loss, k = 2, 1000 training steps"
 model:
   name: "transolver_net"                        # registry key
   params: "configs/params/transolver_net.yaml"  # base params file
@@ -19,7 +19,7 @@ overrides:
   train.lr: 0.001
   train.min_lr: 1e-6
   train.batch_size: 2
-  train.ntraining_steps: 5000
+  train.ntraining_steps: 1000
   train.scheduler_step_size: 5000
   train.push_forward_k: 2
 
