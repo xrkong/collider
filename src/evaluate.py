@@ -1,4 +1,15 @@
-"""Offline evaluation script — loads a model and runs on test set.
+"""Offline evaluation — velocity → acceleration, with sparse-signal diagnostics.
+
+Loads a trained TransolverNet checkpoint and runs on the test set. Reports:
+  - L1 loss (matches train.py), with zero-prediction baseline & skill score
+  - Normalized & physical-space RMSE for acceleration
+  - Active vs quiet node partition (diagnoses sparse-signal failure modes)
+
+Matches the current train.py:
+  - Input:  velocity-only, no SDF (B, N, T_in*3)
+  - Output: acceleration only (B, N, 3), predicted directly (NOT residual)
+  - Target: future_acc[:, :, 0, :]  (k=0, one-step)
+  - Loss:   L1 in normalized space
 
 Usage:
     # From W&B artifact
@@ -21,7 +32,6 @@ import sys
 from pathlib import Path
 
 import torch
-import torch.nn.functional as F
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
@@ -41,9 +51,6 @@ try:
     _SAFETENSORS = True
 except ImportError:
     _SAFETENSORS = False
-
-_STRESS_START = 9
-_STRESS_END   = 15
 
 
 # ── Shared: build model and load weights ──────────────────────────────────────
@@ -101,9 +108,7 @@ def load_model_from_checkpoint(checkpoint_path: str, experiment_path: str):
 
     Args:
         checkpoint_path: Path to .safetensors or .pt file.
-                         e.g. ``outputs/checkpoints/exp_001/checkpoint-best.safetensors``
         experiment_path: Experiment yaml used during training.
-                         e.g. ``configs/experiments/exp_001.yaml``
 
     Returns:
         Tuple[nn.Module, dict]: (model, cfg)
@@ -117,7 +122,6 @@ def load_model_from_checkpoint(checkpoint_path: str, experiment_path: str):
     cfg        = load_config(experiment_path)
     model_name = cfg["model"]["name"]
 
-    # Print sidecar metadata if available
     json_path = ckpt_path.with_suffix(".json")
     if json_path.exists():
         with open(json_path) as f:
@@ -134,23 +138,8 @@ def load_model_from_checkpoint(checkpoint_path: str, experiment_path: str):
     return model, cfg
 
 
-# ── Von Mises ─────────────────────────────────────────────────────────────────
-
-def _von_mises(stress: torch.Tensor) -> torch.Tensor:
-    s = stress
-    return torch.sqrt(0.5 * (
-        (s[..., 0] - s[..., 1]) ** 2
-        + (s[..., 1] - s[..., 2]) ** 2
-        + (s[..., 2] - s[..., 0]) ** 2
-        + 6.0 * (s[..., 3] ** 2 + s[..., 4] ** 2 + s[..., 5] ** 2)
-    ) + 1e-12)
-
-_POS_S, _POS_E = 0, 3
-_VEL_S, _VEL_E = 3, 6
-_ACC_S, _ACC_E = 6, 9
-_STR_S, _STR_E = 9, 15
-
 # ── Evaluation loop ───────────────────────────────────────────────────────────
+
 @torch.no_grad()
 def run_evaluation(
     model:      torch.nn.Module,
@@ -160,128 +149,113 @@ def run_evaluation(
 ):
     """Run full test-set evaluation and save metrics.json.
 
-    Reports per-quantity losses (consistent with training), physical-space
-    RMSE for position & stress, and a last-frame-copy baseline for context.
+    Reports the training loss (L1) plus diagnostic metrics for sparse-signal data:
+    zero-prediction baseline, MSE/L1 skill scores, physical-space RMSE,
+    and active vs quiet node partition (to detect "model collapsed to zero" failures).
     """
     out_dir = Path(output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    norm_stats  = NormStats(cfg["data"]["metadata_path"])
+    # ── Normalization stats (for physical-space RMSE) ─────────────────────
+    norm_stats = NormStats(cfg["data"]["metadata_path"])
+    acc_mean = torch.from_numpy(norm_stats._mean["acceleration"]).to(device).float()  # (3,)
+    acc_std  = torch.from_numpy(norm_stats._std ["acceleration"]).to(device).float()  # (3,)
+
+    # ── Active-node threshold (normalized space) ──────────────────────────
+    # Used for the sparse-signal diagnostic. Override via cfg["eval"]["active_threshold"].
+    eval_cfg = cfg.get("eval", {}) or {}
+    active_thresh = float(eval_cfg.get("active_threshold", 0.1))
+
     model.to(device).eval()
 
     test_loader = build_dataloader(cfg, split="test")
-    print(f"[Eval] Test set: {len(test_loader.dataset)} windows")
+    print(f"[Eval] Test set:         {len(test_loader.dataset)} windows")
+    print(f"[Eval] Active threshold: |a_norm| > {active_thresh}")
 
-    # ── Loss weights (read from cfg, same as training) ────────────────────
-    train_cfg = cfg["train"]
-    loss_w_pos    = float(train_cfg.get("loss_weight_position",     1.0))
-    loss_w_vel    = float(train_cfg.get("loss_weight_velocity",     0.0))
-    loss_w_acc    = float(train_cfg.get("loss_weight_acceleration", 0.0))
-    loss_w_stress = float(train_cfg.get("loss_weight_stress",       1.0))
-    loss_w_vm     = float(train_cfg.get("loss_weight_vm",           1.0))
+    # ── Sum-based accumulators (more accurate than batch-mean) ────────────
+    n_elem    = 0
+    n_windows = 0
+    sum_abs_err     = 0.0   # → L1 model
+    sum_abs_target  = 0.0   # → L1 zero-prediction baseline (== mean |target|)
+    sum_sq_err      = 0.0   # → MSE/RMSE in normalized space
+    sum_sq_target   = 0.0   # → MSE skill score
+    sum_sq_err_phys = 0.0   # → physical RMSE (m/s²)
 
-    # ── Sample-weighted accumulators (more accurate than batch-mean) ──────
-    # We accumulate sum-of-squared-errors and total element count, then
-    # take sqrt at the end for true RMSE. Loss values use sample-count weighting.
-    n_samples = 0          # total windows seen (B summed over batches)
-    sums = {
-        # weighted MSE losses (× B per batch)
-        "loss":        0.0,
-        "loss_pos":    0.0,
-        "loss_vel":    0.0,
-        "loss_acc":    0.0,
-        "loss_stress": 0.0,
-        "loss_vm":     0.0,
-        # baseline (last-frame copy, no model)
-        "baseline_loss_pos":    0.0,
-        "baseline_loss_stress": 0.0,
-    }
-    # squared-error sums for true physical-space RMSE
-    sse_pos_phys     = 0.0
-    sse_stress_phys  = 0.0
-    sse_vm_phys      = 0.0
-    n_elem_pos       = 0
-    n_elem_stress    = 0
-    n_elem_vm        = 0
+    # Active/quiet partition (per-node; broadcast to all 3 accel components)
+    sum_sq_err_active = 0.0
+    sum_sq_err_quiet  = 0.0
+    n_elem_active = 0
+    n_elem_quiet  = 0
 
-    for x, y in test_loader:
-        x, y = x.to(device), y.to(device)
-        bs   = x.size(0)
+    for batch in test_loader:
+        # Match BVCDataset 5-tensor format used by train.py
+        x_vel, future_acc, input_pos, future_pos, v_last_phys = batch
+        x_vel      = x_vel.to(device)
+        future_acc = future_acc.to(device)
 
-        # ── Model forward + residual reconstruction (same as training) ────
-        pred_residual = model(x)
-        last_frame    = x[..., -15:]
-        pred          = pred_residual + last_frame
+        # Velocity-only input (matches current train.py; SDF is commented out there)
+        x_in = x_vel
+        pred   = model(x_in)              # (B, N, 3) — direct acceleration prediction
+        target = future_acc[:, :, 0, :]   # (B, N, 3) — k=0 (one-step), matches val
 
-        # ── Per-quantity losses (normalized space) ────────────────────────
-        loss_pos    = F.mse_loss(pred[..., _POS_S:_POS_E], y[..., _POS_S:_POS_E]).item()
-        loss_vel    = F.mse_loss(pred[..., _VEL_S:_VEL_E], y[..., _VEL_S:_VEL_E]).item()
-        loss_acc    = F.mse_loss(pred[..., _ACC_S:_ACC_E], y[..., _ACC_S:_ACC_E]).item()
+        # ── Element-wise errors ──────────────────────────────────────────
+        err     = pred - target
+        sq_err  = err ** 2
+        abs_err = err.abs()
 
-        pred_stress = pred[..., _STR_S:_STR_E]
-        true_stress = y[...,    _STR_S:_STR_E]
-        loss_stress = F.mse_loss(pred_stress, true_stress).item()
-        loss_vm     = F.mse_loss(_von_mises(pred_stress), _von_mises(true_stress)).item()
+        sum_abs_err     += abs_err.sum().item()
+        sum_abs_target  += target.abs().sum().item()
+        sum_sq_err      += sq_err.sum().item()
+        sum_sq_target   += (target ** 2).sum().item()
 
-        loss_total  = (loss_w_pos    * loss_pos
-                     + loss_w_vel    * loss_vel
-                     + loss_w_acc    * loss_acc
-                     + loss_w_stress * loss_stress
-                     + loss_w_vm     * loss_vm)
+        # ── Physical-space error (denormalize: x_phys = x_norm * std + mean) ──
+        pred_phys   = pred   * acc_std + acc_mean
+        target_phys = target * acc_std + acc_mean
+        sum_sq_err_phys += ((pred_phys - target_phys) ** 2).sum().item()
 
-        # ── Last-frame-copy baseline (pred = last_frame, residual = 0) ────
-        baseline_loss_pos    = F.mse_loss(last_frame[..., _POS_S:_POS_E],
-                                          y[...,         _POS_S:_POS_E]).item()
-        baseline_loss_stress = F.mse_loss(last_frame[..., _STR_S:_STR_E],
-                                          y[...,         _STR_S:_STR_E]).item()
+        # ── Active vs quiet partition ────────────────────────────────────
+        # A node is "active" if any acceleration component exceeds threshold.
+        # This separates the few impact-zone nodes from the many near-zero ones.
+        node_mag    = target.abs().max(dim=-1).values             # (B, N)
+        active_mask = (node_mag > active_thresh)                  # (B, N)
+        active_3d   = active_mask.unsqueeze(-1).expand_as(sq_err) # (B, N, 3)
+        quiet_3d    = ~active_3d
 
-        # ── Physical-space errors (denormalized) ──────────────────────────
-        # Note: key must match metadata — adjust "position" / "positions" to your NormStats.
-        pred_pos_phys   = norm_stats.denormalize_tensor("positions", pred[..., _POS_S:_POS_E])
-        true_pos_phys   = norm_stats.denormalize_tensor("positions", y[...,    _POS_S:_POS_E])
-        pred_str_phys   = norm_stats.denormalize_tensor("stress",   pred_stress)
-        true_str_phys   = norm_stats.denormalize_tensor("stress",   true_stress)
+        sum_sq_err_active += sq_err[active_3d].sum().item()
+        sum_sq_err_quiet  += sq_err[quiet_3d ].sum().item()
+        n_elem_active     += int(active_3d.sum().item())
+        n_elem_quiet      += int(quiet_3d .sum().item())
 
-        sse_pos_phys    += ((pred_pos_phys - true_pos_phys) ** 2).sum().item()
-        sse_stress_phys += ((pred_str_phys - true_str_phys) ** 2).sum().item()
-        n_elem_pos      += pred_pos_phys.numel()
-        n_elem_stress   += pred_str_phys.numel()
+        n_elem    += target.numel()
+        n_windows += x_vel.size(0)
 
-        # VM in physical space
-        pred_vm_phys    = _von_mises(pred_str_phys)
-        true_vm_phys    = _von_mises(true_str_phys)
-        sse_vm_phys    += ((pred_vm_phys - true_vm_phys) ** 2).sum().item()
-        n_elem_vm      += pred_vm_phys.numel()
-
-        # ── Accumulate (weighted by batch size) ───────────────────────────
-        sums["loss"]                  += loss_total            * bs
-        sums["loss_pos"]              += loss_pos              * bs
-        sums["loss_vel"]              += loss_vel              * bs
-        sums["loss_acc"]              += loss_acc              * bs
-        sums["loss_stress"]           += loss_stress           * bs
-        sums["loss_vm"]               += loss_vm               * bs
-        sums["baseline_loss_pos"]     += baseline_loss_pos     * bs
-        sums["baseline_loss_stress"]  += baseline_loss_stress  * bs
-        n_samples                     += bs
-
-    # ── Final metrics ─────────────────────────────────────────────────────
-    metrics = {f"test/{k}": v / n_samples for k, v in sums.items()}
-
-    # True element-wise RMSE in physical units (m, Pa, etc.)
-    metrics["test/pos_rmse_phys"]    = (sse_pos_phys    / n_elem_pos)    ** 0.5
-    metrics["test/stress_rmse_phys"] = (sse_stress_phys / n_elem_stress) ** 0.5
-    metrics["test/vm_rmse_phys"]     = (sse_vm_phys     / n_elem_vm)     ** 0.5
-
-    # How much better is the model vs. just copying the last frame?
+    # ── Aggregate metrics ─────────────────────────────────────────────────
     eps = 1e-12
-    metrics["test/pos_skill_score"] = (
-        1.0 - metrics["test/loss_pos"] / (metrics["test/baseline_loss_pos"] + eps)
-    )
-    metrics["test/stress_skill_score"] = (
-        1.0 - metrics["test/loss_stress"] / (metrics["test/baseline_loss_stress"] + eps)
-    )
+    l1_model = sum_abs_err    / n_elem
+    l1_zero  = sum_abs_target / n_elem
+    mse_norm = sum_sq_err     / n_elem
+    mse_zero = sum_sq_target  / n_elem
 
-    metrics["n_windows"] = len(test_loader.dataset)
+    metrics = {
+        # ── Training-matching loss & baselines ──
+        "test/loss_l1":                l1_model,
+        "test/loss_l1_zero_baseline":  l1_zero,                                    # = mean(|target|)
+        "test/skill_l1_vs_zero":       1.0 - l1_model / max(l1_zero, eps),         # >0 means beats zero pred
+
+        # ── RMSE (normalized & physical) ──
+        "test/rmse_norm":              mse_norm ** 0.5,
+        "test/rmse_phys":              (sum_sq_err_phys / n_elem) ** 0.5,          # m/s² (or whatever physical unit)
+        "test/skill_mse_vs_zero":      1.0 - mse_norm / max(mse_zero, eps),
+
+        # ── Sparse-signal diagnostic ──
+        "test/rmse_norm_active":       (sum_sq_err_active / max(n_elem_active, 1)) ** 0.5,
+        "test/rmse_norm_quiet":        (sum_sq_err_quiet  / max(n_elem_quiet,  1)) ** 0.5,
+        "test/active_node_ratio":      n_elem_active / max(n_elem_active + n_elem_quiet, 1),
+
+        # ── Meta ──
+        "n_windows":                   n_windows,
+        "active_threshold":            active_thresh,
+    }
 
     # ── Save & print ──────────────────────────────────────────────────────
     metrics_path = out_dir / "metrics.json"
@@ -291,15 +265,36 @@ def run_evaluation(
     print("\n[Eval] Test results:")
     for k, v in metrics.items():
         if isinstance(v, float):
-            print(f"  {k}: {v:.6f}")
+            print(f"  {k:36s} {v:.6f}")
         else:
-            print(f"  {k}: {v}")
-    print(f"[Eval] Saved → {metrics_path}")
+            print(f"  {k:36s} {v}")
+    print(f"\n[Eval] Saved → {metrics_path}")
+
+    # ── Interpretive hints ────────────────────────────────────────────────
+    skill_mse = metrics["test/skill_mse_vs_zero"]
+    skill_l1  = metrics["test/skill_l1_vs_zero"]
+    rmse_a    = metrics["test/rmse_norm_active"]
+    rmse_q    = metrics["test/rmse_norm_quiet"]
+
+    print("\n[Eval] Diagnosis:")
+    if skill_mse <= 0 or skill_l1 <= 0:
+        print(f"  ⚠ skill_mse={skill_mse:+.4f}, skill_l1={skill_l1:+.4f} — "
+              f"model is NOT beating zero prediction. Loss/data design issue.")
+    elif skill_mse < 0.1:
+        print(f"  ⚠ skill_mse={skill_mse:.4f} — model only marginally beats zero baseline.")
+    else:
+        print(f"  ✓ skill_mse={skill_mse:.4f}, skill_l1={skill_l1:.4f}")
+
+    if rmse_q > 0 and rmse_a / max(rmse_q, eps) > 3.0:
+        print(f"  ⚠ rmse_active ({rmse_a:.4f}) >> rmse_quiet ({rmse_q:.4f}) — "
+              f"model collapsed to predicting near-zero on impact nodes too. "
+              f"Sparse-signal failure mode.")
 
     if _WANDB_AVAILABLE and wandb.run:
         wandb.log(metrics)
 
     return metrics
+
 
 # ── Entry point ───────────────────────────────────────────────────────────────
 

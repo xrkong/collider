@@ -9,7 +9,6 @@ from pathlib import Path
 from typing import Optional
 
 import torch
-import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint
 import yaml
 
@@ -231,14 +230,17 @@ def relative_l2_loss(pred: torch.Tensor, target: torch.Tensor, eps: float = 1e-3
     return (squared_diff / denominator).mean()
 
 def compute_loss(pred: torch.Tensor, target: torch.Tensor) -> tuple[torch.Tensor, dict]:
-    """Acceleration-only relative L1 loss.
+    """Acceleration-only MSE loss.
 
     pred, target: (B, N, D_acc)
     """
-    loss_criterion = torch.nn.L1Loss(reduction='none')
-    loss_per_var = loss_criterion(pred, target).mean(dim=0)
-    loss = loss_per_var.mean()
+    # loss_criterion = torch.nn.L1Loss(reduction='none')
+    # loss_per_var = loss_criterion(pred, target).mean(dim=0)
+    # loss = loss_per_var.mean()
+    loss = torch.nn.functional.mse_loss(pred, target)
     return loss, {"loss_L1": loss.item()}
+
+
 
 def compute_sdf_batch(xy: torch.Tensor, 
                     barrier_angle_deg: float=-25.4, 
@@ -279,9 +281,9 @@ def run_validation(model, val_loader, device) -> dict:
         B, N, _ = x_vel.shape
         T_in    = input_pos.shape[2]
         
-        # x_sdf = compute_sdf_batch(input_pos[..., :2])   # (B, N, T_in)
-        # x_in  = torch.cat([x_vel, x_sdf], dim=-1)
-        x_in = x_vel  # ablation: no SDF
+        x_sdf = compute_sdf_batch(input_pos[..., :2])   # (B, N, T_in)
+        x_in  = torch.cat([x_vel, x_sdf], dim=-1)
+        # x_in = x_vel  # ablation: no SDF
         
         pred = model(x_in)
 
@@ -336,18 +338,26 @@ def train(cfg: dict, git_commit: str = "unknown"):
     vel_mean = torch.from_numpy(norm_stats._mean["velocity"    ]).to(device).float()
     vel_std  = torch.from_numpy(norm_stats._std ["velocity"    ]).to(device).float()
     
-    # all_targets = []
-    # for batch in train_loader:
-    #     _, y, _ = batch
-    #     all_targets.append(y.flatten())
-    # all_targets = torch.cat(all_targets)
+    # 流式累加，不要堆全部 target 到内存
+    sum_abs = 0.0
+    sum_sq  = 0.0
+    n_active_01 = 0
+    n_active_05 = 0
+    n_total = 0
+    for batch in train_loader:
+        _, future_acc, _, _, _ = batch    # 5 元组
+        target = future_acc[:, :, 0, :]    # k=0
+        abs_t = target.abs()
+        sum_abs     += abs_t.sum().item()
+        sum_sq      += (target ** 2).sum().item()
+        n_active_01 += (abs_t > 0.1).sum().item()
+        n_active_05 += (abs_t > 0.5).sum().item()
+        n_total     += target.numel()
 
-    # print(f"target 统计:")
-    # print(f"  绝对值最小: {all_targets.abs().min():.6f}")
-    # print(f"  绝对值中位数: {all_targets.abs().median():.6f}")
-    # print(f"  |target| < 1e-3 占比: {(all_targets.abs() < 1e-3).float().mean():.4%}")
-    # print(f"  |target| < 1e-2 占比: {(all_targets.abs() < 1e-2).float().mean():.4%}")
-    # print(f"  |target| < 1e-1 占比: {(all_targets.abs() < 1e-1).float().mean():.4%}")
+    print(f"mean |a|:             {sum_abs / n_total:.6f}   # 期望 ≈ 0.23")
+    print(f"rms  |a|:             {(sum_sq / n_total) ** 0.5:.6f}")
+    print(f"active ratio (>0.1):  {n_active_01 / n_total:.4%}")
+    print(f"active ratio (>0.5):  {n_active_05 / n_total:.4%}")
 
     grad_clip = float(train_cfg.get("grad_clip", 1.0))
 
@@ -423,8 +433,8 @@ def train(cfg: dict, git_commit: str = "unknown"):
                     # Build model input: flatten T_in dim into channels, concat SDF
                     x_vel_flat = v_window_input.reshape(B, N, -1)         # (B, N, T_in*3)
                     x_sdf      = build_sdf_window(pos_window)             # (B, N, T_in)
-                    # x_in       = torch.cat([x_vel_flat, x_sdf], dim=-1)   # (B, N, T_in*4)
-                    x_in = x_vel_flat  # 先试验只用速度输入，看看能不能学会推车，SDF先放一边。
+                    x_in       = torch.cat([x_vel_flat, x_sdf], dim=-1)   # (B, N, T_in*4)
+                    # x_in = x_vel_flat  # 先试验只用速度输入，看看能不能学会推车，SDF先放一边。
                     
                     # Forward
                     # a_pred = model(x_in)                                  # (B, N, 3)
