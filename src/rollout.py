@@ -281,7 +281,8 @@ def run_onestep(model, raw_data, normed, norm_stats, device) -> dict:
         x_sdf = compute_sdf_batch(torch.from_numpy(input_pos[..., 0:2])).to(device)
 
         
-        x = torch.cat([x_in, x_sdf.unsqueeze(0) ], dim=-1)
+        # x = torch.cat([x_in, x_sdf.unsqueeze(0) ], dim=-1)
+        x = x_in
 
         a_pred_norm = model(x).squeeze(0)            # (N, 3)
 
@@ -334,7 +335,8 @@ def run_autoregressive(model, raw_data, normed, norm_stats, device) -> dict:
         x_sdf = torch.from_numpy(x_sdf) # (N,T,3)
         x_sdf = compute_sdf_batch(x_sdf[..., 0:2]).to(device) # (N,T,2)
         
-        x = torch.cat([x_in, x_sdf.unsqueeze(0) ], dim=-1)
+        # x = torch.cat([x_in, x_sdf.unsqueeze(0) ], dim=-1)
+        x = x_in
 
         a_pred_norm = model(x).squeeze(0)            # (N, 3)
 

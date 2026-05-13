@@ -248,7 +248,6 @@ def compute_sdf_batch(xy: torch.Tensor,
     car_points: (B, N, 2) 整个 Batch 的车辆点云，必须已经在 GPU 上
     barrier_angle_deg: 护栏角度 (标量) impace degree -25.4
     barrier_anchor: (2,) 护栏基准点，必须在 GPU 上 xy=(0,2000)
-
     """
     device = xy.device
     if barrier_anchor is None:
@@ -280,8 +279,9 @@ def run_validation(model, val_loader, device) -> dict:
         B, N, _ = x_vel.shape
         T_in    = input_pos.shape[2]
         
-        x_sdf = compute_sdf_batch(input_pos[..., :2])   # (B, N, T_in)
-        x_in  = torch.cat([x_vel, x_sdf], dim=-1)
+        # x_sdf = compute_sdf_batch(input_pos[..., :2])   # (B, N, T_in)
+        # x_in  = torch.cat([x_vel, x_sdf], dim=-1)
+        x_in = x_vel  # ablation: no SDF
         
         pred = model(x_in)
 
@@ -423,7 +423,8 @@ def train(cfg: dict, git_commit: str = "unknown"):
                     # Build model input: flatten T_in dim into channels, concat SDF
                     x_vel_flat = v_window_input.reshape(B, N, -1)         # (B, N, T_in*3)
                     x_sdf      = build_sdf_window(pos_window)             # (B, N, T_in)
-                    x_in       = torch.cat([x_vel_flat, x_sdf], dim=-1)   # (B, N, T_in*4)
+                    # x_in       = torch.cat([x_vel_flat, x_sdf], dim=-1)   # (B, N, T_in*4)
+                    x_in = x_vel_flat  # 先试验只用速度输入，看看能不能学会推车，SDF先放一边。
                     
                     # Forward
                     # a_pred = model(x_in)                                  # (B, N, 3)
