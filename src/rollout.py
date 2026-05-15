@@ -71,9 +71,6 @@ FEAT_SLICES   = {
     "acceleration": (6,  9),
 }
 
-INPUT_FEATURE  = "velocity"
-TARGET_FEATURE = "acceleration"
-
 
 # ── Model loading ─────────────────────────────────────────────────────────────
 
@@ -205,30 +202,6 @@ def _pack_pos_only(pos_list):
         arr[i, :, 0:3] = p
     return arr
 
-
-def reconstruct_absolute(pred_residual: torch.Tensor,
-                          last_frame_normed: np.ndarray,
-                          norm_stats: NormStats) -> dict:
-    """Convert normalized residual prediction back to physical-space absolute values.
-
-    pred_absolute (normalized) = pred_residual + last_frame_normed
-    then denormalize each feature.
-
-    Args:
-        pred_residual:    (N, 15) normalized residual from model
-        last_frame_normed: (N, 15) normalized last input frame
-        norm_stats:        NormStats for denormalization
-
-    Returns:
-        dict of {feat: np.ndarray (N, C)} in physical units
-    """
-    pred_norm = pred_residual.cpu().numpy() + last_frame_normed   # (N, 15)
-    result = {}
-    for feat, (s, e) in FEAT_SLICES.items():
-        result[feat] = norm_stats.denormalize(feat, pred_norm[:, s:e])
-    return result
-
-
 # ── Signed Distance Field ────────────────────────────────────────────────────────
 
 def compute_sdf_batch(xy: torch.Tensor, 
@@ -280,7 +253,6 @@ def run_onestep(model, raw_data, normed, norm_stats, device) -> dict:
 
         x_sdf = compute_sdf_batch(torch.from_numpy(input_pos[..., 0:2])).to(device)
 
-        
         x = torch.cat([x_in, x_sdf.unsqueeze(0) ], dim=-1)
         # x = x_in
 
@@ -324,6 +296,7 @@ def run_autoregressive(model, raw_data, normed, norm_stats, device) -> dict:
     # ── 初始化 ──
     # 速度窗口 (归一化, 模型输入用)
     v_window_norm = normed["velocity"][:INPUT_FRAMES].copy()       # (5, N, 3)
+    x_window_phys = raw_data["positions"][:INPUT_FRAMES].copy()  
     # 物理速度 / 位置当前状态
     v_phys = raw_data["velocity"][INPUT_FRAMES - 1].copy()         # (N, 3)
     x_phys = raw_data["positions"][INPUT_FRAMES - 1].copy()        # (N, 3)
@@ -331,9 +304,15 @@ def run_autoregressive(model, raw_data, normed, norm_stats, device) -> dict:
     for t in range(INPUT_FRAMES, T):
         x_in        = build_velocity_input_from_window(v_window_norm).to(device) # (1,N,T*C)
 
-        x_sdf = raw_data["positions"][t - INPUT_FRAMES + 1: t + 1].transpose(1, 0, 2) # (N,T,3)
-        x_sdf = torch.from_numpy(x_sdf) # (N,T,3)
-        x_sdf = compute_sdf_batch(x_sdf[..., 0:2]).to(device) # (N,T,2)
+        # x_sdf = raw_data["positions"][t - INPUT_FRAMES + 1: t + 1].transpose(1, 0, 2) # (N,T,3)
+        # x_sdf = torch.from_numpy(x_sdf) # (N,T,3)
+        # x_sdf = compute_sdf_batch(x_sdf[..., 0:2]).to(device) # (N,T,2)
+        # SDF 用滚动窗口,不再读 raw_data
+        x_sdf_in = torch.from_numpy(
+            x_window_phys[..., 0:2].transpose(1, 0, 2)              # (N, 5, 2)
+        ).float()
+        x_sdf = compute_sdf_batch(x_sdf_in).to(device)               # (N, 5)
+        x = torch.cat([x_in, x_sdf.unsqueeze(0)], dim=-1)
         
         x = torch.cat([x_in, x_sdf.unsqueeze(0) ], dim=-1)
         # x = x_in
@@ -706,7 +685,7 @@ def main():
 
     # ── Load data ─────────────────────────────────────────────────────────
     raw_data   = load_raw_h5(args.raw_h5)
-    norm_stats = NormStats(cfg["data"]["metadata_path"])
+    norm_stats = NormStats(cfg["data"]["metadata_path"], cfg["data"]["acc_scale"])
     normed     = normalize_raw(raw_data, norm_stats)
 
     # ── Baseline ──────────────────────────────────────────────────────────

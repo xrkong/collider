@@ -50,6 +50,7 @@ HDF5 layout
 from __future__ import annotations
 
 import argparse
+import json
 from fnmatch import fnmatch
 from pathlib import Path
 import shutil
@@ -569,6 +570,85 @@ def main() -> None:
     print(f"[h5] barrier:   {barrier_idx.size}/{n_nodes}")
     print(f"[h5] frontface: {frontface_idx.size}/{n_nodes}")
 
+    metadata = {
+        "config": {
+            "source": str(args.src.resolve()),
+            "output": str(args.out.resolve()),
+            "required_config": str(args.required_config.resolve()),
+            "node_stride": args.node_stride,
+            "frame_stride": args.frame_stride,
+            "n_frames": n_frames,
+            "n_nodes": n_nodes,
+            "n_parts": len(sel_part_idx),
+            "normalised": False,
+            "value_mode": "raw_physical_units",
+            "stress_components": "sxx,syy,szz,sxy,syz,sxz",
+            "velocity_source": None,
+            "acceleration_source": None,
+            "selected_part_patterns": patterns,
+        },
+        "dataset_stats": {
+            "num_simulations": 1,
+            "train_windows": 0,
+            "val_windows": 0,
+            "test_trajectories": 0,
+        },
+        "sim_mask_info": {
+            "0": {
+                "barrier_idx": int(barrier_idx.size),
+                "frontface_idx": int(frontface_idx.size),
+            }
+        },
+    }
+
+    meta_path = args.out.parent / "metadata.json"
+
+    # ── Simple stats accumulator for field summary ─────────────────────────────
+    class FieldStats:
+        """Track min, max, and online Welford mean/variance for a field."""
+        def __init__(self, name: str, dim: int):
+            self.name = name
+            self.dim = dim
+            self.count = 0
+            self.min_vals = np.full(dim, np.inf, dtype=np.float64)
+            self.max_vals = np.full(dim, -np.inf, dtype=np.float64)
+            self.mean = np.zeros(dim, dtype=np.float64)
+            self.M2 = np.zeros(dim, dtype=np.float64)
+
+        def update(self, arr: np.ndarray):
+            """arr shape (N, D) or (T, N, D) – flatten to (M, D)"""
+            arr = arr.astype(np.float64).reshape(-1, self.dim)
+            for row in arr:
+                self.count += 1
+                self.min_vals = np.minimum(self.min_vals, row)
+                self.max_vals = np.maximum(self.max_vals, row)
+                delta = row - self.mean
+                self.mean += delta / self.count
+                delta2 = row - self.mean
+                self.M2 += delta * delta2
+
+        def finalize(self) -> dict:
+            """Return {mean, std, min, max} as lists."""
+            if self.count < 2:
+                std = np.ones_like(self.mean)
+            else:
+                std = np.sqrt(self.M2 / self.count)
+            return {
+                "mean": self.mean.tolist(),
+                "std": std.tolist(),
+                "min": self.min_vals.tolist(),
+                "max": self.max_vals.tolist(),
+            }
+
+    pos_stats = FieldStats("positions", 3)
+    vel_stats = FieldStats("velocity", 3)
+    acc_stats = FieldStats("acceleration", 3)
+    stress_stats = FieldStats("stress", 6)
+
+    # accumulators for median calculation (store per-frame flattened arrays)
+    vel_accum: list[np.ndarray] = []
+    acc_accum: list[np.ndarray] = []
+    stress_accum: list[np.ndarray] = []
 
     # ══════════════════════════════════════════════════════════════════════════
     # Pass 2/2 – Extract fields frame by frame (globally time-ordered)
@@ -636,16 +716,23 @@ def main() -> None:
             times_all[fi]     = t
             h5f["states/times"][fi]     = t
             h5f["states/positions"][fi] = pos
+            pos_stats.update(pos)
 
             # ── velocity (direct or filled later numerically) ─────────────
             if has_vel:
                 vel_full = d3.arrays[ArrayType.node_velocity]
-                h5f["states/velocity"][fi] = vel_full[sidx][sel_node_idx].astype(np.float32)
+                vel_sel = vel_full[sidx][sel_node_idx].astype(np.float32)
+                h5f["states/velocity"][fi] = vel_sel
+                vel_stats.update(vel_sel)
+                vel_accum.append(vel_sel.reshape(-1, 3))
 
             # ── acceleration (direct or filled later numerically) ─────────
             if has_acc:
                 acc_full = d3.arrays[ArrayType.node_acceleration]
-                h5f["states/acceleration"][fi] = acc_full[sidx][sel_node_idx].astype(np.float32)
+                acc_sel = acc_full[sidx][sel_node_idx].astype(np.float32)
+                h5f["states/acceleration"][fi] = acc_sel
+                acc_stats.update(acc_sel)
+                acc_accum.append(acc_sel.reshape(-1, 3))
 
             # ── stress (6-component tensor, element-avg → nodes) ──────────
             solid_sf = d3.arrays.get(ArrayType.element_solid_stress)
@@ -661,6 +748,8 @@ def main() -> None:
                 n_total_nodes,
             )
             h5f["states/stress"][fi] = stress_node
+            stress_stats.update(stress_node)
+            stress_accum.append(stress_node.reshape(-1, 6))
 
             if fi % 20 == 0 or fi == n_frames - 1:
                 print(f"  [{fi+1:>5}/{n_frames}]  t = {t*1e3:.3f} ms")
@@ -671,18 +760,68 @@ def main() -> None:
     # ── Numerical fallbacks (run once over all frames in memory) ──────────────
     if not has_vel:
         print("\nComputing velocity numerically (node_velocity absent in d3plot) …")
-        h5f["states/velocity"][:] = _numerical_velocity(positions_all, times_all)
+        vel_computed = _numerical_velocity(positions_all, times_all)
+        h5f["states/velocity"][:] = vel_computed
+        vel_stats.update(vel_computed)
+        vel_accum.append(vel_computed.reshape(-1, 3))
         print("  done.")
 
     if not has_acc:
         print("\nComputing acceleration numerically (node_acceleration absent in d3plot) …")
-        h5f["states/acceleration"][:] = _numerical_acceleration(positions_all, times_all)
+        acc_computed = _numerical_acceleration(positions_all, times_all)
+        h5f["states/acceleration"][:] = acc_computed
+        acc_stats.update(acc_computed)
+        acc_accum.append(acc_computed.reshape(-1, 3))
         print("  done.")
 
     # update provenance attributes
-    h5f["metadata"].attrs["velocity_source"]     = "d3plot"     if has_vel else "numerical"
-    h5f["metadata"].attrs["acceleration_source"] = "d3plot"     if has_acc else "numerical"
+    velocity_source = "d3plot" if has_vel else "numerical"
+    acceleration_source = "d3plot" if has_acc else "numerical"
+    h5f["metadata"].attrs["velocity_source"] = velocity_source
+    h5f["metadata"].attrs["acceleration_source"] = acceleration_source
     h5f.close()
+
+    metadata["config"]["velocity_source"] = velocity_source
+    metadata["config"]["acceleration_source"] = acceleration_source
+    
+    # Finalize field statistics
+    # finalize numeric summaries
+    fs_pos = pos_stats.finalize()
+    fs_vel = vel_stats.finalize()
+    fs_acc = acc_stats.finalize()
+    fs_stress = stress_stats.finalize()
+
+    # medians
+    try:
+        pos_median = np.median(positions_all.reshape(-1, 3), axis=0).tolist()
+    except Exception:
+        pos_median = [0.0, 0.0, 0.0]
+
+    def _safe_median(accum_list, dim):
+        if not accum_list:
+            return [0.0] * dim
+        arr = np.concatenate(accum_list, axis=0)
+        return np.median(arr, axis=0).tolist()
+
+    vel_median = _safe_median(vel_accum, 3)
+    acc_median = _safe_median(acc_accum, 3)
+    stress_median = _safe_median(stress_accum, 6)
+
+    fs_pos["median"] = pos_median
+    fs_vel["median"] = vel_median
+    fs_acc["median"] = acc_median
+    fs_stress["median"] = stress_median
+
+    metadata["field_stats"] = {
+        "positions": fs_pos,
+        "velocity": fs_vel,
+        "acceleration": fs_acc,
+        "stress": fs_stress,
+    }
+    
+    with open(meta_path, "w", encoding="utf-8") as f:
+        json.dump(metadata, f, indent=2)
+    print(f"Metadata saved to {meta_path}")
 
     # ── Summary ───────────────────────────────────────────────────────────────
     size_gb = args.out.stat().st_size / 1e9

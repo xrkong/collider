@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Optional
 
 import torch
+import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint
 import yaml
 
@@ -237,8 +238,9 @@ def compute_loss(pred: torch.Tensor, target: torch.Tensor) -> tuple[torch.Tensor
     # loss_criterion = torch.nn.L1Loss(reduction='none')
     # loss_per_var = loss_criterion(pred, target).mean(dim=0)
     # loss = loss_per_var.mean()
-    loss = torch.nn.functional.mse_loss(pred, target)
-    return loss, {"loss_L1": loss.item()}
+    # loss = torch.nn.functional.mse_loss(pred, target)
+    loss = F.smooth_l1_loss(pred, target, beta=1.0)
+    return loss, {"loss_huber": loss.item()}
 
 
 
@@ -437,8 +439,8 @@ def train(cfg: dict, git_commit: str = "unknown"):
                     # x_in = x_vel_flat  # 先试验只用速度输入，看看能不能学会推车，SDF先放一边。
                     
                     # Forward
-                    # a_pred = model(x_in)                                  # (B, N, 3)
-                    a_pred = checkpoint(model, x_in, use_reentrant=False)
+                    a_pred = model(x_in)                                  # (B, N, 3)
+                    # a_pred = checkpoint(model, x_in, use_reentrant=False)
                     
                     # Loss for this step
                     target_k = future_acc[:, :, k, :]                     # (B, N, 3)
@@ -460,6 +462,22 @@ def train(cfg: dict, git_commit: str = "unknown"):
                         )                                                  # (B, N, T_in, 3)
                 
                 loss = total_loss / push_K
+
+                # if step % 50 == 0:
+                #         # 1. 梯度有没有在更新
+                #         grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), float('inf'))
+                        
+                #         # 2. 模型输出长什么样
+                #         print(f"step {step}: loss={loss.item():.4f}")
+                #         print(f"  pred:   mean={a_pred.mean():.4e}, std={a_pred.std():.4e}, "
+                #             f"abs_max={a_pred.abs().max():.4e}")
+                #         print(f"  target: mean={target_k.mean():.4e}, std={target_k.std():.4e}, "
+                #             f"abs_max={target_k.abs().max():.4e}")
+                #         print(f"  grad_norm={grad_norm:.4e}, lr={scheduler.get_last_lr()[0]:.2e}")
+                        
+                #         # 3. 输入是不是有问题
+                #         print(f"  x_in:   mean={x_in.mean():.4e}, std={x_in.std():.4e}, "
+                #             f"has_nan={torch.isnan(x_in).any().item()}")
                 
                 # ── Backward ──────────────────────────────────────────────
                 optimizer.zero_grad()

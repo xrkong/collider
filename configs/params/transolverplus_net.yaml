@@ -1,5 +1,5 @@
 model:
-  name: transolver_net
+  name: transolverplus_net
 
   # ── 空间维度 ──────────────────────────────────────────────────────────
   dim: 3

@@ -17,29 +17,14 @@ except ImportError:
 
 
 # ── Normalization stats ───────────────────────────────────────────────────────
-
 class NormStats:
-    """Holds per-feature z-score stats loaded from metadata.json.
-
-    Reads ``normalization_stats`` section:
-    ::
-
-        {
-          "normalization_stats": {
-            "positions":    {"mean": [x, y, z],          "std": [x, y, z]},
-            "velocity":     {"mean": [x, y, z],          "std": [x, y, z]},
-            "acceleration": {"mean": [x, y, z],          "std": [x, y, z]},
-            "stress":       {"mean": [s0..s5],            "std": [s0..s5]}
-          }
-        }
-
-    Args:
-        metadata_path: Path to ``metadata.json``.
-    """
-
     FEATURES = ["positions", "velocity", "acceleration", "stress"]
 
-    def __init__(self, metadata_path: str | Path):
+    def __init__(
+        self,
+        metadata_path: str | Path,
+        acc_scale: Optional[float] = None,   # ← 新增
+    ):
         path = Path(metadata_path)
         if not path.exists():
             raise FileNotFoundError(f"metadata.json not found: {path}")
@@ -47,15 +32,13 @@ class NormStats:
         with open(path) as f:
             meta = json.load(f)
 
-        raw = meta.get("normalization_stats", {})
+        raw = meta.get("field_stats", {})
         self._mean: Dict[str, np.ndarray] = {}
         self._std:  Dict[str, np.ndarray] = {}
 
         for feat in self.FEATURES:
             if feat not in raw:
-                raise KeyError(
-                    f"Feature '{feat}' missing from normalization_stats in {path}"
-                )
+                raise KeyError(f"Feature '{feat}' missing from normalization_stats in {path}")
             self._mean[feat] = np.array(raw[feat]["mean"], dtype=np.float32)
             self._std[feat]  = np.array(raw[feat]["std"],  dtype=np.float32)
 
@@ -65,17 +48,29 @@ class NormStats:
                       f"— clamped to 1.0")
                 self._std[feat][zero_mask] = 1.0
 
+        # ── asinh transform for acceleration (opt-in) ──
+        self._acc_scale: Optional[float] = float(acc_scale) if acc_scale else None
+        if self._acc_scale is not None:
+            print(f"[NormStats] acceleration uses asinh transform, scale={self._acc_scale:.2e}")
+        else:
+            print("[NormStats] acceleration uses z-score (no acc_scale provided)")
+
     def normalize(self, feature: str, arr: np.ndarray) -> np.ndarray:
-        return (arr - self._mean[feature]) / self._std[feature]
+        if feature == "acceleration" and self._acc_scale is not None:
+            return np.arcsinh(arr / self._acc_scale).astype(np.float32)
+        return ((arr - self._mean[feature]) / self._std[feature]).astype(np.float32)
 
     def denormalize(self, feature: str, arr: np.ndarray) -> np.ndarray:
-        return arr * self._std[feature] + self._mean[feature]
+        if feature == "acceleration" and self._acc_scale is not None:
+            return (self._acc_scale * np.sinh(arr)).astype(np.float32)
+        return (arr * self._std[feature] + self._mean[feature]).astype(np.float32)
 
     def denormalize_tensor(self, feature: str, t: torch.Tensor) -> torch.Tensor:
+        if feature == "acceleration" and self._acc_scale is not None:
+            return self._acc_scale * torch.sinh(t)
         mean = torch.tensor(self._mean[feature], dtype=t.dtype, device=t.device)
         std  = torch.tensor(self._std[feature],  dtype=t.dtype, device=t.device)
         return t * std + mean
-
 
 def load_norm_stats(metadata_path: str | Path) -> Optional[NormStats]:
     try:
@@ -177,7 +172,10 @@ class BVCDataset(BaseDataset):
         if data_cfg.get("normalize", True):
             meta_path = data_cfg.get("metadata_path")
             if meta_path:
-                self._stats = NormStats(meta_path)
+                self._stats = NormStats(
+                    meta_path,
+                    acc_scale=data_cfg.get("acc_scale"),
+                )
                 print(f"[Dataset] Normalization enabled — stats loaded from {meta_path}")
             else:
                 print("Warning: normalize=True but metadata_path not set — skipping normalization")
@@ -312,7 +310,10 @@ class BVCFullTrajectoryDataset(BaseDataset):
         if data_cfg.get("normalize", True):
             meta_path = data_cfg.get("metadata_path")
             if meta_path:
-                self._stats = NormStats(meta_path)
+                self._stats = NormStats(
+                    meta_path,
+                    acc_scale=data_cfg.get("acc_scale"),
+                )
 
         # self.collision_threshold = float(data_cfg.get("collision_threshold", 100.0))
 
@@ -424,7 +425,10 @@ class BVCSlicedDataset(BaseDataset):
             meta_path = data_cfg.get("metadata_path")
             if not meta_path:
                 raise ValueError("normalize=True requires metadata_path in cfg")
-            self._stats = NormStats(meta_path)
+            self._stats = NormStats(
+                meta_path,
+                acc_scale=data_cfg.get("acc_scale"),
+            )
             print(f"[BVCSlicedDataset] Normalization stats loaded from {meta_path}")
         
         # ── Load trajectories into memory ──

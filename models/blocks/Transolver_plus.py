@@ -6,6 +6,7 @@ from einops import rearrange
 import torch.distributed.nn as dist_nn
 from torch.utils.checkpoint import checkpoint
 import torch.nn.functional as F
+import torch.distributed as dist
 
 ACTIVATION = {'gelu': nn.GELU, 'tanh': nn.Tanh, 'sigmoid': nn.Sigmoid, 'relu': nn.ReLU, 'leaky_relu': nn.LeakyReLU(0.1),
               'softplus': nn.Softplus, 'ELU': nn.ELU, 'silu': nn.SiLU}
@@ -68,9 +69,33 @@ class Physics_Attention_1D_Eidetic(nn.Module):
         temperature = torch.clamp(temperature, min=0.01)
         slice_weights = gumbel_softmax(self.in_project_slice(x_mid), temperature)
         slice_norm = slice_weights.sum(2)  # B H G
-        dist_nn.all_reduce(slice_norm, op=dist_nn.ReduceOp.SUM)
+        # dist_nn.all_reduce(slice_norm, op=dist_nn.ReduceOp.SUM)
+        if dist.is_available() and dist.is_initialized():
+        # 获取当前进程组的大小
+            world_size = dist.get_world_size()
+            if world_size > 1:
+                # 如果是多卡并行，则执行全量归约（求和）
+                dist.all_reduce(slice_norm, op=dist.ReduceOp.SUM)
+                # 如果逻辑上需要求平均而非求和，可以取消下面这一行的注释
+                # slice_norm = slice_norm / world_size
+        else:
+            # 单卡模式或未初始化分布式环境
+            # slice_norm 已经在当前卡上计算完成，无需跨卡通信，直接维持现状
+            pass
         slice_token = torch.einsum("bhnc,bhng->bhgc", x_mid, slice_weights).contiguous()
-        dist_nn.all_reduce(slice_token, op=dist_nn.ReduceOp.SUM)
+        # dist_nn.all_reduce(slice_token, op=dist_nn.ReduceOp.SUM)
+        if dist.is_available() and dist.is_initialized():
+        # 获取当前进程组的大小
+            world_size = dist.get_world_size()
+            if world_size > 1:
+                # 如果是多卡并行，则执行全量归约（求和）
+                dist.all_reduce(slice_norm, op=dist.ReduceOp.SUM)
+                # 如果逻辑上需要求平均而非求和，可以取消下面这一行的注释
+                # slice_norm = slice_norm / world_size
+        else:
+            # 单卡模式或未初始化分布式环境
+            # slice_norm 已经在当前卡上计算完成，无需跨卡通信，直接维持现状
+            pass
         slice_token = slice_token / ((slice_norm + 1e-5)[:, :, :, None].repeat(1, 1, 1, self.dim_head))
 
         q_slice_token = self.to_q(slice_token)
