@@ -435,16 +435,22 @@ def train(cfg: dict, git_commit: str = "unknown"):
                     # Build model input: flatten T_in dim into channels, concat SDF
                     x_vel_flat = v_window_input.reshape(B, N, -1)         # (B, N, T_in*3)
                     x_sdf      = build_sdf_window(pos_window)             # (B, N, T_in)
+                    sdf_threshold = 50.0 / 1000.0  # 50mm in SDF units (metres)
+
                     x_in       = torch.cat([x_vel_flat, x_sdf], dim=-1)   # (B, N, T_in*4)
-                    # x_in = x_vel_flat  # 先试验只用速度输入，看看能不能学会推车，SDF先放一边。
-                    
+
+
                     # Forward
                     a_pred = model(x_in)                                  # (B, N, 3)
                     # a_pred = checkpoint(model, x_in, use_reentrant=False)
-                    
-                    # Loss for this step
-                    target_k = future_acc[:, :, k, :]                     # (B, N, 3)
-                    loss_k, _ = compute_loss(a_pred, target_k)
+
+                    # Loss for this step — only nodes within threshold of barrier
+                    target_k  = future_acc[:, :, k, :]                    # (B, N, 3)
+                    near_mask = x_sdf[:, :, -1] < sdf_threshold           # (B, N) bool
+                    if near_mask.any():
+                        loss_k, _ = compute_loss(a_pred[near_mask], target_k[near_mask])
+                    else:
+                        loss_k = torch.zeros(1, device=device, requires_grad=True).squeeze()
                     total_loss = total_loss + loss_k
                     step_losses.append(loss_k.item())
                     

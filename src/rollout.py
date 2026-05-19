@@ -11,6 +11,16 @@ Usage:
         --mode autoregressive \
         --gif --gif-fps 10 
 
+    python src/rollout.py \
+        --checkpoint outputs/checkpoints/sc_020/checkpoint-best.safetensors \
+        --experiment configs/experiments/sc_020.yaml \
+        --raw-h5 /home/kong/datasets/barrier/h5/T_lok_F_shape_barrier_9_3_100km/output.h5 \
+        --mode both --plot \
+        --compare-dirs \
+            sc_015:outputs/rollouts/sc_015 \
+            sc_018:outputs/rollouts/sc_018 \
+            sc_020:outputs/rollouts/sc_020
+
 """
 
 from __future__ import annotations
@@ -245,11 +255,13 @@ def run_onestep(model, raw_data, normed, norm_stats, device) -> dict:
 
     normed_v = normed["velocity"]                       # (T, N, 3)
     pred_pos_list, gt_pos_list, rmse_pos_steps = [], [], []
+    rmse_vel_steps, rmse_acc_steps = [], []
+    pred_acc_list, gt_acc_list = [], []
 
     for t in range(INPUT_FRAMES, T):
         x_in        = build_velocity_input(normed_v, t - 1).to(device)
 
-        input_pos = normed["positions"][t - INPUT_FRAMES + 1: t + 1].transpose(1, 0, 2) # (N,T,3)
+        input_pos = raw_data["positions"][t - INPUT_FRAMES + 1: t + 1].transpose(1, 0, 2) # (N,T,3)
 
         x_sdf = compute_sdf_batch(torch.from_numpy(input_pos[..., 0:2])).to(device)
 
@@ -263,10 +275,17 @@ def run_onestep(model, raw_data, normed, norm_stats, device) -> dict:
         x_last = raw_data["positions"][t - 1]
         dt     = dt_mean if uniform_dt else float(times[t] - times[t - 1])
 
-        _, _, x_new = integrate_accel(a_pred_norm, v_last, x_last, dt, norm_stats)
+        a_phys, v_new, x_new = integrate_accel(a_pred_norm, v_last, x_last, dt, norm_stats)
 
         x_gt = raw_data["positions"][t]
         rmse = float(np.sqrt(np.mean((x_new - x_gt) ** 2)))
+
+        v_gt = raw_data["velocity"][t]
+        a_gt = raw_data["acceleration"][t]
+        rmse_vel_steps.append(float(np.sqrt(np.mean((v_new  - v_gt) ** 2))))
+        rmse_acc_steps.append(float(np.sqrt(np.mean((a_phys - a_gt) ** 2))))
+        pred_acc_list.append(a_phys)
+        gt_acc_list.append(a_gt)
 
         pred_pos_list.append(x_new)
         gt_pos_list.append(x_gt)
@@ -275,10 +294,20 @@ def run_onestep(model, raw_data, normed, norm_stats, device) -> dict:
         if (t - INPUT_FRAMES + 1) % 50 == 0:
             print(f"  step {t-INPUT_FRAMES+1}/{T-INPUT_FRAMES} | pos_rmse={rmse:.3f}")
 
+    pred_acc_all = np.stack(pred_acc_list)   # (T_steps, N, 3)
+    gt_acc_all   = np.stack(gt_acc_list)
+    rmse_acc     = np.array(rmse_acc_steps)
+    print(f"[One-step] GT   acc |mean| = {np.abs(gt_acc_all).mean()/9810:.2f} g")
+    print(f"[One-step] Pred acc |mean| = {np.abs(pred_acc_all).mean()/9810:.2f} g")
+    print(f"[One-step] Acc RMSE mean   = {rmse_acc.mean()/9810:.2f} g")
+    print(f"[One-step] Acc RMSE/GT std = {rmse_acc.mean() / gt_acc_all.std():.3f}")
+
     return {
         "pred_frames": _pack_pos_only(pred_pos_list),
         "gt_frames":   _pack_pos_only(gt_pos_list),
         "rmse_pos":    np.array(rmse_pos_steps),
+        "rmse_vel":    np.array(rmse_vel_steps),
+        "rmse_acc":    rmse_acc,
         "mode":        "onestep",
     }
 
@@ -292,6 +321,8 @@ def run_autoregressive(model, raw_data, normed, norm_stats, device) -> dict:
     print(f"[Autoregressive] dt ≈ {dt_mean:.6g}, steps = {T - INPUT_FRAMES}")
 
     pred_pos_list, gt_pos_list, rmse_pos_steps = [], [], []
+    rmse_vel_steps, rmse_acc_steps = [], []
+    pred_acc_list, gt_acc_list = [], []
 
     # ── 初始化 ──
     # 速度窗口 (归一化, 模型输入用)
@@ -326,6 +357,13 @@ def run_autoregressive(model, raw_data, normed, norm_stats, device) -> dict:
         x_gt = raw_data["positions"][t]
         rmse = float(np.sqrt(np.mean((x_phys_new - x_gt) ** 2)))
 
+        v_gt = raw_data["velocity"][t]
+        a_gt = raw_data["acceleration"][t]
+        rmse_vel_steps.append(float(np.sqrt(np.mean((v_phys_new - v_gt) ** 2))))
+        rmse_acc_steps.append(float(np.sqrt(np.mean((a_phys_new - a_gt) ** 2))))
+        pred_acc_list.append(a_phys_new)
+        gt_acc_list.append(a_gt)
+
         pred_pos_list.append(x_phys_new)
         gt_pos_list.append(x_gt)
         rmse_pos_steps.append(rmse)
@@ -337,6 +375,9 @@ def run_autoregressive(model, raw_data, normed, norm_stats, device) -> dict:
         v_new_norm = norm_stats.normalize("velocity", v_phys_new[None])[0]   # (N, 3)
         v_window_norm = np.concatenate(
             [v_window_norm[1:], v_new_norm[None]], axis=0)                   # (5, N, 3)
+        # 把预测位置滑窗 (用于 SDF 计算)
+        x_window_phys = np.concatenate(
+            [x_window_phys[1:], x_phys_new[None]], axis=0)                  # (5, N, 3)
 
         # print(f"归一化 0 → v: {v_new_norm}")
         # print(f"real 物理v: {v_phys_new}")
@@ -352,10 +393,20 @@ def run_autoregressive(model, raw_data, normed, norm_stats, device) -> dict:
         if (t - INPUT_FRAMES + 1) % 50 == 0:
             print(f"  step {t-INPUT_FRAMES+1}/{T-INPUT_FRAMES} | pos_rmse={rmse:.3f}")
 
+    pred_acc_all = np.stack(pred_acc_list)   # (T_steps, N, 3)
+    gt_acc_all   = np.stack(gt_acc_list)
+    rmse_acc     = np.array(rmse_acc_steps)
+    print(f"[Autoregressive] GT   acc |mean| = {np.abs(gt_acc_all).mean()/9810:.2f} g")
+    print(f"[Autoregressive] Pred acc |mean| = {np.abs(pred_acc_all).mean()/9810:.2f} g")
+    print(f"[Autoregressive] Acc RMSE mean   = {rmse_acc.mean()/9810:.2f} g")
+    print(f"[Autoregressive] Acc RMSE/GT std = {rmse_acc.mean() / gt_acc_all.std():.3f}")
+
     return {
         "pred_frames": _pack_pos_only(pred_pos_list),
         "gt_frames":   _pack_pos_only(gt_pos_list),
         "rmse_pos":    np.array(rmse_pos_steps),
+        "rmse_vel":    np.array(rmse_vel_steps),
+        "rmse_acc":    rmse_acc,
         "mode":        "autoregressive",
     }
 
@@ -374,6 +425,119 @@ def compute_baseline(raw_data: dict) -> dict:
     return {
         "rmse_pos": np.array(rmse_pos)
     }
+
+
+# ── RMSE plot ────────────────────────────────────────────────────────────────
+
+_RCPARAMS = {
+    "font.family":     "Times New Roman",
+    "font.size":       11,
+    "axes.titlesize":  12,
+    "axes.labelsize":  11,
+    "legend.fontsize": 9,
+    "xtick.labelsize": 10,
+    "ytick.labelsize": 10,
+}
+_FEAT_NAMES  = ["Position",    "Velocity",    "Acceleration"]
+_FEAT_UNITS  = ["mm",          "km/h",        "g"]
+_FEAT_SCALES = [1.0,           0.0036,        1.0 / 9810.0]   # mm/s→km/h, mm/s²→g
+_RMSE_KEYS   = ["rmse_pos",    "rmse_vel",    "rmse_acc"]
+_COL_LABELS  = ["One-step",    "Autoregressive"]
+
+
+def _rmse_axes(axs, row, col, feat, unit, col_label):
+    ax = axs[row, col]
+    ax.set_title(f"{feat} ({unit}) — {col_label}")
+    ax.set_xlabel("Timestep")
+    ax.set_ylabel(f"RMSE ({unit})")
+    ax.grid(True, alpha=0.3, linestyle=":")
+    return ax
+
+
+def plot_rmse_vs_timestep(onestep: dict | None, autoreg: dict | None, out_dir: Path):
+    """3 × 2 grid: rows = pos / vel / acc, cols = one-step / autoregressive."""
+    if not _VIS:
+        print("Warning: matplotlib/Pillow not available — skipping RMSE plot")
+        return
+
+    plt.rcParams.update(_RCPARAMS)
+    col_data = [onestep, autoreg]
+
+    fig, axs = plt.subplots(3, 2, figsize=(12, 10), constrained_layout=True)
+    fig.suptitle("Rollout RMSE vs Timestep", fontsize=13, fontfamily="Times New Roman")
+
+    for row, (feat, unit, scale, rkey) in enumerate(
+            zip(_FEAT_NAMES, _FEAT_UNITS, _FEAT_SCALES, _RMSE_KEYS)):
+        for col, (result, col_label) in enumerate(zip(col_data, _COL_LABELS)):
+            ax = _rmse_axes(axs, row, col, feat, unit, col_label)
+            if result is None or rkey not in result:
+                ax.text(0.5, 0.5, "N/A", ha="center", va="center",
+                        transform=ax.transAxes, fontsize=11)
+                continue
+            rmse  = result[rkey] * scale
+            steps = np.arange(1, len(rmse) + 1)
+            ax.plot(steps, rmse, color="#1f77b4", linestyle="-", linewidth=1.5)
+
+    out_path = out_dir / "rmse_vs_timestep.png"
+    fig.savefig(str(out_path), dpi=200, bbox_inches="tight")
+    plt.close(fig)
+    print(f"[Plot] RMSE plot saved → {out_path}")
+
+
+def plot_multi_rmse(
+    experiments: list[tuple[str, "dict | None", "dict | None"]],
+    out_path: "str | Path",
+):
+    """Compare RMSE vs timestep across multiple checkpoints / experiments.
+
+    Args:
+        experiments: list of (label, onestep_result, autoreg_result).
+                     Either result dict can be None if that mode was not run.
+        out_path:    output PNG file path.
+    """
+    if not _VIS:
+        print("Warning: matplotlib/Pillow not available — skipping multi-RMSE plot")
+        return
+
+    plt.rcParams.update(_RCPARAMS)
+
+    n      = len(experiments)
+    cmap   = plt.get_cmap("tab10", max(n, 1))
+    colors = [cmap(i) for i in range(n)]
+    lstyles = ["-", "--", "-.", ":", (0, (3, 1, 1, 1))]
+
+    fig, axs = plt.subplots(3, 2, figsize=(12, 10), constrained_layout=True)
+    fig.suptitle("RMSE vs Timestep — Multi-Experiment Comparison",
+                 fontsize=13, fontfamily="Times New Roman")
+
+    for row, (feat, unit, scale, rkey) in enumerate(
+            zip(_FEAT_NAMES, _FEAT_UNITS, _FEAT_SCALES, _RMSE_KEYS)):
+        for col, col_label in enumerate(_COL_LABELS):
+            ax = _rmse_axes(axs, row, col, feat, unit, col_label)
+            plotted = False
+            for i, (label, onestep, autoreg) in enumerate(experiments):
+                result = onestep if col == 0 else autoreg
+                if result is None or rkey not in result:
+                    continue
+                rmse  = result[rkey] * scale
+                steps = np.arange(1, len(rmse) + 1)
+                ax.plot(steps, rmse,
+                        color=colors[i],
+                        linestyle=lstyles[i % len(lstyles)],
+                        linewidth=1.5,
+                        label=label)
+                plotted = True
+            if plotted:
+                ax.legend(loc="best")
+            else:
+                ax.text(0.5, 0.5, "N/A", ha="center", va="center",
+                        transform=ax.transAxes, fontsize=11)
+
+    out_path = Path(out_path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(str(out_path), dpi=200, bbox_inches="tight")
+    plt.close(fig)
+    print(f"[Plot] Multi-experiment RMSE plot saved → {out_path}")
 
 
 # ── GIF rendering ─────────────────────────────────────────────────────────────
@@ -630,6 +794,12 @@ def render_vis(
 # ── Console summary ───────────────────────────────────────────────────────────
 
 def print_summary(onestep: dict | None, autoreg: dict | None, baseline: dict):
+    if onestep is not None and autoreg is not None:
+        print("\n[Debug] First 10 acc RMSE — one-step vs autoregressive:")
+        print(f"  one-step : {onestep['rmse_acc'][-10:]}")
+        print(f"  autoreg  : {autoreg['rmse_acc'][-10:]}")
+        print(f"  equal    : {np.array_equal(onestep['rmse_acc'][-10:], autoreg['rmse_acc'][-10:])}")
+
     print("\n" + "=" * 60)
     print("ROLLOUT SUMMARY")
     print("=" * 60)
@@ -664,6 +834,12 @@ def main():
     parser.add_argument("--mode",
                         choices=["onestep", "autoregressive", "both"],
                         default="both")
+    parser.add_argument("--plot",         action="store_true",
+                        help="Save RMSE vs timestep plot for the current run")
+    parser.add_argument("--compare-dirs", nargs="+", default=[],
+                        metavar="NAME:DIR",
+                        help="Compare multiple experiments. Format: 'label:output_dir' "
+                             "where output_dir contains onestep.pkl / autoregressive.pkl")
     parser.add_argument("--gif",         action="store_true",
                         help="Render GIF animations")
     parser.add_argument("--gif-fps",     type=int, default=10)
@@ -735,6 +911,31 @@ def main():
                 group_config_path = "configs/data/required_parts.config", # 指向你的配置文件
                 save_png_dir      = str(out_dir / "autoregressive_pngs")    # 生成同名文件夹存放 PNG
             )
+
+    # ── RMSE plot ─────────────────────────────────────────────────────────
+    if args.plot:
+        plot_rmse_vs_timestep(onestep, autoreg, out_dir)
+        # print(acc_rmse_onestep[:10])
+        # print(acc_rmse_ar[:10])
+        # print(np.array_equal(acc_rmse_onestep, acc_rmse_ar))
+
+    # ── Multi-experiment comparison plot ──────────────────────────────────
+    if args.compare_dirs:
+        experiments = []
+        for entry in args.compare_dirs:
+            if ":" not in entry:
+                print(f"[Warn] --compare-dirs entry '{entry}' missing label — skipping")
+                continue
+            label, cdir = entry.split(":", 1)
+            cdir = Path(cdir)
+            os_pkl  = cdir / "onestep.pkl"
+            ar_pkl  = cdir / "autoregressive.pkl"
+            os_res  = pickle.load(open(os_pkl,  "rb")) if os_pkl.exists()  else None
+            ar_res  = pickle.load(open(ar_pkl,  "rb")) if ar_pkl.exists()  else None
+            experiments.append((label, os_res, ar_res))
+            print(f"[Compare] loaded '{label}' from {cdir}")
+        if experiments:
+            plot_multi_rmse(experiments, out_dir / "multi_experiment_rmse.png")
 
     # ── Summary ───────────────────────────────────────────────────────────
     print_summary(onestep, autoreg, baseline)
