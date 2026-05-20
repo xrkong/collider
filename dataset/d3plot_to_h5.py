@@ -25,6 +25,14 @@ Pipeline
                                       nodes:  sxx, syy, szz, sxy, syz, sxz
         • node_part_id  stored once in /metadata
 
+python dataset/d3plot_to_h5.py \
+    --src /home/kong/datasets/barrier/fem/T_lok_F_shape_barrier_9_3_100km \
+    --tmp /home/kong/datasets/barrier/tmp \
+    --out /home/kong/datasets/barrier/h5/T_lok_F_shape_barrier_9_3_100km_30_5/output.h5 \
+    --required-config configs/data/required_parts.config \
+    --node-stride 30 \
+    --frame-stride 5 
+
 HDF5 layout
 -----------
   /metadata/

@@ -1,5 +1,5 @@
-name: "sc_021"
-description: "hidden dim 256, k = 4, sdf threshold 50mm"
+name: "sc_022"
+description: "copy of sc_021. forward k = 1. batch size =8. Try training with xx_50_1.h5"
 model:
   name: "transolverplus_net"                        # registry key
   params: "configs/params/transolverplus_net.yaml"  # base params file
@@ -17,15 +17,16 @@ overrides:
 
   train.lr: 0.001
   train.min_lr: 1e-6
-  train.batch_size: 2
-  train.n_epochs: 50
-  train.push_forward_k: 4
+  train.batch_size: 8
+  train.n_epochs: 500
+  train.push_forward_k: 1
   train.noise_std: 0.0
   train.grad_clip: 5.0
+  train.val_every_epochs: 10
 
-  data.paths: "/home/kong/datasets/barrier/h5/T_lok_F_shape_barrier_9_3_100km_50_5/output.h5"
+  data.paths: "/home/kong/datasets/barrier/h5/T_lok_F_shape_barrier_9_3_100km_50_1/output.h5"
   data.input_frames: 5 
   data.acc_scale: 5.0e5
-  data.metadata_path: "/home/kong/datasets/barrier/h5/T_lok_F_shape_barrier_9_3_100km_50_5/metadata.json"
+  data.metadata_path: "/home/kong/datasets/barrier/h5/T_lok_F_shape_barrier_9_3_100km_50_1/metadata.json"
 
-notes: "k=4 bs=2. ablation study."
+notes: "copy of sc_021, but trained on 50_1.h5 instead of xx_50_5.h5. "

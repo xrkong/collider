@@ -5,21 +5,22 @@ renders left=pred / right=gt GIFs colored by part, saves PKL + console stats.
 
 Usage:
     python src/rollout.py \
-        --checkpoint outputs/checkpoints/sc_003/checkpoint-best.safetensors \
-        --experiment configs/experiments/sc_003.yaml \
-        --raw-h5 /home/kong/datasets/barrier/h5/T_lok_F_shape_barrier_9_3_100km/output.h5 \
+        --checkpoint outputs/checkpoints/sc_022/checkpoint-best.safetensors \
+        --experiment configs/experiments/sc_022.yaml \
+        --raw-h5 /home/kong/datasets/barrier/h5/T_lok_F_shape_barrier_9_3_100km_50_1/output.h5 \
         --mode autoregressive \
         --gif --gif-fps 10 
 
     python src/rollout.py \
-        --checkpoint outputs/checkpoints/sc_020/checkpoint-best.safetensors \
-        --experiment configs/experiments/sc_020.yaml \
-        --raw-h5 /home/kong/datasets/barrier/h5/T_lok_F_shape_barrier_9_3_100km/output.h5 \
+        --checkpoint outputs/checkpoints/sc_021/checkpoint-best.safetensors \
+        --experiment configs/experiments/sc_021.yaml \
+        --raw-h5 /home/kong/datasets/barrier/h5/T_lok_F_shape_barrier_9_3_100km_50_5/output.h5 \
         --mode both --plot \
         --compare-dirs \
-            sc_015:outputs/rollouts/sc_015 \
             sc_018:outputs/rollouts/sc_018 \
-            sc_020:outputs/rollouts/sc_020
+            sc_019:outputs/rollouts/sc_019 \
+            sc_020:outputs/rollouts/sc_020 \
+            sc_021:outputs/rollouts/sc_021
 
 """
 
