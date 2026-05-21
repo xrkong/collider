@@ -28,10 +28,12 @@ Pipeline
 python dataset/d3plot_to_h5.py \
     --src /home/kong/datasets/barrier/fem/T_lok_F_shape_barrier_9_3_100km \
     --tmp /home/kong/datasets/barrier/tmp \
-    --out /home/kong/datasets/barrier/h5/T_lok_F_shape_barrier_9_3_100km_30_5/output.h5 \
+    --out /home/kong/datasets/barrier/h5/T_lok_F_shape_barrier_9_3_100km_50_1_01/output.h5 \
     --required-config configs/data/required_parts.config \
-    --node-stride 30 \
-    --frame-stride 5 
+    --node-stride 50 \
+    --frame-stride 1 \
+    --frame-limit 100
+
 
 HDF5 layout
 -----------
@@ -394,6 +396,11 @@ def main() -> None:
                         help="Spatial decimation: keep every N-th node  (1 = all).")
     parser.add_argument("--frame-stride",    type=int,   default=DEFAULT_FRAME_STRIDE,
                         help="Temporal decimation: keep every N-th frame (1 = all, 2 = default).")
+    frame_limit_group = parser.add_mutually_exclusive_group()
+    frame_limit_group.add_argument("--frame-limit", type=int,   default=None, metavar="K",
+                        help="Keep only the first K frames after stride (exact count).")
+    frame_limit_group.add_argument("--frame-scale", type=float, default=None, metavar="FRAC",
+                        help="Keep only the first FRAC fraction of frames, e.g. 0.1 for 10%%.")
     args = parser.parse_args()
 
     # ── Sanity checks ─────────────────────────────────────────────────────────
@@ -525,6 +532,20 @@ def main() -> None:
 
     all_entries      = _scan_state_times(state_files, args.tmp)
     selected_entries = _select_frames(all_entries, args.frame_stride)
+
+    # ── Optional head-trim (applied after stride so stats match the kept data) ─
+    if args.frame_limit is not None:
+        k = args.frame_limit
+    elif args.frame_scale is not None:
+        import math
+        k = max(1, math.ceil(len(selected_entries) * args.frame_scale))
+    else:
+        k = len(selected_entries)
+    if k < len(selected_entries):
+        print(f"Head-trim: keeping first {k} / {len(selected_entries)} frames "
+              f"({k/len(selected_entries)*100:.1f}%)")
+        selected_entries = selected_entries[:k]
+
     n_frames         = len(selected_entries)
 
     # ══════════════════════════════════════════════════════════════════════════

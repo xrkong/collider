@@ -1,5 +1,5 @@
-name: "sc_024"
-description: "copy of sc_023. remove self._acc_scale * np.sinh(arrd)."
+name: "sc_025"
+description: "copy of sc_024. remove self._acc_scale * np.sinh(arrd). use original timestep for raw acceleration."
 model:
   name: "transolverplus_net"                        # registry key
   params: "configs/params/transolverplus_net.yaml"  # base params file
@@ -24,9 +24,9 @@ overrides:
   train.grad_clip: 5.0
   train.val_every_epochs: 10
 
-  data.paths: "/home/kong/datasets/barrier/h5/T_lok_F_shape_barrier_9_3_100km_50_5/output.h5"
+  data.paths: "/home/kong/datasets/barrier/h5/T_lok_F_shape_barrier_9_3_100km_50_1_01/output.h5"
   data.input_frames: 5 
-  data.acc_scale: 5.0e5
-  data.metadata_path: "/home/kong/datasets/barrier/h5/T_lok_F_shape_barrier_9_3_100km_50_5/metadata.json"
+  # data.acc_scale: 5.0e5
+  data.metadata_path: "/home/kong/datasets/barrier/h5/T_lok_F_shape_barrier_9_3_100km_50_1_01/metadata.json"
 
-notes: "copy of sc_022, but trained on 50_5.h5 instead of xx_50_1.h5. "
+notes: "copy of sc_022, but trained on 50_1.h5, use raw timestep."
