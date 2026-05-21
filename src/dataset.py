@@ -56,13 +56,13 @@ class NormStats:
             print("[NormStats] acceleration uses z-score (no acc_scale provided)")
 
     def normalize(self, feature: str, arr: np.ndarray) -> np.ndarray:
-        if feature == "acceleration" and self._acc_scale is not None:
-            return np.arcsinh(arr / self._acc_scale).astype(np.float32)
+        # if feature == "acceleration" and self._acc_scale is not None:
+        #     return np.arcsinh(arr / self._acc_scale).astype(np.float32)
         return ((arr - self._mean[feature]) / self._std[feature]).astype(np.float32)
 
     def denormalize(self, feature: str, arr: np.ndarray) -> np.ndarray:
-        if feature == "acceleration" and self._acc_scale is not None:
-            return (self._acc_scale * np.sinh(arr)).astype(np.float32)
+        # if feature == "acceleration" and self._acc_scale is not None:
+        #     return (self._acc_scale * np.sinh(arr)).astype(np.float32)
         return (arr * self._std[feature] + self._mean[feature]).astype(np.float32)
 
     def denormalize_tensor(self, feature: str, t: torch.Tensor) -> torch.Tensor:

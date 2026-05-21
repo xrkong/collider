@@ -450,7 +450,7 @@ def train(cfg: dict, git_commit: str = "unknown"):
                     # Build model input: flatten T_in dim into channels, concat SDF
                     x_vel_flat = v_window_input.reshape(B, N, -1)         # (B, N, T_in*3)
                     x_sdf      = build_sdf_window(pos_window)             # (B, N, T_in)
-                    sdf_threshold = 50.0 / 1000.0  # 50mm in SDF units (metres)
+                    # sdf_threshold = 50.0 / 1000.0  # 50mm in SDF units (metres)
 
                     x_in       = torch.cat([x_vel_flat, x_sdf], dim=-1)   # (B, N, T_in*4)
 

@@ -258,6 +258,7 @@ def run_onestep(model, raw_data, normed, norm_stats, device) -> dict:
     pred_pos_list, gt_pos_list, rmse_pos_steps = [], [], []
     rmse_vel_steps, rmse_acc_steps = [], []
     pred_acc_list, gt_acc_list = [], []
+    pred_acc_norm_list, gt_acc_norm_list = [], []
 
     for t in range(INPUT_FRAMES, T):
         x_in        = build_velocity_input(normed_v, t - 1).to(device)
@@ -287,6 +288,8 @@ def run_onestep(model, raw_data, normed, norm_stats, device) -> dict:
         rmse_acc_steps.append(float(np.sqrt(np.mean((a_phys - a_gt) ** 2))))
         pred_acc_list.append(a_phys)
         gt_acc_list.append(a_gt)
+        pred_acc_norm_list.append(a_pred_norm.cpu().numpy())
+        gt_acc_norm_list.append(norm_stats.normalize("acceleration", a_gt))
 
         pred_pos_list.append(x_new)
         gt_pos_list.append(x_gt)
@@ -302,6 +305,14 @@ def run_onestep(model, raw_data, normed, norm_stats, device) -> dict:
     print(f"[One-step] Pred acc |mean| = {np.abs(pred_acc_all).mean()/9810:.2f} g")
     print(f"[One-step] Acc RMSE mean   = {rmse_acc.mean()/9810:.2f} g")
     print(f"[One-step] Acc RMSE/GT std = {rmse_acc.mean() / gt_acc_all.std():.3f}")
+    if norm_stats._acc_scale is not None:
+        pred_norm_all = np.stack(pred_acc_norm_list)   # (steps, N, 3)
+        gt_norm_all   = np.stack(gt_acc_norm_list)
+        rmse_asinh    = np.sqrt(np.mean((pred_norm_all - gt_norm_all) ** 2))
+        rmse_physical = np.sqrt(np.mean((pred_acc_all  - gt_acc_all ) ** 2))
+        print(f"[One-step] RMSE asinh-space = {rmse_asinh:.6f}")
+        print(f"[One-step] RMSE physical    = {rmse_physical:.2f} mm/s²")
+        print(f"[One-step] Amplification    = {rmse_physical / rmse_asinh:.1f}×")
 
     return {
         "pred_frames": _pack_pos_only(pred_pos_list),
@@ -324,6 +335,7 @@ def run_autoregressive(model, raw_data, normed, norm_stats, device) -> dict:
     pred_pos_list, gt_pos_list, rmse_pos_steps = [], [], []
     rmse_vel_steps, rmse_acc_steps = [], []
     pred_acc_list, gt_acc_list = [], []
+    pred_acc_norm_list, gt_acc_norm_list = [], []
 
     # ── 初始化 ──
     # 速度窗口 (归一化, 模型输入用)
@@ -364,6 +376,8 @@ def run_autoregressive(model, raw_data, normed, norm_stats, device) -> dict:
         rmse_acc_steps.append(float(np.sqrt(np.mean((a_phys_new - a_gt) ** 2))))
         pred_acc_list.append(a_phys_new)
         gt_acc_list.append(a_gt)
+        pred_acc_norm_list.append(a_pred_norm.cpu().numpy())
+        gt_acc_norm_list.append(norm_stats.normalize("acceleration", a_gt))
 
         pred_pos_list.append(x_phys_new)
         gt_pos_list.append(x_gt)
@@ -401,6 +415,14 @@ def run_autoregressive(model, raw_data, normed, norm_stats, device) -> dict:
     print(f"[Autoregressive] Pred acc |mean| = {np.abs(pred_acc_all).mean()/9810:.2f} g")
     print(f"[Autoregressive] Acc RMSE mean   = {rmse_acc.mean()/9810:.2f} g")
     print(f"[Autoregressive] Acc RMSE/GT std = {rmse_acc.mean() / gt_acc_all.std():.3f}")
+    if norm_stats._acc_scale is not None:
+        pred_norm_all = np.stack(pred_acc_norm_list)   # (steps, N, 3)
+        gt_norm_all   = np.stack(gt_acc_norm_list)
+        rmse_asinh    = np.sqrt(np.mean((pred_norm_all - gt_norm_all) ** 2))
+        rmse_physical = np.sqrt(np.mean((pred_acc_all  - gt_acc_all ) ** 2))
+        print(f"[Autoregressive] RMSE asinh-space = {rmse_asinh:.6f}")
+        print(f"[Autoregressive] RMSE physical    = {rmse_physical:.2f} mm/s²")
+        print(f"[Autoregressive] Amplification    = {rmse_physical / rmse_asinh:.1f}×")
 
     return {
         "pred_frames": _pack_pos_only(pred_pos_list),
@@ -801,25 +823,30 @@ def print_summary(onestep: dict | None, autoreg: dict | None, baseline: dict):
         print(f"  autoreg  : {autoreg['rmse_acc'][-10:]}")
         print(f"  equal    : {np.array_equal(onestep['rmse_acc'][-10:], autoreg['rmse_acc'][-10:])}")
 
-    print("\n" + "=" * 60)
+    print("\n" + "=" * 72)
     print("ROLLOUT SUMMARY")
-    print("=" * 60)
-    print(f"{'Mode':<20} {'mean_pos_rmse':>15} {'mean_vm_rmse':>14}")
-    print("-" * 60)
+    print("=" * 72)
+    print(f"{'Mode':<20} {'pos_rmse(mm)':>14} {'vel_rmse(mm/s)':>16} {'acc_rmse(mm/s²)':>17}")
+    print("-" * 72)
 
     print(f"{'last-frame baseline':<20} "
-          f"{baseline['rmse_pos'].mean():>15.3f} ")
+          f"{baseline['rmse_pos'].mean():>14.3f} "
+          f"{'N/A':>16} "
+          f"{'N/A':>17}")
 
     if onestep is not None:
         print(f"{'one-step':<20} "
-              f"{onestep['rmse_pos'].mean():>15.3f} ")
+              f"{onestep['rmse_pos'].mean():>14.3f} "
+              f"{onestep['rmse_vel'].mean():>16.3f} "
+              f"{onestep['rmse_acc'].mean():>17.3f}")
 
     if autoreg is not None:
         print(f"{'autoregressive':<20} "
-              f"{autoreg['rmse_pos'].mean():>15.3f} ")
+              f"{autoreg['rmse_pos'].mean():>14.3f} "
+              f"{autoreg['rmse_vel'].mean():>16.3f} "
+              f"{autoreg['rmse_acc'].mean():>17.3f}")
 
-    print("=" * 60)
-    print("(pos_rmse in physical units, vm_rmse in physical units)\n")
+    print("=" * 72)
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────
