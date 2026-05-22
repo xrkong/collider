@@ -1,5 +1,5 @@
-name: "sc_025"
-description: "copy of sc_024. remove self._acc_scale * np.sinh(arrd). use original timestep for raw acceleration."
+name: "sc_026"
+description: "copy of sc_025. remove self._acc_scale * np.sinh(arrd). use original timestep for raw acceleration."
 model:
   name: "transolverplus_net"                        # registry key
   params: "configs/params/transolverplus_net.yaml"  # base params file
@@ -20,7 +20,7 @@ overrides:
   train.batch_size: 8
   train.n_epochs: 2000
   train.push_forward_k: 1
-  train.noise_std: 0.0
+  train.noise_std: 0.01
   train.grad_clip: 5.0
   train.val_every_epochs: 10
 

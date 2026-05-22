@@ -5,9 +5,9 @@ renders left=pred / right=gt GIFs colored by part, saves PKL + console stats.
 
 Usage:
     python src/rollout.py \
-        --checkpoint outputs/checkpoints/sc_022/checkpoint-best.safetensors \
-        --experiment configs/experiments/sc_022.yaml \
-        --raw-h5 /home/kong/datasets/barrier/h5/T_lok_F_shape_barrier_9_3_100km_50_1/output.h5 \
+        --checkpoint outputs/checkpoints/sc_025/checkpoint-best.safetensors \
+        --experiment configs/experiments/sc_025.yaml \
+        --raw-h5 /home/kong/datasets/barrier/h5/T_lok_F_shape_barrier_9_3_100km_50_1_01/output.h5 \
         --mode autoregressive \
         --gif --gif-fps 10 
 
@@ -310,7 +310,7 @@ def run_onestep(model, raw_data, normed, norm_stats, device) -> dict:
         gt_norm_all   = np.stack(gt_acc_norm_list)
         rmse_asinh    = np.sqrt(np.mean((pred_norm_all - gt_norm_all) ** 2))
         rmse_physical = np.sqrt(np.mean((pred_acc_all  - gt_acc_all ) ** 2))
-        print(f"[One-step] RMSE asinh-space = {rmse_asinh:.6f}")
+        print(f"[One-step] RMSE norm = {rmse_asinh:.6f}")
         print(f"[One-step] RMSE physical    = {rmse_physical:.2f} mm/s²")
         print(f"[One-step] Amplification    = {rmse_physical / rmse_asinh:.1f}×")
 
@@ -889,7 +889,7 @@ def main():
 
     # ── Load data ─────────────────────────────────────────────────────────
     raw_data   = load_raw_h5(args.raw_h5)
-    norm_stats = NormStats(cfg["data"]["metadata_path"], cfg["data"]["acc_scale"])
+    norm_stats = NormStats(cfg["data"]["metadata_path"]) #, cfg["data"]["acc_scale"])
     normed     = normalize_raw(raw_data, norm_stats)
 
     # ── Baseline ──────────────────────────────────────────────────────────

@@ -66,8 +66,8 @@ class NormStats:
         return (arr * self._std[feature] + self._mean[feature]).astype(np.float32)
 
     def denormalize_tensor(self, feature: str, t: torch.Tensor) -> torch.Tensor:
-        if feature == "acceleration" and self._acc_scale is not None:
-            return self._acc_scale * torch.sinh(t)
+        # if feature == "acceleration" and self._acc_scale is not None:
+        #     return self._acc_scale * torch.sinh(t)
         mean = torch.tensor(self._mean[feature], dtype=t.dtype, device=t.device)
         std  = torch.tensor(self._std[feature],  dtype=t.dtype, device=t.device)
         return t * std + mean
