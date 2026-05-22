@@ -372,7 +372,7 @@ def train(cfg: dict, git_commit: str = "unknown"):
         optimizer,
         max_lr=float(train_cfg.get("lr", 1e-3)),
         total_steps=total_steps,
-        pct_start=0.05,
+        pct_start=0.01,
         final_div_factor=1e6,
         div_factor=25,
     )
