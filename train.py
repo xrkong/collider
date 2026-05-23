@@ -368,23 +368,18 @@ def train(cfg: dict, git_commit: str = "unknown"):
     steps_per_epoch = len(train_loader)
     total_steps     = n_epochs * steps_per_epoch
 
+    lr     = float(train_cfg.get("lr", 1e-3))
+    min_lr = float(train_cfg.get("min_lr", lr))
+    div_factor = 25
+
     scheduler = torch.optim.lr_scheduler.OneCycleLR(
         optimizer,
-        max_lr=float(train_cfg.get("lr", 1e-3)),
+        max_lr=lr,
         total_steps=total_steps,
         pct_start=0.01,
-        final_div_factor=1e6,
-        div_factor=25,
+        div_factor=div_factor,
+        final_div_factor=(lr / div_factor) / min_lr,
     )
-
-    '''
-    lr_scheduler = torch.optim.lr_scheduler.OneCycleLR(
-        optimizer,
-        max_lr=hparams['lr'],
-        total_steps=(len(train_dataset) // hparams['batch_size'] + 1) * hparams['nb_epochs'],
-        final_div_factor=1000.,
-    )
-    '''
 
     # ── Checkpoint state ──────────────────────────────────────────────────
     save_dir      = PROJECT_ROOT / "outputs" / "checkpoints" / cfg["name"]
