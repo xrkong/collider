@@ -31,13 +31,11 @@ train:
   keep_top_k: 3       # 保留 val_loss 最低的 K 个 checkpoint
 
 data:
-  base_path: "/home/kong/datasets/barrier/split_data/T_lok_F_shape_barrier_9_3_100km/"
-  metadata_path: "/home/kong/datasets/barrier/split_data/T_lok_F_shape_barrier_9_3_100km/metadata.json"
   dataset_type: bvc_sliced
   input_frames: 5
   normalize: true
   num_workers: 0
-  dt: 0.004
+  dt: 1 # dt is 1. real dt is 2ms.
   data.acc_scale: 1.0e7
   # pin_memory: true
   # collision_threshold: 100.0

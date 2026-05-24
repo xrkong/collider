@@ -331,7 +331,7 @@ def train(cfg: dict, git_commit: str = "unknown"):
     # ── Push-forward & noise config ──────────────────────────────────────
     push_K     = int(train_cfg.get("push_forward_k", 1))
     noise_std  = float(train_cfg.get("noise_std", 0.0))
-    dt         = float(data_cfg.get("dt", 0.004))
+    dt         = float(data_cfg.get("dt", 1))
     print(f"[Train] push_forward_k = {push_K}, noise_std = {noise_std}, dt = {dt}")
     
     # ── Pre-load normalization stats as GPU tensors (for in-graph denorm/renorm) ──

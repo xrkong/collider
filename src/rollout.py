@@ -3,6 +3,17 @@
 Reads the original full-trajectory h5 (251 frames, not pre-windowed),
 renders left=pred / right=gt GIFs colored by part, saves PKL + console stats.
 
+Conventions (must match the exporter / loader / trainer):
+    * Kinematics are forward finite differences with dt = 1 frame:
+          vel[i] = pos[i+1] - pos[i],  acc[i] = vel[i+1] - vel[i]
+    * Integration is FORWARD EULER (x uses current v, then v updates):
+          x_new = x_last + v_last,  v_new = v_last + a        (dt = 1)
+    * Units of velocity / acceleration are therefore mm/dt and mm/dt^2
+      (per-frame), NOT mm/s. Multiply by 1/dt_seconds (from metadata) only
+      when converting to physical units for an external report.
+    * The last 1-2 frames of GT velocity/acceleration are padding (forward
+      diff has no valid value there), so evaluation stops at T-2.
+
 Usage:
     python src/rollout.py \
         --checkpoint outputs/checkpoints/sc_026/checkpoint-best.safetensors \
@@ -73,7 +84,11 @@ except ImportError:
     _SAFETENSORS = False
 
 # ── Constants ─────────────────────────────────────────────────────────────────
+# INPUT_FRAMES is overridden from cfg["data"]["input_frames"] in main().
 INPUT_FRAMES  = 5
+# dt is fixed to 1: kinematics are per-frame forward differences. The physical
+# timestep lives in metadata.json (dt_seconds) and is only for unit conversion.
+DT            = 1.0
 FEATURES      = ["positions", "velocity", "acceleration"]
 FEAT_DIMS     = {"positions": 3, "velocity": 3, "acceleration": 3}
 FEAT_SLICES   = {
@@ -82,6 +97,7 @@ FEAT_SLICES   = {
     "acceleration": (6,  9),
 }
 
+FONTSIZE=12
 
 # ── Model loading ─────────────────────────────────────────────────────────────
 
@@ -190,17 +206,22 @@ def build_velocity_input_from_window(window: np.ndarray) -> torch.Tensor:
 
 def integrate_accel(
     a_pred_norm: torch.Tensor,    # (N, 3)  模型直接输出
-    v_last_phys: np.ndarray,      # (N, 3)  物理量
+    v_last_phys: np.ndarray,      # (N, 3)  物理量 (per-frame)
     x_last_phys: np.ndarray,      # (N, 3)
     dt:          float,
     norm_stats:  NormStats,
 ):
-    """半隐式 Euler: a -> v_new -> x_new. 返回都是物理量 (N, 3)."""
+    """Forward Euler: x uses CURRENT velocity, then v updates.
+
+    Matches the forward-difference (dt = 1) data convention:
+        x_new = x_last + v_last * dt      # use current v first
+        v_new = v_last + a      * dt      # then update v
+    With dt = 1 this exactly inverts the differencing, so feeding GT acc
+    reconstructs GT positions. Returns physical (per-frame) (N, 3) arrays.
+    """
     a_phys     = norm_stats.denormalize("acceleration", a_pred_norm.cpu().numpy())
-    # bias = np.array([96257.18, -36023.75, 1812.44], dtype=np.float32)
-    # a_phys = a_phys - bias
-    v_new_phys = v_last_phys + a_phys * dt
-    x_new_phys = x_last_phys + v_new_phys * dt        # 用新速度积分位置
+    x_new_phys = x_last_phys + v_last_phys * dt      # forward Euler: current v
+    v_new_phys = v_last_phys + a_phys     * dt       # then update v
     return a_phys, v_new_phys, x_new_phys
 
 
@@ -243,16 +264,9 @@ def compute_sdf_batch(xy: torch.Tensor,
 # ── Inference ─────────────────────────────────────────────────────────────────
 @torch.no_grad()
 def run_onestep(model, raw_data, normed, norm_stats, device) -> dict:
-    T  = raw_data["positions"].shape[0]
-    times = raw_data["times"]
-    dt_arr = np.diff(times)
-    dt_mean = float(dt_arr.mean())
-    if dt_arr.std() / max(abs(dt_mean), 1e-12) > 1e-3:
-        print(f"[Warn] dt 非均匀: mean={dt_mean:.6g}, std={dt_arr.std():.3g} — 用每步对应 dt")
-        uniform_dt = False
-    else:
-        uniform_dt = True
-    print(f"[One-step] dt ≈ {dt_mean:.6g}, steps = {T - INPUT_FRAMES}")
+    T      = raw_data["positions"].shape[0]
+    T_eval = T - 2          # last 2 frames have padded GT vel/acc (forward diff)
+    print(f"[One-step] dt = 1 (per-frame), steps = {T_eval - INPUT_FRAMES}")
 
     normed_v = normed["velocity"]                       # (T, N, 3)
     pred_pos_list, gt_pos_list, rmse_pos_steps = [], [], []
@@ -260,7 +274,7 @@ def run_onestep(model, raw_data, normed, norm_stats, device) -> dict:
     pred_acc_list, gt_acc_list = [], []
     pred_acc_norm_list, gt_acc_norm_list = [], []
 
-    for t in range(INPUT_FRAMES, T):
+    for t in range(INPUT_FRAMES, T_eval):
         x_in        = build_velocity_input(normed_v, t - 1).to(device)
 
         input_pos = raw_data["positions"][t - INPUT_FRAMES + 1: t + 1].transpose(1, 0, 2) # (N,T,3)
@@ -275,9 +289,8 @@ def run_onestep(model, raw_data, normed, norm_stats, device) -> dict:
         # 上一帧 GT 速度 / 位置 (物理量) — one-step 模式始终用 GT
         v_last = raw_data["velocity"][t - 1]
         x_last = raw_data["positions"][t - 1]
-        dt     = dt_mean if uniform_dt else float(times[t] - times[t - 1])
 
-        a_phys, v_new, x_new = integrate_accel(a_pred_norm, v_last, x_last, dt, norm_stats)
+        a_phys, v_new, x_new = integrate_accel(a_pred_norm, v_last, x_last, DT, norm_stats)
 
         x_gt = raw_data["positions"][t]
         rmse = float(np.sqrt(np.mean((x_new - x_gt) ** 2)))
@@ -296,14 +309,14 @@ def run_onestep(model, raw_data, normed, norm_stats, device) -> dict:
         rmse_pos_steps.append(rmse)
 
         if (t - INPUT_FRAMES + 1) % 50 == 0:
-            print(f"  step {t-INPUT_FRAMES+1}/{T-INPUT_FRAMES} | pos_rmse={rmse:.3f}")
+            print(f"  step {t-INPUT_FRAMES+1}/{T_eval-INPUT_FRAMES} | pos_rmse={rmse:.3f}")
 
     pred_acc_all = np.stack(pred_acc_list)   # (T_steps, N, 3)
     gt_acc_all   = np.stack(gt_acc_list)
     rmse_acc     = np.array(rmse_acc_steps)
-    print(f"[One-step] GT   acc |mean| = {np.abs(gt_acc_all).mean()/9810:.2f} g")
-    print(f"[One-step] Pred acc |mean| = {np.abs(pred_acc_all).mean()/9810:.2f} g")
-    print(f"[One-step] Acc RMSE mean   = {rmse_acc.mean()/9810:.2f} g")
+    print(f"[One-step] GT   acc |mean| = {np.abs(gt_acc_all).mean():.4f} mm/dt²")
+    print(f"[One-step] Pred acc |mean| = {np.abs(pred_acc_all).mean():.4f} mm/dt²")
+    print(f"[One-step] Acc RMSE mean   = {rmse_acc.mean():.4f} mm/dt²")
     print(f"[One-step] Acc RMSE/GT std = {rmse_acc.mean() / gt_acc_all.std():.3f}")
     if norm_stats._acc_scale is not None:
         pred_norm_all = np.stack(pred_acc_norm_list)   # (steps, N, 3)
@@ -311,7 +324,7 @@ def run_onestep(model, raw_data, normed, norm_stats, device) -> dict:
         rmse_asinh    = np.sqrt(np.mean((pred_norm_all - gt_norm_all) ** 2))
         rmse_physical = np.sqrt(np.mean((pred_acc_all  - gt_acc_all ) ** 2))
         print(f"[One-step] RMSE norm = {rmse_asinh:.6f}")
-        print(f"[One-step] RMSE physical    = {rmse_physical:.2f} mm/s²")
+        print(f"[One-step] RMSE physical    = {rmse_physical:.4f} mm/dt²")
         print(f"[One-step] Amplification    = {rmse_physical / rmse_asinh:.1f}×")
 
     return {
@@ -325,12 +338,9 @@ def run_onestep(model, raw_data, normed, norm_stats, device) -> dict:
 
 @torch.no_grad()
 def run_autoregressive(model, raw_data, normed, norm_stats, device) -> dict:
-    T     = raw_data["positions"].shape[0]
-    times = raw_data["times"]
-    dt_arr = np.diff(times)
-    dt_mean = float(dt_arr.mean())
-    uniform_dt = (dt_arr.std() / max(abs(dt_mean), 1e-12)) <= 1e-3
-    print(f"[Autoregressive] dt ≈ {dt_mean:.6g}, steps = {T - INPUT_FRAMES}")
+    T      = raw_data["positions"].shape[0]
+    T_eval = T - 2          # last 2 frames have padded GT vel/acc (forward diff)
+    print(f"[Autoregressive] dt = 1 (per-frame), steps = {T_eval - INPUT_FRAMES}")
 
     pred_pos_list, gt_pos_list, rmse_pos_steps = [], [], []
     rmse_vel_steps, rmse_acc_steps = [], []
@@ -345,27 +355,20 @@ def run_autoregressive(model, raw_data, normed, norm_stats, device) -> dict:
     v_phys = raw_data["velocity"][INPUT_FRAMES - 1].copy()         # (N, 3)
     x_phys = raw_data["positions"][INPUT_FRAMES - 1].copy()        # (N, 3)
 
-    for t in range(INPUT_FRAMES, T):
+    for t in range(INPUT_FRAMES, T_eval):
         x_in        = build_velocity_input_from_window(v_window_norm).to(device) # (1,N,T*C)
 
-        # x_sdf = raw_data["positions"][t - INPUT_FRAMES + 1: t + 1].transpose(1, 0, 2) # (N,T,3)
-        # x_sdf = torch.from_numpy(x_sdf) # (N,T,3)
-        # x_sdf = compute_sdf_batch(x_sdf[..., 0:2]).to(device) # (N,T,2)
         # SDF 用滚动窗口,不再读 raw_data
         x_sdf_in = torch.from_numpy(
             x_window_phys[..., 0:2].transpose(1, 0, 2)              # (N, 5, 2)
         ).float()
         x_sdf = compute_sdf_batch(x_sdf_in).to(device)               # (N, 5)
         x = torch.cat([x_in, x_sdf.unsqueeze(0)], dim=-1)
-        
-        x = torch.cat([x_in, x_sdf.unsqueeze(0) ], dim=-1)
-        # x = x_in
 
         a_pred_norm = model(x).squeeze(0)            # (N, 3)
 
-        dt = dt_mean if uniform_dt else float(times[t] - times[t - 1])
         a_phys_new, v_phys_new, x_phys_new = integrate_accel(
-            a_pred_norm, v_phys, x_phys, dt, norm_stats)
+            a_pred_norm, v_phys, x_phys, DT, norm_stats)
 
         x_gt = raw_data["positions"][t]
         rmse = float(np.sqrt(np.mean((x_phys_new - x_gt) ** 2)))
@@ -394,26 +397,15 @@ def run_autoregressive(model, raw_data, normed, norm_stats, device) -> dict:
         x_window_phys = np.concatenate(
             [x_window_phys[1:], x_phys_new[None]], axis=0)                  # (5, N, 3)
 
-        # print(f"归一化 0 → v: {v_new_norm}")
-        # print(f"real 物理v: {v_phys_new}")
-
-        # print(f"step {t}: a_pred_norm |mean|={a_pred_norm.abs().mean():.4f}, "
-        #         f"|max|={a_pred_norm.abs().max():.4f}, "
-        #         f"v_phys |max|={np.abs(v_phys).max():.1f}, "
-        #         f"v_gt |max|={np.abs(raw_data['velocity'][t - 1]).max():.1f}, "
-        #         f"pos_rmse={rmse:.1f}")
-        # print(norm_stats.stats["acceleration"]["mean"])
-        # print(norm_stats.stats["acceleration"]["std"])
-
         if (t - INPUT_FRAMES + 1) % 50 == 0:
-            print(f"  step {t-INPUT_FRAMES+1}/{T-INPUT_FRAMES} | pos_rmse={rmse:.3f}")
+            print(f"  step {t-INPUT_FRAMES+1}/{T_eval-INPUT_FRAMES} | pos_rmse={rmse:.3f}")
 
     pred_acc_all = np.stack(pred_acc_list)   # (T_steps, N, 3)
     gt_acc_all   = np.stack(gt_acc_list)
     rmse_acc     = np.array(rmse_acc_steps)
-    print(f"[Autoregressive] GT   acc |mean| = {np.abs(gt_acc_all).mean()/9810:.2f} g")
-    print(f"[Autoregressive] Pred acc |mean| = {np.abs(pred_acc_all).mean()/9810:.2f} g")
-    print(f"[Autoregressive] Acc RMSE mean   = {rmse_acc.mean()/9810:.2f} g")
+    print(f"[Autoregressive] GT   acc |mean| = {np.abs(gt_acc_all).mean():.4f} mm/dt²")
+    print(f"[Autoregressive] Pred acc |mean| = {np.abs(pred_acc_all).mean():.4f} mm/dt²")
+    print(f"[Autoregressive] Acc RMSE mean   = {rmse_acc.mean():.4f} mm/dt²")
     print(f"[Autoregressive] Acc RMSE/GT std = {rmse_acc.mean() / gt_acc_all.std():.3f}")
     if norm_stats._acc_scale is not None:
         pred_norm_all = np.stack(pred_acc_norm_list)   # (steps, N, 3)
@@ -421,7 +413,7 @@ def run_autoregressive(model, raw_data, normed, norm_stats, device) -> dict:
         rmse_asinh    = np.sqrt(np.mean((pred_norm_all - gt_norm_all) ** 2))
         rmse_physical = np.sqrt(np.mean((pred_acc_all  - gt_acc_all ) ** 2))
         print(f"[Autoregressive] RMSE asinh-space = {rmse_asinh:.6f}")
-        print(f"[Autoregressive] RMSE physical    = {rmse_physical:.2f} mm/s²")
+        print(f"[Autoregressive] RMSE physical    = {rmse_physical:.4f} mm/dt²")
         print(f"[Autoregressive] Amplification    = {rmse_physical / rmse_asinh:.1f}×")
 
     return {
@@ -435,20 +427,61 @@ def run_autoregressive(model, raw_data, normed, norm_stats, device) -> dict:
 
 # ── Last-frame baseline ───────────────────────────────────────────────────────
 
-def compute_baseline(raw_data: dict) -> dict:
-    """Last-frame copy baseline: predict frame t = frame t-1."""
+def compute_frozen_baseline(raw_data: dict) -> dict:
     T   = raw_data["positions"].shape[0]
-    pos = raw_data["positions"]   # (T, N, 3) # (T, N, 6)
+    pos = raw_data["positions"]   # (T, N, 3)
 
-    rmse_pos, rmse_vm = [], []
-    for t in range(INPUT_FRAMES, T):
-        pos_rmse = np.sqrt(np.mean((pos[t - 1] - pos[t]) ** 2))
-        rmse_pos.append(pos_rmse)
+    rmse_onestep, rmse_rollout = [], []
+    last = pos[INPUT_FRAMES - 1]
+    # frozen baseline
+    for t in range(INPUT_FRAMES, T - 2):
+        rmse_onestep.append(np.sqrt(np.mean((pos[t - 1] - pos[t]) ** 2)))
+        rmse_rollout.append(np.sqrt(np.mean((last      - pos[t]) ** 2)))
 
     return {
-        "rmse_pos": np.array(rmse_pos)
+        "rmse_pos_onestep": np.array(rmse_onestep),
+        "rmse_pos_rollout": np.array(rmse_rollout),
     }
 
+def compute_baseline(raw_data: dict, dt: float, input_frames: int) -> dict:
+    pos = raw_data["positions"]                       # (T, N, 3)
+    vel = raw_data["velocity"]                      # (T, N, 3)
+    acc = raw_data["acceleration"]                   # (T, N, 3)
+    T = pos.shape[0]
+    IF = input_frames
+
+    def rms(x):  # RMS over nodes & dims for one frame
+        return np.sqrt(np.mean(x ** 2))
+
+    out = {k: [] for k in [
+        "rmse_pos_onestep", "rmse_vel_onestep", "rmse_acc_onestep",
+        "rmse_pos_rollout", "rmse_vel_rollout", "rmse_acc_rollout",
+    ]}
+
+    # rollout: acc=0 → 速度冻结、位置匀速外推
+    x0, v0 = pos[IF - 1], vel[IF - 1]
+
+    # stop at T-2: last 1-2 GT vel/acc frames are forward-diff padding
+    for t in range(IF, T - 2):
+        # ---- acc=0 预测 → 加速度误差就是真值加速度的 RMS（两模式相同）----
+        acc_err = rms(acc[t])                          # pred=0
+        out["rmse_acc_onestep"].append(acc_err)
+        out["rmse_acc_rollout"].append(acc_err)
+
+        # ---- one-step：每步喂 GT 上一帧 (forward Euler, dt=1) ----
+        # x_pred = pos[t-1] + vel[t-1]*dt；因 vel 为前向差分，结果≈pos[t]，故 pos_rmse≈0
+        v_pred_os = vel[t - 1]                          # a=0 → v 沿用 GT 上一帧
+        x_pred_os = pos[t - 1] + v_pred_os * dt
+        out["rmse_vel_onestep"].append(rms(v_pred_os - vel[t]))
+        out["rmse_pos_onestep"].append(rms(x_pred_os - pos[t]))
+
+        # ---- rollout：从最后输入帧自我递推 (constant-velocity) ----
+        steps = t - (IF - 1)
+        x_pred_rl = x0 + v0 * dt * steps                # 匀速外推
+        out["rmse_vel_rollout"].append(rms(v0 - vel[t]))     # v 冻结
+        out["rmse_pos_rollout"].append(rms(x_pred_rl - pos[t]))
+
+    return {k: np.array(v) for k, v in out.items()}
 
 # ── RMSE plot ────────────────────────────────────────────────────────────────
 
@@ -462,8 +495,8 @@ _RCPARAMS = {
     "ytick.labelsize": 10,
 }
 _FEAT_NAMES  = ["Position",    "Velocity",    "Acceleration"]
-_FEAT_UNITS  = ["mm",          "km/h",        "g"]
-_FEAT_SCALES = [1.0,           0.0036,        1.0 / 9810.0]   # mm/s→km/h, mm/s²→g
+_FEAT_UNITS  = ["mm",          "mm/dt",       "mm/dt²"]
+_FEAT_SCALES = [1.0,           1.0,           1.0]    # per-frame units, no conversion
 _RMSE_KEYS   = ["rmse_pos",    "rmse_vel",    "rmse_acc"]
 _COL_LABELS  = ["One-step",    "Autoregressive"]
 
@@ -710,7 +743,29 @@ def render_vis(
 
     # Visual Setup
     plt.rcParams['font.family'] = 'Times New Roman'
-    fig, axs = plt.subplots(2, 2, figsize=(10, 8), dpi=dpi)
+    plt.rcParams['font.size']   = 12
+
+    # 按各行的数据纵向跨度分配行高,使 equal-aspect 下各行填满格子、消除空白
+    x_span = x_range[1] - x_range[0]
+    z_span = z_range[1] - z_range[0]      # X-Z 行 (上): ~4500
+    y_span = y_range[1] - y_range[0]      # X-Y 行 (下): ~18000
+
+    fig_w     = 12.0
+    n_cols    = 2
+    col_w     = fig_w / n_cols
+    upi       = x_span / col_w             # units per inch (x 方向)
+    plot_h    = (z_span + y_span) / upi    # 两排内容真实总高
+    fig_h     = plot_h + 1.6               # +1.6 给标题/轴标签留边
+
+    fig, axs = plt.subplots(
+        2, 2,
+        figsize=(fig_w, fig_h), dpi=dpi,
+        gridspec_kw={
+            "height_ratios": [z_span, y_span],
+            "hspace": 0.18,
+            "wspace": 0.18,
+        },
+    )
     fig.patch.set_facecolor("white")
     
 
@@ -728,7 +783,7 @@ def render_vis(
     # ── Axes Setup (Equal aspect ratio for NO distortion) ──────────────────
     for ax in axs.flat:
         ax.set_facecolor("white")
-        ax.tick_params(colors="black", labelsize=6)
+        ax.tick_params(colors="black", labelsize=12)
         ax.set_aspect('equal', adjustable='box')
         
     for i in range(2):
@@ -741,10 +796,10 @@ def render_vis(
             axs[i, 0].set_ylim(y_range)
             axs[i, 1].set_ylim(y_range)
 
-    axs[0, 0].set_ylabel("Z", color="black", fontsize=8)
-    axs[1, 0].set_ylabel("Y", color="black", fontsize=8)
-    axs[1, 0].set_xlabel("X", color="black", fontsize=8)
-    axs[1, 1].set_xlabel("X", color="black", fontsize=8)
+    axs[0, 0].set_ylabel("Z", color="black", fontsize=FONTSIZE)
+    axs[1, 0].set_ylabel("Y", color="black", fontsize=FONTSIZE)
+    axs[1, 0].set_xlabel("X", color="black", fontsize=FONTSIZE)
+    axs[1, 1].set_xlabel("X", color="black", fontsize=FONTSIZE)
 
     # ── Initialize Scatter Plots ───────────────────────────────────────────
     scatters = [[None, None], [None, None]]
@@ -760,10 +815,10 @@ def render_vis(
                                        c=c, s=0.3, alpha=0.6, linewidths=0)
             scatters[row][col] = sc
 
-    title_pred_xz = axs[0, 0].set_title("", color="black", fontsize=8, pad=3)
-    title_gt_xz   = axs[0, 1].set_title("", color="black", fontsize=8, pad=3)
-    axs[1, 0].set_title("PRED (X-Y Plane)", color="black", fontsize=8, pad=3)
-    axs[1, 1].set_title("GT (X-Y Plane)", color="black", fontsize=8, pad=3)
+    title_pred_xz = axs[0, 0].set_title("", color="black", fontsize=FONTSIZE, pad=3)
+    title_gt_xz   = axs[0, 1].set_title("", color="black", fontsize=FONTSIZE, pad=3)
+    axs[1, 0].set_title("PRED (X-Y Plane)", color="black", fontsize=FONTSIZE, pad=3)
+    axs[1, 1].set_title("GT (X-Y Plane)", color="black", fontsize=FONTSIZE, pad=3)
 
     # 取消了原有的 fig.axes[0].legend() 避免画面遮挡
     fig.canvas.draw()
@@ -826,19 +881,24 @@ def print_summary(onestep: dict | None, autoreg: dict | None, baseline: dict):
     print("\n" + "=" * 72)
     print("ROLLOUT SUMMARY")
     print("=" * 72)
-    print(f"{'Mode':<20} {'pos_rmse(mm)':>14} {'vel_rmse(mm/s)':>16} {'acc_rmse(mm/s²)':>17}")
+    print(f"{'Mode':<20} {'pos_rmse(mm)':>14} {'vel_rmse(mm/dt)':>16} {'acc_rmse(mm/dt²)':>17}")
     print("-" * 72)
 
-    print(f"{'last-frame baseline':<20} "
-          f"{baseline['rmse_pos'].mean():>14.3f} "
-          f"{'N/A':>16} "
-          f"{'N/A':>17}")
+    print(f"{'onestep baseline':<20} "
+          f"{baseline['rmse_pos_onestep'].mean():>14.3f} "
+          f"{baseline['rmse_vel_onestep'].mean():>16.3f} "
+          f"{baseline['rmse_acc_onestep'].mean():>17.3f}")
 
     if onestep is not None:
         print(f"{'one-step':<20} "
               f"{onestep['rmse_pos'].mean():>14.3f} "
               f"{onestep['rmse_vel'].mean():>16.3f} "
               f"{onestep['rmse_acc'].mean():>17.3f}")
+    
+    print(f"{'rollout baseline':<20} "
+          f"{baseline['rmse_pos_rollout'].mean():>14.3f} "
+          f"{baseline['rmse_vel_rollout'].mean():>16.3f} "
+          f"{baseline['rmse_acc_rollout'].mean():>17.3f}")
 
     if autoreg is not None:
         print(f"{'autoregressive':<20} "
@@ -883,6 +943,11 @@ def main():
     model, cfg = load_model(args.checkpoint, args.experiment, device)
     exp_name   = cfg["name"]
 
+    # ── INPUT_FRAMES from config (must match training) ────────────────────
+    global INPUT_FRAMES
+    INPUT_FRAMES = int(cfg["data"].get("input_frames", INPUT_FRAMES))
+    print(f"[Rollout] INPUT_FRAMES = {INPUT_FRAMES} (from config)")
+
     out_dir = Path(args.output_dir or
                    PROJECT_ROOT / "outputs" / "rollouts" / exp_name)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -892,8 +957,8 @@ def main():
     norm_stats = NormStats(cfg["data"]["metadata_path"]) #, cfg["data"]["acc_scale"])
     normed     = normalize_raw(raw_data, norm_stats)
 
-    # ── Baseline ──────────────────────────────────────────────────────────
-    baseline = compute_baseline(raw_data)
+    # ── Baseline (dt=1, per-frame; same forward-Euler convention) ─────────
+    baseline = compute_baseline(raw_data, dt=DT, input_frames=INPUT_FRAMES)
 
     # ── Run inference ─────────────────────────────────────────────────────
     onestep = autoreg = None
@@ -943,9 +1008,6 @@ def main():
     # ── RMSE plot ─────────────────────────────────────────────────────────
     if args.plot:
         plot_rmse_vs_timestep(onestep, autoreg, out_dir)
-        # print(acc_rmse_onestep[:10])
-        # print(acc_rmse_ar[:10])
-        # print(np.array_equal(acc_rmse_onestep, acc_rmse_ar))
 
     # ── Multi-experiment comparison plot ──────────────────────────────────
     if args.compare_dirs:

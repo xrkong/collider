@@ -455,21 +455,39 @@ class BVCSlicedDataset(BaseDataset):
             else:
                 vel_norm = vel
                 acc_norm = acc
-            
+
+            # Derived vel/acc from position finite differences
+            vel_derived     = np.diff(pos, axis=0)          # (T-1, N, 3)
+            acc_derived_raw = np.diff(vel_derived, axis=0)  # (T-2, N, 3)
+            if self._stats is not None:
+                vel_derived_norm = self._stats.normalize("velocity",     vel_derived)
+                acc_derived_norm = self._stats.normalize("acceleration", acc_derived_raw)
+            else:
+                vel_derived_norm = vel_derived
+                acc_derived_norm = acc_derived_raw
+
             self._trajectories.append({
-                "vel_norm":  vel_norm,   # (T, N, 3) normalized
-                "vel_phys":  vel,        # (T, N, 3) physical, for integration
-                "acc_norm":  acc_norm,   # (T, N, 3) normalized target
-                "pos_phys":  pos,        # (T, N, 3) physical, for SDF
-                "T":         T,
-                "path":      str(p),
+                "vel_norm":          vel_norm,          # (T, N, 3) normalized
+                "vel_phys":          vel,               # (T, N, 3) physical, for integration
+                "acc_norm":          acc_norm,          # (T, N, 3) normalized target
+                "pos_phys":          pos,               # (T, N, 3) physical, for SDF
+                "T":                 T,
+                "path":              str(p),
+                "vel_derived_norm":  vel_derived_norm,  # (T-1, N, 3)
+                "vel_derived_phys":  vel_derived,       # (T-1, N, 3)
+                "acc_derived_norm":  acc_derived_norm,  # (T-2, N, 3)
+                "T_derived":         T - 2,
             })
         
         # ── Build (traj_idx, start_idx) index ──
-        # Each valid start spans [0, T - window_len], inclusive.
+        # Binding constraint is the acc target slice acc_derived[start+T_in-1 :
+        # start+T_in-1+K] (acc_derived has length T-2). Requiring the full K
+        # frames in-bounds gives start <= T - window_len - 1, i.e. n_starts =
+        # T - window_len. (future_pos pos[start+T_in : start+T_in+K] is less
+        # binding: start <= T - window_len.)
         self._index_map: list[tuple[int, int]] = []
         for ti, traj in enumerate(self._trajectories):
-            n_starts = traj["T"] - self.window_len + 1
+            n_starts = max(0, traj["T"] - self.window_len)
             for si in range(n_starts):
                 self._index_map.append((ti, si))
         
@@ -481,33 +499,80 @@ class BVCSlicedDataset(BaseDataset):
     def __len__(self) -> int:
         return len(self._index_map)
     
+    # def __getitem__(self, idx):
+    #     traj_idx, start = self._index_map[idx]
+    #     traj = self._trajectories[traj_idx]
+    #     T_in = self.input_frames
+    #     K    = self.K
+    #     end  = start + T_in + K
+    #
+    #     # ── Input velocity (normalized, flattened) ──
+    #     vel_in = traj["vel_norm"][start : start + T_in]            # (T_in, N, 3)
+    #     N = vel_in.shape[1]
+    #     x_vel = vel_in.transpose(1, 0, 2).reshape(N, -1)           # (N, T_in*3)
+    #
+    #     # ── Last input frame physical velocity (for integration) ──
+    #     v_last_phys = traj["vel_phys"][start + T_in - 1]           # (N, 3)
+    #
+    #     # ── Future acceleration targets (K frames, normalized) ──
+    #     acc_future = traj["acc_norm"][start + T_in : end]          # (K, N, 3)
+    #     future_acc = acc_future.transpose(1, 0, 2)                 # (N, K, 3)
+    #
+    #     # ── Positions (raw, for SDF) ──
+    #     input_pos  = traj["pos_phys"][start : start + T_in]        # (T_in, N, 3)
+    #     future_pos = traj["pos_phys"][start + T_in : end]          # (K, N, 3)
+    #     future_pos = future_pos.transpose(1, 0, 2)                 # (N, K, 3)
+    #     input_pos  = input_pos.transpose(1, 0, 2)                  # (T_in, N, 3)->(N, T_in, 3)
+    #
+    #     return (
+    #         torch.from_numpy(np.ascontiguousarray(x_vel)),         # (N, T_in*3)
+    #         torch.from_numpy(np.ascontiguousarray(future_acc)),    # (N, K, 3)
+    #         torch.from_numpy(np.ascontiguousarray(input_pos)),     # (N, T_in, 3)
+    #         torch.from_numpy(np.ascontiguousarray(future_pos)),    # (N, K, 3)
+    #         torch.from_numpy(np.ascontiguousarray(v_last_phys)),   # (N, 3)
+    #     )
+
     def __getitem__(self, idx):
+        """Derived-kinematics version: vel = pos[t+1]-pos[t], acc = vel[t+1]-vel[t].
+
+        Forward-difference convention (dt = 1 frame), consistent with the
+        exporter. The trainer MUST integrate with forward Euler in this order:
+            x_{i+1} = x_i + v_i      # use CURRENT velocity first
+            v_{i+1} = v_i + a_i      # then update velocity
+        with x_0 = input_pos[:, -1, :] (= pos[start+T_in-1]) and
+             v_0 = v_last_phys        (= vel_derived[start+T_in-1]).
+
+        Under this scheme the k-th acceleration that advances v_k -> v_{k+1} is
+        acc_derived[start+T_in-1+k], so the K targets start at start+T_in-1
+        (NOT start+T_in). Feeding GT acc through the above integrator then
+        reconstructs future_pos exactly (verified to machine precision).
+        """
         traj_idx, start = self._index_map[idx]
         traj = self._trajectories[traj_idx]
         T_in = self.input_frames
         K    = self.K
         end  = start + T_in + K
-        
-        # ── Input velocity (normalized, flattened) ──
-        vel_in = traj["vel_norm"][start : start + T_in]            # (T_in, N, 3)
+
+        # Input: derived velocity (normalized, flattened)
+        vel_in = traj["vel_derived_norm"][start : start + T_in]    # (T_in, N, 3)
         N = vel_in.shape[1]
         x_vel = vel_in.transpose(1, 0, 2).reshape(N, -1)           # (N, T_in*3)
-        
-        # ── Last input frame physical velocity (for integration) ──
-        v_last_phys = traj["vel_phys"][start + T_in - 1]           # (N, 3)
-        
-        # ── Future acceleration targets (K frames, normalized) ──
-        acc_future = traj["acc_norm"][start + T_in : end]          # (K, N, 3)
+
+        # Last input frame physical velocity for integration (v_0)
+        v_last_phys = traj["vel_derived_phys"][start + T_in - 1]   # (N, 3)
+
+        # Target: derived acceleration (K frames, normalized).
+        # Starts at start+T_in-1 so a_0 advances v_last -> next velocity.
+        acc_start  = start + T_in - 1
+        acc_future = traj["acc_derived_norm"][acc_start : acc_start + K]  # (K, N, 3)
         future_acc = acc_future.transpose(1, 0, 2)                 # (N, K, 3)
-        
-        # ── Positions (raw, for SDF) ──
+
+        # Positions (raw, for SDF). future_pos[k] = pos[start+T_in+k].
         input_pos  = traj["pos_phys"][start : start + T_in]        # (T_in, N, 3)
         future_pos = traj["pos_phys"][start + T_in : end]          # (K, N, 3)
         future_pos = future_pos.transpose(1, 0, 2)                 # (N, K, 3)
+        input_pos  = input_pos.transpose(1, 0, 2)                  # (N, T_in, 3)
 
-
-        input_pos = input_pos.transpose(1, 0, 2)                 # (T_in, N, 3)->(N, T_in, 3)
-        
         return (
             torch.from_numpy(np.ascontiguousarray(x_vel)),         # (N, T_in*3)
             torch.from_numpy(np.ascontiguousarray(future_acc)),    # (N, K, 3)
