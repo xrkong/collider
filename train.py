@@ -288,10 +288,10 @@ def run_validation(model, val_loader, device) -> dict:
         x_in  = torch.cat([x_vel, x_sdf], dim=-1)
         # x_in = x_vel  # ablation: no SDF
         
-        pred = model(x_in)
-
-        target = future_acc[:, :, 0, :]                  # first step target
-        loss, _ = compute_loss(pred, target)
+        with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+            pred = model(x_in)
+            target = future_acc[:, :, 0, :]                  # first step target
+            loss, _ = compute_loss(pred, target)
         total += loss.item()
         n_batches += 1
     return {"loss": total / max(n_batches, 1)}
@@ -450,13 +450,14 @@ def train(cfg: dict, git_commit: str = "unknown"):
                     x_in       = torch.cat([x_vel_flat, x_sdf], dim=-1)   # (B, N, T_in*4)
 
                     # Forward
-                    a_pred = model(x_in)                                  # (B, N, 3)
+                    with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                        a_pred = model(x_in)                                  # (B, N, 3)
 
-                    # Loss for this step — only nodes within threshold of barrier
-                    target_k  = future_acc[:, :, k, :]                    # (B, N, 3)
-                    loss_k, _ = compute_loss(a_pred, target_k)
-                    total_loss = total_loss + loss_k
-                    step_losses.append(loss_k.item())
+                        # Loss for this step — only nodes within threshold of barrier
+                        target_k  = future_acc[:, :, k, :]                    # (B, N, 3)
+                        loss_k, _ = compute_loss(a_pred, target_k)
+                        total_loss = total_loss + loss_k
+                        step_losses.append(loss_k.item())
 
                     # If not last step, prepare next iteration
                     if k < push_K - 1:
