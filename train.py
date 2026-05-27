@@ -363,10 +363,13 @@ def train(cfg: dict, git_commit: str = "unknown"):
     print(f"active ratio (>0.5):  {n_active_05 / n_total:.4%}")
 
     grad_clip = float(train_cfg.get("grad_clip", 1.0))
+    accum_steps = int(train_cfg.get("accum_steps", 1))   # <-- 新增
+    print(f"[Train] accum_steps = {accum_steps} | effective batch = {train_cfg['batch_size'] * accum_steps}")
 
     n_epochs        = int(train_cfg["n_epochs"])
     steps_per_epoch = len(train_loader)
-    total_steps     = n_epochs * steps_per_epoch
+    opt_steps_per_epoch = (steps_per_epoch + accum_steps - 1) // accum_steps   # ceil
+    total_steps     = n_epochs * opt_steps_per_epoch
 
     lr     = float(train_cfg.get("lr", 1e-3))
     min_lr = float(train_cfg.get("min_lr", lr))
@@ -408,7 +411,7 @@ def train(cfg: dict, git_commit: str = "unknown"):
 
             pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{n_epochs}", unit="batch",
                         dynamic_ncols=True, leave=True)
-            for batch in pbar:
+            for batch_idx, batch in enumerate(pbar):
                 # ── Unpack batch (5 tensors from new BVCSlicedDataset) ────
                 x_vel, future_acc, input_pos, future_pos, v_last_phys = batch
                 # x_vel:       (B, N, T_in*3)   normalized velocity, flattened
@@ -475,11 +478,20 @@ def train(cfg: dict, git_commit: str = "unknown"):
                 loss = total_loss / push_K
 
                 # ── Backward ──────────────────────────────────────────────
-                optimizer.zero_grad()
-                loss.backward()
-                torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
-                optimizer.step()
-                scheduler.step()
+                # optimizer.zero_grad()
+                # loss.backward()
+                # torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+                # optimizer.step()
+                # scheduler.step()
+                (loss / accum_steps).backward()                            # <-- 缩放 loss
+    
+                is_accum_boundary = ((batch_idx + 1) % accum_steps == 0) \
+                                    or (batch_idx + 1 == len(train_loader))
+                if is_accum_boundary:
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+                    optimizer.step()
+                    scheduler.step()
+                    optimizer.zero_grad()
 
                 step           += 1
                 epoch_batches  += 1
