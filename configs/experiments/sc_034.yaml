@@ -1,5 +1,5 @@
-name: "sc_033"
-description: "Try autocase bf16 to meet the requirements."
+name: "sc_034"
+description: "noise std 0.1"
 model:
   name: "transolverplus_net"                        # registry key
   params: "configs/params/transolverplus_net.yaml"  # base params file
