@@ -20,7 +20,7 @@ overrides:
   train.batch_size: 4
   train.accum_steps: 2 
   train.n_epochs: 500
-  train.push_forward_k: 1
+  train.push_forward_k: 2
   train.noise_std: 0.05
   train.grad_clip: 5.0
   train.val_every_epochs: 10
