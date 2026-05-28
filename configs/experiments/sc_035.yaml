@@ -25,8 +25,9 @@ overrides:
   train.grad_clip: 5.0
   train.val_every_epochs: 10
 
-  data.paths: "/home/kong/datasets/barrier/h5/T_lok_F_shape_barrier_9_3_100km_50_5_dt/output.h5"
-  data.input_frames: 5 
+  data.train_paths: "/home/kong/datasets/barrier/h5/T_lok_F_shape_barrier_9_3_100km_50_5_dt/output.h5"
+  data.val_paths: "/home/kong/datasets/barrier/h5/T_lok_F_shape_barrier_9_3_80km_50_5_dt/output.h5"
+  data.input_frames: 5
   data.acc_scale: 5.0e5
   data.metadata_path: "/home/kong/datasets/barrier/h5/T_lok_F_shape_barrier_9_3_100km_50_5_dt/metadata.json"
 

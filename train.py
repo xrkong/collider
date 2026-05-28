@@ -325,8 +325,8 @@ def train(cfg: dict, git_commit: str = "unknown"):
     )
 
     # ── Data ──────────────────────────────────────────────────────────────
-    train_loader = build_dataloader(cfg, split="train") # 跑最小的训练集，验证loss能不能降到最低。
-    val_loader   = build_dataloader(cfg, split="train")
+    train_loader = build_dataloader(cfg, split="train")
+    val_loader   = build_dataloader(cfg, split="val")
 
     # ── Push-forward & noise config ──────────────────────────────────────
     push_K     = int(train_cfg.get("push_forward_k", 1))

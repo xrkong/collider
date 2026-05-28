@@ -26,9 +26,9 @@ Pipeline
         • node_part_id  stored once in /metadata
 
 python dataset/d3plot_to_h5_dt.py \
-    --src /home/kong/datasets/barrier/fem/T_lok_F_shape_barrier_9_3_100km \
+    --src /home/kong/datasets/barrier/fem/T_lok_F_shape_barrier_9_3_80km \
     --tmp /home/kong/datasets/barrier/tmp \
-    --out /home/kong/datasets/barrier/h5/T_lok_F_shape_barrier_9_3_100km_50_5_dt/output.h5 \
+    --out /home/kong/datasets/barrier/h5/T_lok_F_shape_barrier_9_3_80km_50_5_dt/output.h5 \
     --required-config configs/data/required_parts.config \
     --node-stride 50 \
     --frame-stride 5 \
@@ -347,6 +347,11 @@ def _scan_state_times(
                 print(f"  {src.name}: {len(t_arr)} state(s), "
                       f"t = {float(t_arr[0])*1e3:.2f} – {float(t_arr[-1])*1e3:.2f} ms")
             del d3
+        except RuntimeError as exc:
+            if "endmark" in str(exc).lower():
+                print(f"  WARNING: {src.name} skipped – missing endmark ({exc})")
+            else:
+                raise
         finally:
             (tmp_dir / "d3plot").unlink(missing_ok=True)
             (tmp_dir / "d3plot01").unlink(missing_ok=True)
