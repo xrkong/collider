@@ -21,7 +21,7 @@ REPO_ROOT = PROJECT_ROOT
 
 import models  # triggers auto-import of all registered models
 from models.registry import build_model
-from src.dataset import NormStats, build_dataloader
+from src.dataset import NormStats, build_dataloader, load_or_compute_global_stats, _DEFAULT_NORM_FIELDS
 from src.utils.metrics import MetricTracker
 
 try:
@@ -325,13 +325,37 @@ def train(cfg: dict, git_commit: str = "unknown"):
     )
 
     # ── Data ──────────────────────────────────────────────────────────────
+    train_dirs = data_cfg["train_dirs"]
+    val_dirs   = data_cfg["val_dirs"]
+
+    # Fail fast if train and val dirs overlap
+    train_resolved = {str(Path(d).resolve()) for d in train_dirs}
+    val_resolved   = {str(Path(d).resolve()) for d in val_dirs}
+    overlap = train_resolved & val_resolved
+    if overlap:
+        raise ValueError(f"Val dirs overlap with train dirs: {overlap}")
+
+    # Compute or load global normalization stats (train trajs only)
+    run_output_dir = PROJECT_ROOT / "outputs" / "checkpoints" / cfg["name"]
+    norm_fields = data_cfg.get("norm_fields", _DEFAULT_NORM_FIELDS)
+    train_stats = load_or_compute_global_stats(
+        train_dirs  = train_dirs,
+        cache_path  = run_output_dir / "global_stats.json",
+        fields      = norm_fields,
+    )
+
+    # Both loaders share the same train stats (critical: val must NOT use its own stats)
     train_loader = build_dataloader(
-        cfg, data_cfg["train_dirs"],
-        shuffle=True,  batch_size=train_cfg.get("batch_size", 1),
+        cfg, train_dirs,
+        shuffle    = True,
+        batch_size = train_cfg.get("batch_size", 1),
+        stats      = train_stats,
     )
     val_loader = build_dataloader(
-        cfg, data_cfg["val_dirs"],
-        shuffle=False, batch_size=train_cfg.get("val_batch_size", 1),
+        cfg, val_dirs,
+        shuffle    = False,
+        batch_size = train_cfg.get("val_batch_size", 1),
+        stats      = train_stats,
     )
 
     # ── Push-forward & noise config ──────────────────────────────────────
@@ -341,11 +365,11 @@ def train(cfg: dict, git_commit: str = "unknown"):
     print(f"[Train] push_forward_k = {push_K}, noise_std = {noise_std}, dt = {dt}")
     
     # ── Pre-load normalization stats as GPU tensors (for in-graph denorm/renorm) ──
-    norm_stats = NormStats(cfg["data"]["metadata_path"])
-    acc_mean = torch.from_numpy(norm_stats._mean["acceleration"]).to(device).float()  # (3,)
-    acc_std  = torch.from_numpy(norm_stats._std ["acceleration"]).to(device).float()
-    vel_mean = torch.from_numpy(norm_stats._mean["velocity"    ]).to(device).float()
-    vel_std  = torch.from_numpy(norm_stats._std ["velocity"    ]).to(device).float()
+    # Uses global train stats (scalars); broadcasts correctly against (B, N, 3).
+    acc_mean = torch.tensor(train_stats["acceleration"]["mean"], dtype=torch.float32, device=device)
+    acc_std  = torch.tensor(train_stats["acceleration"]["std"],  dtype=torch.float32, device=device)
+    vel_mean = torch.tensor(train_stats["velocity"]["mean"],     dtype=torch.float32, device=device)
+    vel_std  = torch.tensor(train_stats["velocity"]["std"],      dtype=torch.float32, device=device)
     
     # 流式累加，不要堆全部 target 到内存
     sum_abs = 0.0
