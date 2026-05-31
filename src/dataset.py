@@ -590,39 +590,49 @@ _DATASET_MAP = {
     "bvc_sliced":     BVCSlicedDataset,
 }
 
-def build_dataloader(cfg: dict, split: str = "train") -> torch.utils.data.DataLoader:
-    data_cfg  = cfg.get("data", {})
-    train_cfg = cfg.get("train", {})
-    
+def _resolve_traj_dir(d: str | Path) -> dict:
+    """Resolve a trajectory dir to its required files. Fails loudly if missing."""
+    d = Path(d)
+    if not d.is_dir():
+        raise FileNotFoundError(f"Trajectory dir not found: {d}")
+    h5, meta = d / "output.h5", d / "metadata.json"
+    missing = [p.name for p in (h5, meta) if not p.is_file()]
+    if missing:
+        raise FileNotFoundError(f"{d} missing required files: {missing}")
+    return {"h5": str(h5), "metadata": str(meta)}
+
+def build_dataloader(
+    cfg: dict,
+    dirs: list[str] | str,
+    *,
+    shuffle: bool,
+    batch_size: int,
+) -> torch.utils.data.DataLoader:
+    data_cfg = cfg.get("data", {})
+
     dataset_type = data_cfg.get("dataset_type", "bvc")
     dataset_cls  = _DATASET_MAP.get(dataset_type)
     if dataset_cls is None:
         raise ValueError(f"Unknown dataset_type '{dataset_type}'")
-    
-    if dataset_type == "bvc_sliced":
-        # New-style: explicit paths in config; supports per-split override.
-        # e.g. data.train_paths / data.val_paths, or single data.paths for both.
-        split_paths = data_cfg.get(f"{split}_paths") or data_cfg.get("paths")
-        if split_paths is None:
-            raise ValueError(
-                f"bvc_sliced requires data.{split}_paths or data.paths in cfg"
-            )
-        split_cfg = {**cfg, "data": {**data_cfg, "paths": split_paths}}
-    else:
-        # Legacy pre-windowed
-        base_path = Path(data_cfg.get("base_path", "dataset/data_processed"))
-        h5_path   = base_path / f"{split}" / f"{split}_data_000.h5"
-        split_cfg = {**cfg, "data": {**data_cfg, "path": str(h5_path)}}
-    
-    dataset = dataset_cls(split_cfg)
-    
-    is_train   = (split == "train")
-    batch_size = train_cfg.get("batch_size", 1) if is_train else 1
-    
+
+    if isinstance(dirs, str):
+        dirs = [dirs]
+    if not dirs:
+        raise ValueError("build_dataloader needs at least one trajectory dir")
+
+    trajectories = [_resolve_traj_dir(d) for d in dirs]
+    ds_cfg = {**cfg, "data": {
+        **data_cfg,
+        "paths":          [t["h5"]       for t in trajectories],
+        "metadata_paths": [t["metadata"] for t in trajectories],
+    }}
+
+    dataset = dataset_cls(ds_cfg)
+
     return torch.utils.data.DataLoader(
         dataset,
         batch_size  = batch_size,
-        shuffle     = is_train,
+        shuffle     = shuffle,
         num_workers = data_cfg.get("num_workers", 0),
         pin_memory  = data_cfg.get("pin_memory", True),
     )

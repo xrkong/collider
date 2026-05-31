@@ -1,0 +1,208 @@
+# ============================================================
+# Sampling Configuration for BVC Surrogate Model
+#
+# Two-layer node selection strategy:
+#   Layer 1 - collision_zone:   all nodes kept unconditionally (no stride)
+#   Layer 2 - required_parts:   stride sampled (--node-stride N)
+#                               nodes already in Layer 1 are deduplicated out
+# ============================================================
+
+
+# ------------------------------------------------------------
+# Layer 1: Collision zone — ALL nodes kept, no stride
+# Car front contact face + barrier contact face
+# ------------------------------------------------------------
+collision_zone:
+
+  car_contact_parts:
+    - frontface
+    - bumper
+    - bumpersteel
+    - bumpercover
+    - bumperhousing
+    - railfront
+    - noserail
+    - frontrail
+
+  barrier_parts:
+    - anchor rebar_t-1
+    - anchor rebar_s-1
+    - reinforcement-1
+    - steel tube-1
+    - t lok-1
+    - anchor rebar_t-2
+    - anchor rebar_s-2
+    - reinforcement-2
+    - steel tube-2
+    - t lok-2
+
+
+# ------------------------------------------------------------
+# Layer 2: Required parts — stride sampled (--node-stride N)
+# Collision zone parts listed here too; duplicates are removed
+# automatically in code via np.isin deduplication.
+# ------------------------------------------------------------
+required_parts:
+
+  barrier_parts:
+    - concrete_fine_mesh
+
+  front_crash_structure:
+    - frontface
+    - bumper
+    - bumpersteel
+    - bumpercover
+    - bumperhousing
+    - hood
+    - hoodinner
+    - fender
+    - windshield
+    - railfront
+    - noserail
+    - frontrail
+    - railfrontplate
+    - railfrontplaterear
+    - raillargefront
+    - raillargeinnerfront
+    - raillargefrontouter
+    - railmid
+    - xmemberfront
+    - xmembermidfront
+    - xmemberrearmiddlebottom
+    - framexmemberplates
+    - radiator
+    - radiatorframe
+    - radiatorframebottom
+    - radiatorframebrkttop
+    - radiatorside
+    - radiatorsolid
+    - radiatornullshell
+    - condensor
+
+  occupant_cage:
+    - firewall
+    - firewalltray
+    - firewallsupport
+    - ipbeamfirewallbrkt
+    - floor
+    - floorfront
+    - rearfloor
+    - floorxmember
+    - floorlongitudesupport
+    - floorsupport
+    - floorbottomplate
+    - rocker
+    - rockerinner
+    - rockerfront
+    - rockerinternal
+    - rockerfrontinnersuppport
+    - apillar
+    - bpillar
+    - cpillar
+    - pillar
+    - cabrail
+    - cabrailupper
+    - cabraillower
+    - cabraillatitudebar
+    - cabrailconnection
+    - cabrailpanel
+    - cabrailframeconnector
+    - roof
+    - roofrail
+    - roofrailfront
+    - roofrailrear
+    - roofrailxmember
+    - sidepanel
+    - backwall
+    - cabpanel
+
+  doors:
+    - doorfront
+    - doorrear
+    - doorouter
+    - doorinner
+    - frontdoorinner
+    - doorfrontbar
+    - doorrearlowerbar
+    - doorrearuppersupport
+    - doorfrtlongitudesuprt
+    - doorfrontlonguppersprt
+    - doorrearlatitudesuprt
+    - windowframe
+    - windowguide
+    - lockplate
+    - hinge
+
+  interior:
+    - ipbeam
+    - dash
+    - dashcover
+    - dashfan
+    - dashscreen
+    - dashcenter
+    - dashbottom
+    - dashcompartment
+    - glovecompartment
+    - airbag
+    - airbagbrkt
+    - airbagbkt
+    - airbagcover
+    - steering
+    - steeringwheel
+    - steeringcolmn
+    - steeringcolumn
+    - steeringrack
+
+  seats:
+    - seat
+    - seatdriver
+    - seadriver
+    - backseat
+    - seatback
+    - seatfoam
+    - foam
+    - driverseat
+    - passengerseat
+    - rearseat
+    - headrest
+    - seatbelt
+    - seatdriverouterrail
+    - seatdriverinnerrail
+
+  dummy_and_sensors:
+    - dummy
+    - dummy_beams
+    - lap_strap
+    - shoulder_strap
+    - accelerometer
+    - accelerometers
+
+  powertrain:
+    - engine
+    - engineoilpan
+    - enginemount
+    - enginemountrubber
+    - transmission
+    - transmissionoilpan
+    - transmissionmount
+    - battery
+    - batterymount
+    - fusebox
+    - brake
+    - brakebooster
+    - brakeboostermnt
+    - brakefluidcontainer
+
+  suspension:
+    - aarm
+    - upperarm
+    - lowerarm
+    - spindle
+    - diskfront
+    - upright
+    - tire
+    - rim
+    - swaybar
+    - shockhousingfront
+    - shocksupport
+    - suspensionbracketinner

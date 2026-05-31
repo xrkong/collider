@@ -325,8 +325,14 @@ def train(cfg: dict, git_commit: str = "unknown"):
     )
 
     # ── Data ──────────────────────────────────────────────────────────────
-    train_loader = build_dataloader(cfg, split="train")
-    val_loader   = build_dataloader(cfg, split="val")
+    train_loader = build_dataloader(
+        cfg, data_cfg["train_dirs"],
+        shuffle=True,  batch_size=train_cfg.get("batch_size", 1),
+    )
+    val_loader = build_dataloader(
+        cfg, data_cfg["val_dirs"],
+        shuffle=False, batch_size=train_cfg.get("val_batch_size", 1),
+    )
 
     # ── Push-forward & noise config ──────────────────────────────────────
     push_K     = int(train_cfg.get("push_forward_k", 1))

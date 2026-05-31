@@ -3,13 +3,15 @@ d3plot_to_h5.py  –  Compressed HDF5 exporter for LS-DYNA d3plot sequences.
 
 Pipeline
 --------
-  Step 1a – Part filtering
-      Keep only the parts listed / matched in required_parts.config.
-      All nodes not belonging to any selected part are discarded.
+  Step 1a – Part filtering (two-layer, --sampling-config YAML)
+      Layer 1 (collision_zone):  all nodes from car_contact_parts and
+                                 barrier_parts are kept unconditionally.
+      Layer 2 (required_parts):  nodes from all other structural parts are
+                                 kept every --node-stride-th entry.
+                                 Nodes already in Layer 1 are deduplicated out.
+      The union of both layers forms the final node set sel_node_idx.
 
-  Step 1b – Spatial decimation  (--node-stride N)
-      From the selected nodes (ordered by global node index), keep
-      every N-th entry.  N=1 keeps all nodes.
+  Step 1b – (removed; stride is now applied per-layer inside Step 1a)
 
   Step 2  – Temporal decimation  (--frame-stride N)
       Sort all states across every d3plot file by physical time,
@@ -26,10 +28,10 @@ Pipeline
         • node_part_id  stored once in /metadata
 
 python dataset/d3plot_to_h5_dt.py \
-    --src /home/kong/datasets/barrier/fem/T_lok_F_shape_barrier_9_3_80km \
+    --src /home/kong/datasets/barrier/fem/T_lok_F_shape_barrier_9_3_100km \
     --tmp /home/kong/datasets/barrier/tmp \
-    --out /home/kong/datasets/barrier/h5/T_lok_F_shape_barrier_9_3_80km_50_5_dt/output.h5 \
-    --required-config configs/data/required_parts.config \
+    --out /home/kong/datasets/barrier/h5/T_lok_F_shape_barrier_9_3_100km_dt_2layers/output.h5 \
+    --sampling-config configs/data/sampling_config.yaml \
     --node-stride 50 \
     --frame-stride 5 \
     --frame-limit 100
@@ -46,7 +48,7 @@ HDF5 layout
       part_ids            (P,)     int64
       part_names          (P,)     bytes
       part_patterns       (K,)     bytes
-      attrs: node_stride, frame_stride, n_frames, n_nodes,
+      attrs: node_stride, node_selection, frame_stride, n_frames, n_nodes,
              stress_components = "sxx,syy,szz,sxy,syz,sxz"
 
   /states/
@@ -67,17 +69,18 @@ import shutil
 
 import h5py
 import numpy as np
+import yaml
 from lasso.dyna import ArrayType, D3plot
 
 
 # ── Defaults ───────────────────────────────────────────────────────────────────
 
-DEFAULT_SRC            = Path("/home/kong/datasets/barrier/fem/T_lok_F_shape_barrier_9_3_100km")
-DEFAULT_TMP            = Path("/home/kong/datasets/barrier/tmp")
-DEFAULT_OUT            = Path("/home/kong/datasets/barrier/h5/output.h5")
-DEFAULT_REQUIRED_CONFIG = Path("dataset/required_parts.config")
-DEFAULT_NODE_STRIDE    = 50   # 1 = keep all selected nodes
-DEFAULT_FRAME_STRIDE   = 2   # 2 = keep every 2nd frame (0, 2, 4, …)
+DEFAULT_SRC             = Path("/home/kong/datasets/barrier/fem/T_lok_F_shape_barrier_9_3_100km")
+DEFAULT_TMP             = Path("/home/kong/datasets/barrier/tmp")
+DEFAULT_OUT             = Path("/home/kong/datasets/barrier/h5/output.h5")
+DEFAULT_SAMPLING_CONFIG = Path("configs/data/sampling_config.yaml")
+DEFAULT_NODE_STRIDE     = 50   # applies to Layer 2 (required_parts) only
+DEFAULT_FRAME_STRIDE    = 2    # 2 = keep every 2nd frame (0, 2, 4, …)
 
 
 # ── Part-name helpers ──────────────────────────────────────────────────────────
@@ -88,14 +91,28 @@ def _decode_part_name(raw: object) -> str:
     return str(raw).strip().strip("\x00")
 
 
-def _load_patterns(path: Path) -> list[str]:
-    patterns: list[str] = []
-    for line in path.read_text(encoding="utf-8").splitlines():
-        line = line.strip()
-        if not line or line.startswith("#"):
-            continue
-        patterns.append(line.lower())
-    return patterns
+def _load_sampling_config(path: Path) -> tuple[list[str], list[str], dict]:
+    """
+    Returns:
+        collision_patterns : flat list of all patterns from collision_zone.*
+        required_patterns  : flat list of all patterns from required_parts.*
+        collision_zone_cfg : raw collision_zone sub-dict for sub-group access
+    """
+    with open(path, encoding="utf-8") as f:
+        cfg = yaml.safe_load(f)
+
+    collision_zone_cfg: dict = cfg.get("collision_zone", {})
+    collision_patterns: list[str] = []
+    for group in collision_zone_cfg.values():
+        if isinstance(group, list):
+            collision_patterns.extend(p.lower() for p in group)
+
+    required_patterns: list[str] = []
+    for group in cfg.get("required_parts", {}).values():
+        if isinstance(group, list):
+            required_patterns.extend(p.lower() for p in group)
+
+    return collision_patterns, required_patterns, collision_zone_cfg
 
 
 def _pattern_matches(name_lower: str, pat: str) -> bool:
@@ -418,17 +435,17 @@ def main() -> None:
     parser = argparse.ArgumentParser(
         description="Convert LS-DYNA d3plot sequence → single HDF5 training file."
     )
-    parser.add_argument("--src",             type=Path,  default=DEFAULT_SRC,
+    parser.add_argument("--src",              type=Path,  default=DEFAULT_SRC,
                         help="Directory containing d3plot, d3plot01, d3plot02 …")
-    parser.add_argument("--tmp",             type=Path,  default=DEFAULT_TMP,
+    parser.add_argument("--tmp",              type=Path,  default=DEFAULT_TMP,
                         help="Scratch directory for single-file copies.")
-    parser.add_argument("--out",             type=Path,  default=DEFAULT_OUT,
+    parser.add_argument("--out",              type=Path,  default=DEFAULT_OUT,
                         help="Output HDF5 file path  (e.g. output.h5).")
-    parser.add_argument("--required-config", type=Path,  default=DEFAULT_REQUIRED_CONFIG,
-                        help="Part-name filter list (one pattern per line).")
-    parser.add_argument("--node-stride",     type=int,   default=DEFAULT_NODE_STRIDE,
-                        help="Spatial decimation: keep every N-th node  (1 = all).")
-    parser.add_argument("--frame-stride",    type=int,   default=DEFAULT_FRAME_STRIDE,
+    parser.add_argument("--sampling-config",  type=Path,  default=DEFAULT_SAMPLING_CONFIG,
+                        help="YAML node-selection config (collision_zone + required_parts).")
+    parser.add_argument("--node-stride",      type=int,   default=DEFAULT_NODE_STRIDE,
+                        help="Spatial decimation for Layer 2 (required_parts): keep every N-th node (1 = all).")
+    parser.add_argument("--frame-stride",     type=int,   default=DEFAULT_FRAME_STRIDE,
                         help="Temporal decimation: keep every N-th frame (1 = all, 2 = default).")
     frame_limit_group = parser.add_mutually_exclusive_group()
     frame_limit_group.add_argument("--frame-limit", type=int,   default=None, metavar="K",
@@ -441,7 +458,7 @@ def main() -> None:
     for path, label in [
         (args.src,             "source folder"),
         (args.tmp,             "tmp folder"),
-        (args.required_config, "required_parts config"),
+        (args.sampling_config, "sampling config"),
     ]:
         if not path.exists():
             raise FileNotFoundError(f"{label} not found: {path}")
@@ -455,7 +472,7 @@ def main() -> None:
         old.unlink()
 
     # ══════════════════════════════════════════════════════════════════════════
-    # Step 1a – Part selection (from d3plot header)
+    # Step 1 – Two-layer part / node selection (from d3plot header + YAML config)
     # ══════════════════════════════════════════════════════════════════════════
     # Copy ONLY the bare header file into tmp so lasso cannot follow the
     # file-chain links (d3plot -> d3plot01 -> d3plot02 -> ...) and pull all
@@ -474,16 +491,25 @@ def main() -> None:
     part_ids_full = d3hdr.arrays[ArrayType.part_titles_ids]
     part_names    = [_decode_part_name(x) for x in part_titles]
 
-    patterns      = _load_patterns(args.required_config)
-    sel_part_mask = _build_selected_part_mask(part_names, patterns)
-    sel_part_idx  = np.where(sel_part_mask)[0].astype(np.int64)
+    collision_patterns, required_patterns, collision_zone_cfg = _load_sampling_config(args.sampling_config)
 
-    print(f"Patterns: {len(patterns)}  →  matched {len(sel_part_idx)}/{len(part_names)} parts")
+    # Layer 1: collision_zone — all nodes kept, no stride
+    collision_mask = _build_selected_part_mask(part_names, collision_patterns)
+    # Layer 2: required_parts — stride sampled
+    required_mask  = _build_selected_part_mask(part_names, required_patterns)
+    # Combined mask used for element selection (stress needs all elements from both layers)
+    combined_mask  = collision_mask | required_mask
+    sel_part_idx   = np.where(combined_mask)[0].astype(np.int64)
+
+    all_patterns = list(dict.fromkeys(collision_patterns + required_patterns))
+    print(f"Collision patterns : {len(collision_patterns)},  Required patterns : {len(required_patterns)}")
+    print(f"Matched {len(sel_part_idx)}/{len(part_names)} parts")
     for i in sel_part_idx:
-        print(f"  part_idx={int(i):4d}  part_id={int(part_ids_full[i]):6d}"
+        layer = "L1+L2" if collision_mask[i] and required_mask[i] else ("L1" if collision_mask[i] else "L2")
+        print(f"  [{layer}] part_idx={int(i):4d}  part_id={int(part_ids_full[i]):6d}"
               f"  name={part_names[i]}")
     if len(sel_part_idx) == 0:
-        raise RuntimeError("No parts matched. Check required_parts.config.")
+        raise RuntimeError("No parts matched. Check sampling_config.yaml.")
 
     solid_part_idx  = d3hdr.arrays.get(ArrayType.element_solid_part_indexes)
     solid_node_idx  = d3hdr.arrays.get(ArrayType.element_solid_node_indexes)
@@ -493,9 +519,9 @@ def main() -> None:
     n_total_nodes   = len(coords_ref)
 
     sel_solid_ei, solid_node_sel, solid_node_part = _select_elements_and_nodes(
-        solid_part_idx, solid_node_idx, sel_part_mask, n_total_nodes)
+        solid_part_idx, solid_node_idx, combined_mask, n_total_nodes)
     sel_shell_ei, shell_node_sel, shell_node_part = _select_elements_and_nodes(
-        shell_part_idx, shell_node_idx, sel_part_mask, n_total_nodes)
+        shell_part_idx, shell_node_idx, combined_mask, n_total_nodes)
 
     # merge solid + shell node assignments (solid wins on shared nodes)
     node_part_full = np.full(n_total_nodes, -1, dtype=np.int64)
@@ -507,23 +533,37 @@ def main() -> None:
 
     all_sel_nodes  = np.where(node_part_full >= 0)[0].astype(np.int64)
     all_node_parts = node_part_full[all_sel_nodes].astype(np.int64)
-    print(f"Selected  solid elems : {len(sel_solid_ei)}")
-    print(f"          shell elems : {len(sel_shell_ei)}")
-    print(f"          nodes       : {len(all_sel_nodes)}")
 
-    # ══════════════════════════════════════════════════════════════════════════
-    # Step 1b – Spatial decimation  (every node_stride-th node)
-    # ══════════════════════════════════════════════════════════════════════════
-    keep_mask    = np.zeros(len(all_sel_nodes), dtype=bool)
-    keep_mask[::args.node_stride] = True
-    sel_node_idx  = all_sel_nodes[keep_mask]
-    node_part_idx = all_node_parts[keep_mask]
+    # ── Two-layer node selection ───────────────────────────────────────────────
+    # Layer 1: collision_zone — ALL nodes kept unconditionally
+    col_local_mask     = collision_mask[all_node_parts]
+    collision_node_idx = all_sel_nodes[col_local_mask]
+    collision_node_set = set(collision_node_idx.tolist())
+
+    # Layer 2: required_parts — strided, then deduplicate collision nodes
+    req_local_mask    = required_mask[all_node_parts]
+    required_node_idx = all_sel_nodes[req_local_mask]
+    required_strided  = required_node_idx[::args.node_stride]
+    required_new      = required_strided[~np.isin(required_strided, list(collision_node_set))]
+
+    n_col_nodes   = len(collision_node_idx)
+    n_req_strided = len(required_strided)
+    n_req_new     = len(required_new)
+    print(f"Selected  solid elems                      : {len(sel_solid_ei)}")
+    print(f"          shell elems                      : {len(sel_shell_ei)}")
+    print(f"Collision-zone nodes (all)                 : {n_col_nodes}")
+    print(f"Required-parts nodes (strided, stride={args.node_stride})"
+          f"  : {n_req_strided}")
+    print(f"  of which new (not in collision zone)     : {n_req_new}")
+
+    # Union: collision (all) + required (strided, deduplicated)
+    sel_node_idx  = np.union1d(collision_node_idx, required_new)
+    node_part_idx = node_part_full[sel_node_idx].astype(np.int64)
     n_nodes       = len(sel_node_idx)
+    print(f"Total nodes                                : {n_nodes}")
 
-    print(f"\nAfter node-stride={args.node_stride}: {n_nodes} nodes kept"
-          f"  (from {len(all_sel_nodes)})")
     if n_nodes == 0:
-        raise RuntimeError("No nodes remain after decimation. Reduce --node-stride.")
+        raise RuntimeError("No nodes selected. Check sampling_config.yaml.")
 
     # element connectivity sub-arrays for the kept elements only
     sel_solid_elem_nodes = (
@@ -589,8 +629,9 @@ def main() -> None:
     mg.create_dataset("node_part_name",  data=node_part_name.astype("S"))   # bytes
     mg.create_dataset("part_ids",        data=sel_part_ids)
     mg.create_dataset("part_names",      data=sel_part_names.astype("S"))
-    mg.create_dataset("part_patterns",   data=np.asarray(patterns, dtype="S"))
+    mg.create_dataset("part_patterns",   data=np.asarray(all_patterns, dtype="S"))
     mg.attrs["node_stride"]         = args.node_stride
+    mg.attrs["node_selection"]      = "collision_zone:all + required_parts:strided"
     mg.attrs["frame_stride"]        = args.frame_stride
     mg.attrs["n_frames"]            = n_frames
     mg.attrs["n_nodes"]             = n_nodes
@@ -602,8 +643,8 @@ def main() -> None:
     # add front face / barrier part mask for distance calc
     part_names_str = [str(n).strip() for n in node_part_name]
 
-    barrier_patterns   = ["concrete_fine_mesh"]
-    car_collision_patterns = ["frontface"]
+    barrier_patterns       = [p.lower() for p in collision_zone_cfg.get("barrier_parts", ["concrete_fine_mesh"])]
+    car_collision_patterns = [p.lower() for p in collision_zone_cfg.get("car_contact_parts", ["frontface"])]
 
     barrier_mask   = _build_selected_part_mask(part_names_str, barrier_patterns)
     frontface_mask = _build_selected_part_mask(part_names_str, car_collision_patterns)
@@ -629,8 +670,11 @@ def main() -> None:
         "config": {
             "source": str(args.src.resolve()),
             "output": str(args.out.resolve()),
-            "required_config": str(args.required_config.resolve()),
+            "sampling_config": str(args.sampling_config.resolve()),
+            "node_selection": "collision_zone:all + required_parts:strided",
             "node_stride": args.node_stride,
+            "collision_zone_n_nodes": n_col_nodes,
+            "required_parts_n_nodes": n_req_new,
             "frame_stride": args.frame_stride,
             "n_frames": n_frames,
             "n_nodes": n_nodes,
@@ -640,7 +684,8 @@ def main() -> None:
             "stress_components": "sxx,syy,szz,sxy,syz,sxz",
             "velocity_source": None,
             "acceleration_source": None,
-            "selected_part_patterns": patterns,
+            "collision_patterns": collision_patterns,
+            "required_patterns": required_patterns,
         },
         "dataset_stats": {
             "num_simulations": 1,
@@ -896,7 +941,8 @@ def main() -> None:
     print(f"Done.  Output  : {args.out}")
     print(f"Size           : {size_gb:.3f} GB")
     print(f"Frames (T)     : {n_frames}  (frame-stride = {args.frame_stride})")
-    print(f"Nodes  (N)     : {n_nodes}  (node-stride  = {args.node_stride})")
+    print(f"Nodes  (N)     : {n_nodes}  "
+          f"(collision={n_col_nodes}, required_new={n_req_new}, stride={args.node_stride})")
     print(f"Parts  (P)     : {len(sel_part_idx)}")
     print(f"Velocity src   : finite difference (dt = 1 frame)")
     print(f"Accel src      : finite difference (dt = 1 frame)")

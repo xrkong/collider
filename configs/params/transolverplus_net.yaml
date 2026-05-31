@@ -31,7 +31,7 @@ train:
   keep_top_k: 3       # 保留 val_loss 最低的 K 个 checkpoint
 
 data:
-  dataset_type: bvc_sliced
+  # dataset_type: bvc_sliced
   input_frames: 5
   normalize: true
   num_workers: 0

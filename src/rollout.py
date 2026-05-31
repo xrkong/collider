@@ -20,7 +20,13 @@ Usage:
         --experiment configs/experiments/sc_026.yaml \
         --raw-h5 /home/kong/datasets/barrier/h5/T_lok_F_shape_barrier_9_3_100km_50_1_01/output.h5 \
         --mode autoregressive \
-        --gif --gif-fps 10 
+        --gif --gif-fps 10 --gif-name sc026_ar_100kmh
+
+    # GT-only GIF — no checkpoint/experiment needed
+    python src/rollout.py \
+        --raw-h5 /home/kong/datasets/barrier/h5/T_lok_F_shape_barrier_9_3_100km_dt_all/output.h5 \
+        --mode raw_gt \
+        --gif --gif-fps 10 --gif-name traj_9_3_gt
 
     python src/rollout.py \
         --checkpoint outputs/checkpoints/sc_021/checkpoint-best.safetensors \
@@ -869,6 +875,125 @@ def render_vis(
     if save_png_dir:
         print(f"[Vis] Saved PNG sequence → {save_png_dir}")
 
+
+def render_gt_only(
+    raw_data:          dict,
+    out_path:          str,
+    fps:               int  = 10,
+    max_frames:        int  = 200,
+    dpi:               int  = 120,
+    group_config_path: str  = None,
+    save_png_dir:      str  = None,
+):
+    """Render a GT-only single-column animation (no model required).
+
+    Layout: two rows, one column — top = X-Z plane, bottom = X-Y plane.
+    Saves a GIF (and optionally a PNG sequence) identical in style to render_vis
+    but without the pred column.
+    """
+    if not _VIS:
+        print("Warning: matplotlib/Pillow not available — skipping rendering")
+        return
+
+    T_full = raw_data["positions"].shape[0]
+    T      = min(T_full, max_frames)
+
+    node_part_id   = raw_data["node_part_id"]
+    node_part_name = raw_data["node_part_name"]
+    gt_pos         = raw_data["positions"][:T]   # (T, N, 3)
+
+    x_range = (-14000, 20000)
+    y_range = (-10000,  8000)
+    z_range =   (-500,  4000)
+
+    plt.rcParams['font.family'] = 'Times New Roman'
+    plt.rcParams['font.size']   = 12
+
+    x_span = x_range[1] - x_range[0]
+    z_span = z_range[1] - z_range[0]
+    y_span = y_range[1] - y_range[0]
+
+    fig_w  = 6.0                           # single column → half of dual-column
+    upi    = x_span / fig_w
+    plot_h = (z_span + y_span) / upi
+    fig_h  = plot_h + 1.6
+
+    fig, axs = plt.subplots(
+        2, 1,
+        figsize=(fig_w, fig_h), dpi=dpi,
+        gridspec_kw={
+            "height_ratios": [z_span, y_span],
+            "hspace": 0.18,
+        },
+    )
+    fig.patch.set_facecolor("white")
+
+    if group_config_path:
+        node_colors, group_to_color = _get_grouped_colormap(
+            node_part_id, node_part_name, group_config_path)
+        legend_out = Path(out_path).parent / "raw_gt_legend.svg"
+        _save_legend_svg(group_to_color, legend_out)
+    else:
+        node_colors, _, _ = _get_part_colormap(node_part_id)
+
+    for ax in axs:
+        ax.set_facecolor("white")
+        ax.tick_params(colors="black", labelsize=12)
+        ax.set_aspect('equal', adjustable='box')
+
+    axs[0].set_xlim(x_range);  axs[0].set_ylim(z_range)
+    axs[1].set_xlim(x_range);  axs[1].set_ylim(y_range)
+    axs[0].set_ylabel("Z", color="black", fontsize=FONTSIZE)
+    axs[1].set_ylabel("Y", color="black", fontsize=FONTSIZE)
+    axs[1].set_xlabel("X", color="black", fontsize=FONTSIZE)
+
+    sc_xz = axs[0].scatter(gt_pos[0, :, 0], gt_pos[0, :, 2],
+                            c=node_colors, s=0.3, alpha=0.6, linewidths=0)
+    sc_xy = axs[1].scatter(gt_pos[0, :, 0], gt_pos[0, :, 1],
+                            c=node_colors, s=0.3, alpha=0.6, linewidths=0)
+
+    title_xz = axs[0].set_title("", color="black", fontsize=FONTSIZE, pad=3)
+    axs[1].set_title("GT (X-Y Plane)", color="black", fontsize=FONTSIZE, pad=3)
+
+    fig.canvas.draw()
+
+    if save_png_dir:
+        Path(save_png_dir).mkdir(parents=True, exist_ok=True)
+
+    gif_frames = []
+    print(f"[Vis] Rendering {T} GT-only frames at {dpi} DPI...")
+
+    for t in range(T):
+        title_xz.set_text(f"GT (X-Z Plane)\nstep={t+1}")
+        sc_xz.set_offsets(np.c_[gt_pos[t, :, 0], gt_pos[t, :, 2]])
+        sc_xy.set_offsets(np.c_[gt_pos[t, :, 0], gt_pos[t, :, 1]])
+
+        fig.canvas.draw()
+        rgba    = np.asarray(fig.canvas.buffer_rgba())
+        pil_img = Image.fromarray(rgba).convert('RGB')
+        gif_frames.append(pil_img)
+
+        if save_png_dir:
+            pil_img.save(os.path.join(save_png_dir, f"frame_{t:04d}.png"))
+
+        if (t + 1) % 50 == 0:
+            print(f"  rendered {t+1}/{T} frames")
+
+    plt.close(fig)
+
+    Path(out_path).parent.mkdir(parents=True, exist_ok=True)
+    gif_frames[0].save(
+        out_path,
+        save_all=True,
+        append_images=gif_frames[1:],
+        duration=int(1000 / fps),
+        loop=0,
+    )
+    print(f"[Vis] Saved GT-only GIF → {out_path} ({T} frames @ {fps}fps)")
+    if save_png_dir:
+        print(f"[Vis] Saved PNG sequence → {save_png_dir}")
+
+
 # ── Console summary ───────────────────────────────────────────────────────────
 
 def print_summary(onestep: dict | None, autoreg: dict | None, baseline: dict):
@@ -913,14 +1038,16 @@ def print_summary(onestep: dict | None, autoreg: dict | None, baseline: dict):
 
 def main():
     parser = argparse.ArgumentParser(description="BVC rollout visualization")
-    parser.add_argument("--checkpoint",  required=True,
-                        help="Local .safetensors checkpoint")
-    parser.add_argument("--experiment",  required=True,
-                        help="Experiment yaml, e.g. configs/experiments/exp_05.yaml")
+    parser.add_argument("--checkpoint",
+                        default=None,
+                        help="Local .safetensors checkpoint (not required for --mode raw_gt)")
+    parser.add_argument("--experiment",
+                        default=None,
+                        help="Experiment yaml (not required for --mode raw_gt)")
     parser.add_argument("--raw-h5",      required=True,
                         help="Path to original (non-windowed) h5 trajectory")
     parser.add_argument("--mode",
-                        choices=["onestep", "autoregressive", "both"],
+                        choices=["onestep", "autoregressive", "both", "raw_gt"],
                         default="both")
     parser.add_argument("--plot",         action="store_true",
                         help="Save RMSE vs timestep plot for the current run")
@@ -933,11 +1060,42 @@ def main():
     parser.add_argument("--gif-fps",     type=int, default=10)
     parser.add_argument("--gif-max-frames", type=int, default=200,
                         help="Cap frames rendered (for speed)")
+    parser.add_argument("--gif-name",    default=None,
+                        help="Custom GIF filename stem (no extension), e.g. 'sc026_ar_100kmh'. "
+                             "Defaults to mode name (onestep / autoregressive / raw_gt).")
     parser.add_argument("--device",
                         default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--output-dir",  default=None,
                         help="Override output directory")
     args = parser.parse_args()
+
+    # ── raw_gt mode: skip model entirely ─────────────────────────────────
+    if args.mode == "raw_gt":
+        raw_data = load_raw_h5(args.raw_h5)
+        h5_stem  = Path(args.raw_h5).parent.name  # use parent folder name as exp label
+        out_dir  = Path(args.output_dir or
+                        PROJECT_ROOT / "outputs" / "rollouts" / h5_stem)
+        out_dir.mkdir(parents=True, exist_ok=True)
+
+        if args.gif:
+            gif_stem = args.gif_name or "raw_gt"
+            render_gt_only(
+                raw_data,
+                out_path          = str(out_dir / f"{gif_stem}.gif"),
+                fps               = args.gif_fps,
+                max_frames        = args.gif_max_frames,
+                dpi               = 120,
+                group_config_path = "configs/data/required_parts.config",
+                save_png_dir      = str(out_dir / f"{gif_stem}_pngs"),
+            )
+        else:
+            print("[raw_gt] No --gif flag — nothing to do. Add --gif to render.")
+        return
+
+    # ── Model-based modes (onestep / autoregressive / both) ───────────────
+    if args.checkpoint is None or args.experiment is None:
+        parser.error("--checkpoint and --experiment are required for modes: "
+                     "onestep, autoregressive, both")
 
     device     = torch.device(args.device)
     model, cfg = load_model(args.checkpoint, args.experiment, device)
@@ -985,24 +1143,32 @@ def main():
     _DPI = 120
     if args.gif:
         if onestep is not None:
+            gif_stem = args.gif_name or "onestep"
             render_vis(
                 onestep, raw_data,
-                out_path          = str(out_dir / "onestep.gif"),
+                out_path          = str(out_dir / f"{gif_stem}.gif"),
                 fps               = args.gif_fps,
                 max_frames        = args.gif_max_frames,
-                dpi               = _DPI,  # 提高 DPI 以获得极高的清晰度
-                group_config_path = "configs/data/required_parts.config", # 指向你的配置文件
-                save_png_dir      = str(out_dir / "onestep_pngs")    # 生成同名文件夹存放 PNG
+                dpi               = _DPI,
+                group_config_path = "configs/data/required_parts.config",
+                save_png_dir      = str(out_dir / f"{gif_stem}_pngs"),
             )
         if autoreg is not None:
+            # if both modes run and no custom name, suffix to distinguish them
+            if args.gif_name and args.mode == "both":
+                gif_stem = f"{args.gif_name}_ar"
+            elif args.gif_name:
+                gif_stem = args.gif_name
+            else:
+                gif_stem = "autoregressive"
             render_vis(
                 autoreg, raw_data,
-                out_path          = str(out_dir / "autoregressive.gif"),
+                out_path          = str(out_dir / f"{gif_stem}.gif"),
                 fps               = args.gif_fps,
                 max_frames        = args.gif_max_frames,
-                dpi               = _DPI,  # 提高 DPI 以获得极高的清晰度
-                group_config_path = "configs/data/required_parts.config", # 指向你的配置文件
-                save_png_dir      = str(out_dir / "autoregressive_pngs")    # 生成同名文件夹存放 PNG
+                dpi               = _DPI,
+                group_config_path = "configs/data/required_parts.config",
+                save_png_dir      = str(out_dir / f"{gif_stem}_pngs"),
             )
 
     # ── RMSE plot ─────────────────────────────────────────────────────────

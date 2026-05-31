@@ -1,0 +1,242 @@
+# ============================================================
+# Sampling Configuration for BVC Surrogate Model
+# Node selection strategy:
+#   Layer 1 - Whitelist:        all nodes from required parts (existing logic)
+#   Layer 2 - Collision zone:   car contact face (all nodes) +
+#                               barrier contact face (spatial filter by proximity)
+#   Layer 3 - Fill (disabled):  uniform stride sampling from remaining nodes
+#                               enable once Layer 1+2 node count is known
+# ============================================================
+
+
+# ------------------------------------------------------------
+# Layer 1: Required parts (existing logic, keep all nodes)
+# Mirrors required_parts.config — edit here, not there.
+# ------------------------------------------------------------
+required_parts:
+
+  barrier:
+    # Fine mesh: always included
+    - concrete_fine_mesh
+
+    # Optional reinforcement (previously commented out — now active)
+    - anchor rebar_t-1
+    - anchor rebar_s-1
+    - reinforcement-1
+    - steel tube-1
+    - t lok-1
+    - anchor rebar_t-2
+    - anchor rebar_s-2
+    - reinforcement-2
+    - steel tube-2
+    - t lok-2
+
+  front_crash_structure:
+    - frontface
+    - bumper
+    - bumpersteel
+    - bumpercover
+    - bumperhousing
+    - hood
+    - hoodinner
+    - fender
+    - windshield
+    - railfront
+    - noserail
+    - frontrail
+    - railfrontplate
+    - railfrontplaterear
+    - raillargefront
+    - raillargeinnerfront
+    - raillargefrontouter
+    - railmid
+    - xmemberfront
+    - xmembermidfront
+    - xmemberrearmiddlebottom
+    - framexmemberplates
+    - radiator
+    - radiatorframe
+    - radiatorframebottom
+    - radiatorframebrkttop
+    - radiatorside
+    - radiatorsolid
+    - radiatornullshell
+    - condensor
+
+  occupant_cage:
+    - firewall
+    - firewalltray
+    - firewallsupport
+    - ipbeamfirewallbrkt
+    - floor
+    - floorfront
+    - rearfloor
+    - floorxmember
+    - floorlongitudesupport
+    - floorsupport
+    - floorbottomplate
+    - rocker
+    - rockerinner
+    - rockerfront
+    - rockerinternal
+    - rockerfrontinnersuppport
+    - apillar
+    - bpillar
+    - cpillar
+    - pillar
+    - cabrail
+    - cabrailupper
+    - cabraillower
+    - cabraillatitudebar
+    - cabrailconnection
+    - cabrailpanel
+    - cabrailframeconnector
+    - roof
+    - roofrail
+    - roofrailfront
+    - roofrailrear
+    - roofrailxmember
+    - sidepanel
+    - backwall
+    - cabpanel
+
+  doors:
+    - doorfront
+    - doorrear
+    - doorouter
+    - doorinner
+    - frontdoorinner
+    - doorfrontbar
+    - doorrearlowerbar
+    - doorrearuppersupport
+    - doorfrtlongitudesuprt
+    - doorfrontlonguppersprt
+    - doorrearlatitudesuprt
+    - windowframe
+    - windowguide
+    - lockplate
+    - hinge
+
+  interior:
+    - ipbeam
+    - dash
+    - dashcover
+    - dashfan
+    - dashscreen
+    - dashcenter
+    - dashbottom
+    - dashcompartment
+    - glovecompartment
+    - airbag
+    - airbagbrkt
+    - airbagbkt
+    - airbagcover
+    - steering
+    - steeringwheel
+    - steeringcolmn
+    - steeringcolumn
+    - steeringrack
+
+  seats:
+    - seat
+    - seatdriver
+    - seadriver
+    - backseat
+    - seatback
+    - seatfoam
+    - foam
+    - driverseat
+    - passengerseat
+    - rearseat
+    - headrest
+    - seatbelt
+    - seatdriverouterrail
+    - seatdriverinnerrail
+
+  dummy_and_sensors:
+    - dummy
+    - dummy_beams
+    - lap_strap
+    - shoulder_strap
+    - accelerometer
+    - accelerometers
+
+  powertrain:
+    - engine
+    - engineoilpan
+    - enginemount
+    - enginemountrubber
+    - transmission
+    - transmissionoilpan
+    - transmissionmount
+    - battery
+    - batterymount
+    - fusebox
+    - brake
+    - brakebooster
+    - brakeboostermnt
+    - brakefluidcontainer
+
+  suspension:
+    - aarm
+    - upperarm
+    - lowerarm
+    - spindle
+    - diskfront
+    - upright
+    - tire
+    - rim
+    - swaybar
+    - shockhousingfront
+    - shocksupport
+    - suspensionbracketinner
+
+
+# ------------------------------------------------------------
+# Layer 2: Collision zone — dense sampling
+#
+# car_contact_parts:  all nodes kept unconditionally
+# barrier_parts:      all nodes kept unconditionally for now
+#                     (spatial filter via contact_threshold_mm disabled
+#                      until node counts are known)
+# ------------------------------------------------------------
+collision_zone:
+
+  # Car front face: keep ALL nodes
+  car_contact_parts:
+    - frontface
+    - bumper
+    - bumpersteel
+    - bumpercover
+    - bumperhousing
+    - railfront
+    - noserail
+    - frontrail
+
+  # Barrier: keep ALL nodes for now
+  barrier_parts:
+    - concrete_fine_mesh
+    - anchor rebar_t-1
+    - anchor rebar_s-1
+    - reinforcement-1
+    - steel tube-1
+    - t lok-1
+    - anchor rebar_t-2
+    - anchor rebar_s-2
+    - reinforcement-2
+    - steel tube-2
+    - t lok-2
+
+  # Spatial filter — disabled until node counts are assessed.
+  # Uncomment and tune if barrier node count is too large.
+  # contact_threshold_mm: 300
+  # collision_whitelist_cache: data/cache/collision_zone_nodes.npy
+
+
+# ------------------------------------------------------------
+# Layer 3: Fill — disabled for now
+# Enable once Layer 1+2 node count is known.
+# ------------------------------------------------------------
+# fill_sampling:
+#   total_quota: 600
+#   stride: 50
