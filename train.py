@@ -271,25 +271,25 @@ def compute_sdf_batch(xy: torch.Tensor,
 
 # ── Validation loop ───────────────────────────────────────────────────────────
 @torch.no_grad()
-def run_validation(model, val_loader, device) -> dict:
+def run_validation(model, val_loader, device, use_node_type: bool = False) -> dict:
     model.eval()
     total, n_batches = 0.0, 0
     for batch in val_loader:
-        x_vel, future_acc, input_pos, future_pos, v_last_phys = batch
-        x_vel      = x_vel.to(device)
-        future_acc = future_acc.to(device)
-        input_pos  = input_pos.to(device)
-        
+        x_vel      = batch[0].to(device)
+        future_acc = batch[1].to(device)
+        input_pos  = batch[2].to(device)
+        node_type  = batch[5].to(device) if use_node_type else None
+
         # Validation: one-step only (k=0)
         B, N, _ = x_vel.shape
         T_in    = input_pos.shape[2]
-        
+
         x_sdf = compute_sdf_batch(input_pos[..., :2])   # (B, N, T_in)
         x_in  = torch.cat([x_vel, x_sdf], dim=-1)
         # x_in = x_vel  # ablation: no SDF
-        
+
         with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-            pred = model(x_in)
+            pred = model(x_in, node_type)
             target = future_acc[:, :, 0, :]                  # first step target
             loss, _ = compute_loss(pred, target)
         total += loss.item()
@@ -308,6 +308,20 @@ def train(cfg: dict, git_commit: str = "unknown"):
     train_cfg = cfg["train"]
     model_cfg = cfg["model"]
     data_cfg  = cfg["data"]
+
+    # Consistency assertion: data.node_type and model embedding must be co-enabled
+    use_node_type   = bool(data_cfg.get("node_type", False))
+    has_node_emb    = model_cfg.get("num_node_types", 0) > 0 and model_cfg.get("type_emb_dim", 0) > 0
+    has_partial_emb = model_cfg.get("num_node_types", 0) > 0 or model_cfg.get("type_emb_dim", 0) > 0
+    if use_node_type and not has_node_emb:
+        raise ValueError(
+            "data.node_type=true requires model.num_node_types > 0 and model.type_emb_dim > 0"
+        )
+    if not use_node_type and has_partial_emb:
+        raise ValueError(
+            "data.node_type=false but model.num_node_types or model.type_emb_dim is configured — "
+            "set both to 0 or enable data.node_type"
+        )
 
     print(f"[Train] Device: {device}")
 
@@ -378,8 +392,8 @@ def train(cfg: dict, git_commit: str = "unknown"):
     n_active_05 = 0
     n_total = 0
     for batch in train_loader:
-        _, future_acc, _, _, _ = batch    # 5 元组
-        target = future_acc[:, :, 0, :]    # k=0
+        future_acc = batch[1]              # 5- or 6-tuple
+        target = future_acc[:, :, 0, :]   # k=0
         abs_t = target.abs()
         sum_abs     += abs_t.sum().item()
         sum_sq      += (target ** 2).sum().item()
@@ -442,19 +456,19 @@ def train(cfg: dict, git_commit: str = "unknown"):
             pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{n_epochs}", unit="batch",
                         dynamic_ncols=True, leave=True)
             for batch_idx, batch in enumerate(pbar):
-                # ── Unpack batch (5 tensors from new BVCSlicedDataset) ────
-                x_vel, future_acc, input_pos, future_pos, v_last_phys = batch
+                # ── Unpack batch (5 or 6 tensors from BVCSlicedDataset) ──
                 # x_vel:       (B, N, T_in*3)   normalized velocity, flattened
                 # future_acc:  (B, N, K, 3)     K-step normalized acceleration targets
                 # input_pos:   (B, N, T_in, 3)  raw input positions
                 # future_pos:  (B, N, K, 3)     raw future positions (for SDF rolling)
                 # v_last_phys: (B, N, 3)        physical velocity at last input frame
-
-                x_vel       = x_vel.to(device)
-                future_acc  = future_acc.to(device)
-                input_pos   = input_pos.to(device)
-                future_pos  = future_pos.to(device)
-                v_last_phys = v_last_phys.to(device)
+                # node_type:   (B, N)           per-node int label (only when use_node_type)
+                x_vel       = batch[0].to(device)
+                future_acc  = batch[1].to(device)
+                input_pos   = batch[2].to(device)
+                future_pos  = batch[3].to(device)
+                v_last_phys = batch[4].to(device)
+                node_type   = batch[5].to(device) if use_node_type else None
 
                 B, N, _ = x_vel.shape
                 T_in    = input_pos.shape[2]
@@ -484,7 +498,7 @@ def train(cfg: dict, git_commit: str = "unknown"):
 
                     # Forward
                     with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-                        a_pred = model(x_in)                                  # (B, N, 3)
+                        a_pred = model(x_in, node_type)                       # (B, N, 3)
 
                         # Loss for this step — only nodes within threshold of barrier
                         target_k  = future_acc[:, :, k, :]                    # (B, N, 3)
@@ -547,7 +561,7 @@ def train(cfg: dict, git_commit: str = "unknown"):
             epoch_log = {"epoch": epoch + 1, "train/epoch_loss": epoch_avg_loss}
 
             if (epoch + 1) % val_every == 0:
-                val_metrics = run_validation(model, val_loader, device)
+                val_metrics = run_validation(model, val_loader, device, use_node_type)
                 val_loss    = val_metrics["loss"]
 
                 meta_payload = {

@@ -16,6 +16,10 @@ model:
   mlp_ratio: 2
   block_act: silu
 
+  # ── Node-type embedding (must match data.node_type) ──────────────────
+  num_node_types: 0    # vocab size; 0 = disabled
+  type_emb_dim: 0      # embedding dim; 0 = disabled
+
 train:
   optimizer: adam
   lr: 0.001
@@ -37,6 +41,10 @@ data:
   num_workers: 0
   dt: 1 # dt is 1. real dt is 2ms.
   data.acc_scale: 1.0e7
+
+  # ── Node-type embedding switch ────────────────────────────────────────
+  node_type: false           # main switch; false = current behaviour
+  node_type_field: node_part_label  # h5 metadata/ field name for per-node int label
   # pin_memory: true
   # collision_threshold: 100.0
   # normalize_dist: false

@@ -64,6 +64,54 @@ class NormStats:
         std  = torch.tensor(self._std[feature],  dtype=t.dtype, device=t.device)
         return t * std + mean
 
+    @classmethod
+    def from_global_stats(
+        cls,
+        stats_path: str | Path,
+        acc_scale: float | None = None,
+    ) -> "NormStats":
+        """Build NormStats from a training-run global_stats.json.
+
+        File schema written by load_or_compute_global_stats():
+            {"key": [...], "fields": [...], "stats": {field: {"mean": float, "std": float}, ...}}
+
+        Each field's mean/std is a global scalar across all train trajs.
+        Broadcasts correctly against any shape (..., C) in normalize/denormalize.
+        """
+        stats_path = Path(stats_path)
+        if not stats_path.is_file():
+            raise FileNotFoundError(
+                f"Global stats not found: {stats_path}. "
+                f"Pass --stats-path explicitly or place global_stats.json next to the checkpoint."
+            )
+        with open(stats_path) as f:
+            cached = json.load(f)
+
+        stats = cached["stats"]
+        obj = cls.__new__(cls)
+        obj._mean = {}
+        obj._std  = {}
+
+        for feat, s in stats.items():
+            obj._mean[feat] = np.array(s["mean"], dtype=np.float32)
+            obj._std[feat]  = np.array(s["std"],  dtype=np.float32)
+            if float(obj._std[feat]) < 1e-8:
+                print(f"Warning: near-zero std in '{feat}' — clamped to 1.0")
+                obj._std[feat] = np.float32(1.0)
+
+        obj._acc_scale = float(acc_scale) if acc_scale else None
+        if obj._acc_scale is not None:
+            print(f"[NormStats] acceleration uses asinh transform, scale={obj._acc_scale:.2e}")
+        else:
+            print("[NormStats] acceleration uses z-score (global stats)")
+
+        print(f"[NormStats] Loaded global stats from {stats_path}")
+        for feat, s in stats.items():
+            print(f"  {feat}: mean={s['mean']:.6f}  std={s['std']:.6f}")
+
+        return obj
+
+
 def load_norm_stats(metadata_path: str | Path) -> Optional[NormStats]:
     try:
         return NormStats(metadata_path)
@@ -253,6 +301,8 @@ class BVCSlicedDataset(BaseDataset):
         # ── Config ────────────────────────────────────────────────────────
         self.input_frames = int(data_cfg.get("input_frames", 5))
         self.K = int(train_cfg.get("push_forward_k", 1))
+        self.use_node_type   = bool(data_cfg.get("node_type", False))
+        self.node_type_field = data_cfg.get("node_type_field", "node_part_label")
         if self.K < 1:
             raise ValueError(f"push_forward_k must be >= 1, got {self.K}")
         self.window_len = self.input_frames + self.K
@@ -285,6 +335,11 @@ class BVCSlicedDataset(BaseDataset):
                 vel  = f[self.INPUT_KEY][:].astype(np.float32)    # (T, N, 3)
                 acc  = f[self.TARGET_KEY][:].astype(np.float32)   # (T, N, 3)
                 pos  = f[self.POS_KEY][:].astype(np.float32)      # (T, N, 3)
+                if self.use_node_type:
+                    nt_key = f"metadata/{self.node_type_field}"
+                    if nt_key not in f:
+                        raise KeyError(f"{p}: missing node_type field '{nt_key}'")
+                    node_type_arr = f[nt_key][:].astype(np.int64)  # (N,) static
 
             T = vel.shape[0]
             if T < self.window_len:
@@ -317,7 +372,7 @@ class BVCSlicedDataset(BaseDataset):
             print(f"[BVCSlicedDataset] traj[{idx}] {dir_name}{meta_label} "
                   f"— T={T}, windows={n_windows}")
 
-            self._trajectories.append({
+            traj_entry = {
                 "vel_norm":          vel_norm,
                 "vel_phys":          vel,
                 "acc_norm":          acc_norm,
@@ -328,7 +383,10 @@ class BVCSlicedDataset(BaseDataset):
                 "vel_derived_phys":  vel_derived,
                 "acc_derived_norm":  acc_derived_norm,
                 "T_derived":         T - 2,
-            })
+            }
+            if self.use_node_type:
+                traj_entry["node_type"] = node_type_arr  # (N,) int64, static
+            self._trajectories.append(traj_entry)
 
         # ── Build global (traj_idx, start_idx) index ──────────────────────
         # Windows are built per-traj; they never cross traj boundaries.
@@ -391,13 +449,17 @@ class BVCSlicedDataset(BaseDataset):
         future_pos = future_pos.transpose(1, 0, 2)                 # (N, K, 3)
         input_pos  = input_pos.transpose(1, 0, 2)                  # (N, T_in, 3)
 
-        return (
+        base = (
             torch.from_numpy(np.ascontiguousarray(x_vel)),         # (N, T_in*3)
             torch.from_numpy(np.ascontiguousarray(future_acc)),    # (N, K, 3)
             torch.from_numpy(np.ascontiguousarray(input_pos)),     # (N, T_in, 3)
             torch.from_numpy(np.ascontiguousarray(future_pos)),    # (N, K, 3)
             torch.from_numpy(np.ascontiguousarray(v_last_phys)),   # (N, 3)
         )
+        if self.use_node_type:
+            nt = traj["node_type"]                                  # (N,) int64
+            return base + (torch.from_numpy(np.ascontiguousarray(nt)),)  # (N,) long
+        return base
 
 
 # ── DataLoader factory ────────────────────────────────────────────────────────

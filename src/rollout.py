@@ -16,15 +16,16 @@ Conventions (must match the exporter / loader / trainer):
 
 Usage:
     python src/rollout.py \
-        --checkpoint outputs/checkpoints/sc_026/checkpoint-best.safetensors \
-        --experiment configs/experiments/sc_026.yaml \
-        --raw-h5 /home/kong/datasets/barrier/h5/T_lok_F_shape_barrier_9_3_100km_50_1_01/output.h5 \
-        --mode autoregressive \
-        --gif --gif-fps 10 --gif-name sc026_ar_100kmh
+        --checkpoint outputs/checkpoints/sc_040/checkpoint-best.safetensors \
+        --experiment configs/experiments/sc_040.yaml \
+        --raw-h5 /home/kong/datasets/barrier/h5dt_50ns_5fs_mat/T_lok_F_shape_barrier_9_3_100km/output.h5 \
+        --mode both \
+        --gif --gif-fps 10 \
+        --gif-name sc040_100kmh
 
     # GT-only GIF — no checkpoint/experiment needed
     python src/rollout.py \
-        --raw-h5 /home/kong/datasets/barrier/h5/T_lok_F_shape_barrier_9_3_100km_dt_all/output.h5 \
+        --raw-h5 /home/kong/datasets/barrier/h5dt_50ns_5fs_mat/T_lok_F_shape_barrier_9_3_100km/output.h5 \
         --mode raw_gt \
         --gif --gif-fps 10 --gif-name traj_9_3_gt
 
@@ -145,7 +146,7 @@ def load_model(checkpoint_path: str, experiment_path: str, device: torch.device)
 
 # ── Raw h5 loading ────────────────────────────────────────────────────────────
 
-def load_raw_h5(h5_path: str) -> dict:
+def load_raw_h5(h5_path: str, node_type_field: str | None = None) -> dict:
     """Load full trajectory and part metadata from raw h5.
 
     Returns dict with:
@@ -179,6 +180,11 @@ def load_raw_h5(h5_path: str) -> dict:
                 for n in f["metadata/part_names"][:]
             ]),
         }
+        if node_type_field is not None:
+            nt_key = f"metadata/{node_type_field}"
+            if nt_key not in f:
+                raise KeyError(f"{h5_path}: missing node_type field '{nt_key}'")
+            data["node_type"] = f[nt_key][:].astype(np.int64)  # (N,)
 
     T, N, _ = data["positions"].shape
     P       = len(data["part_ids"])
@@ -269,7 +275,7 @@ def compute_sdf_batch(xy: torch.Tensor,
 
 # ── Inference ─────────────────────────────────────────────────────────────────
 @torch.no_grad()
-def run_onestep(model, raw_data, normed, norm_stats, device) -> dict:
+def run_onestep(model, raw_data, normed, norm_stats, device, node_type=None) -> dict:
     T      = raw_data["positions"].shape[0]
     T_eval = T - 2          # last 2 frames have padded GT vel/acc (forward diff)
     print(f"[One-step] dt = 1 (per-frame), steps = {T_eval - INPUT_FRAMES}")
@@ -290,7 +296,7 @@ def run_onestep(model, raw_data, normed, norm_stats, device) -> dict:
         x = torch.cat([x_in, x_sdf.unsqueeze(0) ], dim=-1)
         # x = x_in
 
-        a_pred_norm = model(x).squeeze(0)            # (N, 3)
+        a_pred_norm = model(x, node_type).squeeze(0)  # (N, 3)
 
         # 上一帧 GT 速度 / 位置 (物理量) — one-step 模式始终用 GT
         v_last = raw_data["velocity"][t - 1]
@@ -343,7 +349,7 @@ def run_onestep(model, raw_data, normed, norm_stats, device) -> dict:
     }
 
 @torch.no_grad()
-def run_autoregressive(model, raw_data, normed, norm_stats, device) -> dict:
+def run_autoregressive(model, raw_data, normed, norm_stats, device, node_type=None) -> dict:
     T      = raw_data["positions"].shape[0]
     T_eval = T - 2          # last 2 frames have padded GT vel/acc (forward diff)
     print(f"[Autoregressive] dt = 1 (per-frame), steps = {T_eval - INPUT_FRAMES}")
@@ -371,7 +377,7 @@ def run_autoregressive(model, raw_data, normed, norm_stats, device) -> dict:
         x_sdf = compute_sdf_batch(x_sdf_in).to(device)               # (N, 5)
         x = torch.cat([x_in, x_sdf.unsqueeze(0)], dim=-1)
 
-        a_pred_norm = model(x).squeeze(0)            # (N, 3)
+        a_pred_norm = model(x, node_type).squeeze(0)  # (N, 3)
 
         a_phys_new, v_phys_new, x_phys_new = integrate_accel(
             a_pred_norm, v_phys, x_phys, DT, norm_stats)
@@ -1063,6 +1069,9 @@ def main():
     parser.add_argument("--gif-name",    default=None,
                         help="Custom GIF filename stem (no extension), e.g. 'sc026_ar_100kmh'. "
                              "Defaults to mode name (onestep / autoregressive / raw_gt).")
+    parser.add_argument("--stats-path",   default=None,
+                        help="Path to training-run global_stats.json. "
+                             "Defaults to <checkpoint_dir>/global_stats.json.")
     parser.add_argument("--device",
                         default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--output-dir",  default=None,
@@ -1111,9 +1120,23 @@ def main():
     out_dir.mkdir(parents=True, exist_ok=True)
 
     # ── Load data ─────────────────────────────────────────────────────────
-    raw_data   = load_raw_h5(args.raw_h5)
-    norm_stats = NormStats(cfg["data"]["metadata_path"]) #, cfg["data"]["acc_scale"])
-    normed     = normalize_raw(raw_data, norm_stats)
+    use_node_type    = bool(cfg["data"].get("node_type", False))
+    node_type_field  = cfg["data"].get("node_type_field", None) if use_node_type else None
+    raw_data = load_raw_h5(args.raw_h5, node_type_field=node_type_field)
+    node_type = (
+        torch.from_numpy(raw_data["node_type"]).to(device) if use_node_type else None
+    )
+
+    stats_path = (
+        Path(args.stats_path)
+        if args.stats_path
+        else Path(args.checkpoint).parent / "global_stats.json"
+    )
+    norm_stats = NormStats.from_global_stats(
+        stats_path,
+        acc_scale=cfg["data"].get("acc_scale"),
+    )
+    normed = normalize_raw(raw_data, norm_stats)
 
     # ── Baseline (dt=1, per-frame; same forward-Euler convention) ─────────
     baseline = compute_baseline(raw_data, dt=DT, input_frames=INPUT_FRAMES)
@@ -1124,14 +1147,14 @@ def main():
     t0 = time.time()
 
     if args.mode in ("onestep", "both"):
-        onestep = run_onestep(model, raw_data, normed, norm_stats, device)
+        onestep = run_onestep(model, raw_data, normed, norm_stats, device, node_type)
         pkl_path = out_dir / "onestep.pkl"
         with open(pkl_path, "wb") as f:
             pickle.dump(onestep, f)
         print(f"[Rollout] PKL saved → {pkl_path}")
 
     if args.mode in ("autoregressive", "both"):
-        autoreg = run_autoregressive(model, raw_data, normed, norm_stats, device)
+        autoreg = run_autoregressive(model, raw_data, normed, norm_stats, device, node_type)
         pkl_path = out_dir / "autoregressive.pkl"
         with open(pkl_path, "wb") as f:
             pickle.dump(autoreg, f)

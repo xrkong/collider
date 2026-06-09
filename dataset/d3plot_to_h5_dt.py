@@ -20,17 +20,18 @@ Pipeline
 
   Step 3  – Per-frame extraction  (direct from d3plot, no manual math)
       For each kept frame:
-        • position      (xyz)         ref_coords + node_displacement
-        • velocity      (xyz)         finite difference of positions (dt=1 frame)
-        • acceleration  (xyz)         finite difference of velocity   (dt=1 frame)
-        • stress        (6-component) element solid/shell stress averaged to
-                                      nodes:  sxx, syy, szz, sxy, syz, sxz
-        • node_part_id  stored once in /metadata
+        • position        (xyz)         ref_coords + node_displacement
+        • velocity        (xyz)         finite difference of positions (dt=1 frame)
+        • acceleration    (xyz)         finite difference of velocity   (dt=1 frame)
+        • stress          (6-component) element solid/shell stress averaged to nodes
+        • plastic_strain  (scalar)      element eff. plastic strain averaged to nodes
+        • node_part_id    stored once in /metadata
+        • material props  stored once in /metadata (from --kfile)
 
 python dataset/d3plot_to_h5_dt.py \
-    --src /home/kong/datasets/barrier/fem/T_lok_F_shape_barrier_9_3_100km \
+    --src /home/kong/datasets/barrier/fem/T_lok_F_shape_barrier_9_3_60km \
     --tmp /home/kong/datasets/barrier/tmp \
-    --out /home/kong/datasets/barrier/h5/T_lok_F_shape_barrier_9_3_100km_dt_2layers/output.h5 \
+    --out /home/kong/datasets/barrier/h5dt_50ns_5fs_mat/T_lok_F_shape_barrier_9_3_60km/output.h5 \
     --sampling-config configs/data/sampling_config.yaml \
     --node-stride 50 \
     --frame-stride 5 \
@@ -48,6 +49,14 @@ HDF5 layout
       part_ids            (P,)     int64
       part_names          (P,)     bytes
       part_patterns       (K,)     bytes
+      node_mat_type_id    (N,)     int32     material type code (see _MAT_TYPE_ID_MAP)
+      node_mat_type_name  (N,)     bytes     material keyword string (e.g. PIECEWISE_LINEAR_PLASTICITY)
+      node_mat_label      (N,)     bytes     precise title from *MAT_xxx_TITLE card (e.g. "Steel - 300")
+                                             falls back to type_name when _TITLE absent in k-file
+      node_mat_E          (N,)     float32   Young's modulus [MPa]
+      node_mat_sigy       (N,)     float32   yield stress [MPa]
+      node_mat_rho        (N,)     float32   density [t/mm³]
+      node_mat_nu         (N,)     float32   Poisson's ratio
       attrs: node_stride, node_selection, frame_stride, n_frames, n_nodes,
              stress_components = "sxx,syy,szz,sxy,syz,sxz"
 
@@ -57,12 +66,14 @@ HDF5 layout
       velocity            (T, N, 3)   float32  [mm/frame]   finite diff, dt=1
       acceleration        (T, N, 3)   float32  [mm/frame^2] finite diff, dt=1
       stress              (T, N, 6)   float32  [MPa]  sxx…sxz
+      plastic_strain      (T, N)      float32  [-]    eff. plastic strain at nodes
 """
 
 from __future__ import annotations
 
 import argparse
 import json
+import re
 from fnmatch import fnmatch
 from pathlib import Path
 import shutil
@@ -128,6 +139,204 @@ def _build_selected_part_mask(part_names: list[str], patterns: list[str]) -> np.
         low = name.lower()
         mask[i] = any(_pattern_matches(low, p) for p in patterns)
     return mask
+
+
+# ── K-file material parser ────────────────────────────────────────────────────
+
+_MAT_TYPE_ID_MAP: dict[str, int] = {
+    "PIECEWISE_LINEAR_PLASTICITY":          0,
+    "MODIFIED_PIECEWISE_LINEAR_PLASTICITY": 0,
+    "RIGID":                                1,
+    "ELASTIC":                              2,
+    "BLATZ-KO_RUBBER":                      3,
+    "CONCRETE_DAMAGE_REL3":                 4,
+    "LOW_DENSITY_FOAM":                     5,
+    "SPOTWELD":                             6,
+    "SPRING_ELASTIC":                       7,
+    "SPRING_NONLINEAR_ELASTIC":             7,
+    "DAMPER_NONLINEAR_VISCOUS":             7,
+}
+_MAT_TYPE_UNKNOWN = 8
+
+
+def _kfields(line: str) -> list[str]:
+    """Parse LS-DYNA 10-char fixed-width data line into token list."""
+    s = line.rstrip()
+    if len(s) < 10:
+        return s.split()
+    chunks = [s[k:k+10].strip() for k in range(0, len(s), 10)]
+    chunks = [c for c in chunks if c]
+    return chunks if len(chunks) > 1 else s.split()
+
+
+def _kf(tok: str) -> float:
+    try:
+        return float(tok)
+    except (ValueError, TypeError):
+        return 0.0
+
+
+def _ki(tok: str) -> int:
+    try:
+        return int(tok.split(".")[0])
+    except (ValueError, TypeError):
+        return 0
+
+
+def _parse_kfile_materials(path: Path) -> dict[str, dict]:
+    """
+    Single-pass parse of an LS-DYNA keyword file.
+
+    Returns
+    -------
+    name_to_props : {part_name -> {type_name, type_id, rho, E, nu, sigy}}
+        Keyed by the part title string so it matches node_part_name from d3plot
+        (the d3plot part_titles_ids are sequential 1-N, not the k-file PIDs).
+    """
+    # Collect parts: list of {name, mid}  and  mats: {mid -> props}
+    parts: list[dict] = []
+    mats:  dict[int, dict] = {}
+
+    try:
+        with open(path, encoding="ascii", errors="ignore") as fh:
+            lines = fh.readlines()
+    except OSError as exc:
+        print(f"  WARNING: cannot read k-file {path}: {exc}")
+        return {}
+
+    i = 0
+    while i < len(lines):
+        raw = lines[i].rstrip("\n")
+        kw  = raw.strip().upper()
+
+        # ── *PART ──────────────────────────────────────────────────────────
+        if kw == "*PART":
+            j = i + 1
+            # skip comment lines, then read the title text line
+            while j < len(lines) and lines[j].startswith("$"):
+                j += 1
+            part_title = ""
+            if j < len(lines) and not lines[j].startswith("*"):
+                part_title = lines[j].strip()
+                j += 1
+            # skip comments before the data line
+            while j < len(lines) and lines[j].startswith("$"):
+                j += 1
+            if j < len(lines) and not lines[j].startswith("*"):
+                tok = _kfields(lines[j])
+                if len(tok) >= 3:
+                    parts.append({"name": part_title, "mid": _ki(tok[2])})
+                j += 1
+            i = j
+            continue
+
+        # ── *MAT_xxx or *MAT_xxx_TITLE ─────────────────────────────────────
+        if raw.startswith("*MAT_"):
+            mat_kw    = raw.strip()
+            has_title = mat_kw.upper().endswith("_TITLE")
+            mat_type  = re.sub(r"_TITLE$", "", mat_kw, flags=re.IGNORECASE)
+            mat_type  = mat_type.upper().replace("*MAT_", "")
+
+            j = i + 1
+            mat_label = ""
+            if has_title:
+                while j < len(lines) and lines[j].startswith("$"):
+                    j += 1
+                if j < len(lines) and not lines[j].startswith("*"):
+                    mat_label = lines[j].strip()   # ← capture precise title
+                    j += 1
+
+            while j < len(lines) and lines[j].startswith("$"):
+                j += 1
+
+            if j < len(lines) and not lines[j].startswith("*"):
+                tok = _kfields(lines[j])
+                if len(tok) >= 2:
+                    mid = int(_kf(tok[0]))
+                    rho = _kf(tok[1])
+                    if "CONCRETE" in mat_type:
+                        E, nu, sigy = 0.0, _kf(tok[2]) if len(tok) > 2 else 0.0, 0.0
+                    elif "BLATZ" in mat_type or "RUBBER" in mat_type:
+                        E, nu, sigy = 0.0, 0.0, 0.0
+                    elif "FOAM" in mat_type:
+                        E, nu, sigy = _kf(tok[2]) if len(tok) > 2 else 0.0, 0.0, 0.0
+                    else:
+                        E    = _kf(tok[2]) if len(tok) > 2 else 0.0
+                        nu   = _kf(tok[3]) if len(tok) > 3 else 0.0
+                        sigy = _kf(tok[4]) if len(tok) > 4 else 0.0
+                    mats[mid] = {
+                        "type_name": mat_type,
+                        "type_id":   _MAT_TYPE_ID_MAP.get(mat_type, _MAT_TYPE_UNKNOWN),
+                        # precise label: title string if available, else keyword name
+                        "label":     mat_label if mat_label else mat_type,
+                        "rho": rho, "E": E, "nu": nu, "sigy": sigy,
+                    }
+                j += 1
+            i = j
+            continue
+
+        i += 1
+
+    # Join parts + mats on mid, keyed by part name
+    name_to_props: dict[str, dict] = {}
+    for p in parts:
+        props = mats.get(p["mid"])
+        if props is not None:
+            name_to_props[p["name"]] = props
+
+    return name_to_props
+
+
+def _build_node_material_arrays(
+    node_part_name: np.ndarray,         # (N,) str – part name per node
+    name_to_props:  dict[str, dict],    # part_name -> material props
+) -> dict[str, np.ndarray]:
+    """
+    Build per-node material property arrays by looking up part name.
+    The d3plot part_titles_ids are sequential (1-N), not the k-file PIDs,
+    so we look up by part name which matches between both sources.
+
+    Output keys
+    -----------
+    type_id    (N,) int32    coarse type code (see _MAT_TYPE_ID_MAP)
+    type_name  (N,) str      MAT keyword without *MAT_ prefix
+    label      (N,) str      precise title from *MAT_xxx_TITLE; falls back to
+                             type_name when _TITLE was absent in the k-file
+    E          (N,) float32  Young's modulus [MPa]
+    sigy       (N,) float32  yield stress [MPa]
+    rho        (N,) float32  density [t/mm³]
+    nu         (N,) float32  Poisson's ratio
+    """
+    N = len(node_part_name)
+    type_ids   = np.full(N, _MAT_TYPE_UNKNOWN, dtype=np.int32)
+    type_names = np.full(N, "UNKNOWN",         dtype=object)
+    labels     = np.full(N, "UNKNOWN",         dtype=object)
+    E_arr      = np.zeros(N, dtype=np.float32)
+    sigy_arr   = np.zeros(N, dtype=np.float32)
+    rho_arr    = np.zeros(N, dtype=np.float32)
+    nu_arr     = np.zeros(N, dtype=np.float32)
+
+    for i, raw_name in enumerate(node_part_name):
+        name  = raw_name if isinstance(raw_name, str) else raw_name.decode("ascii", errors="ignore").strip()
+        props = name_to_props.get(name)
+        if props is not None:
+            type_ids[i]   = props["type_id"]
+            type_names[i] = props["type_name"]
+            labels[i]     = props.get("label", props["type_name"])
+            E_arr[i]      = props["E"]
+            sigy_arr[i]   = props["sigy"]
+            rho_arr[i]    = props["rho"]
+            nu_arr[i]     = props["nu"]
+
+    return {
+        "type_id":   type_ids,
+        "type_name": type_names,
+        "label":     labels,
+        "E":         E_arr,
+        "sigy":      sigy_arr,
+        "rho":       rho_arr,
+        "nu":        nu_arr,
+    }
 
 
 # ── Node / element selection ───────────────────────────────────────────────────
@@ -254,6 +463,57 @@ def _compute_node_stress(
     denom = node_count[sel_node_idx]
     good  = denom > 0
     out[good] = (node_sum[sel_node_idx][good] / denom[good, None]).astype(np.float32)
+    return out
+
+
+# ── Scalar field (e.g. effective plastic strain) element → node ───────────────
+
+def _average_scalar_to_elem(field_frame: np.ndarray) -> np.ndarray:
+    """
+    Collapse integration-point / layer dimensions → (n_elem,) scalar.
+    Accepted shapes: (n_elem, n_ip), (n_elem, n_ip, 1), etc.
+    """
+    s = np.asarray(field_frame, dtype=np.float32)
+    if s.ndim > 1:
+        s = s.mean(axis=tuple(range(1, s.ndim)))
+    return s  # (n_elem,)
+
+
+def _compute_node_plastic_strain(
+    solid_eps: np.ndarray | None,       # (n_solid_all, ...) for this state
+    shell_eps: np.ndarray | None,       # (n_shell_all, ...) for this state
+    sel_solid_elem_idx:   np.ndarray,
+    sel_shell_elem_idx:   np.ndarray,
+    sel_solid_elem_nodes: np.ndarray,   # (E_solid_sel, 8)
+    sel_shell_elem_nodes: np.ndarray,   # (E_shell_sel, 4)
+    sel_node_idx: np.ndarray,           # (N_sel,)
+    n_total_nodes: int,
+) -> np.ndarray:                        # (N_sel,) float32
+    """
+    Average element effective plastic strain to nodes.
+    Mirrors _compute_node_stress but for a single scalar component.
+    """
+    node_sum   = np.zeros(n_total_nodes, dtype=np.float64)
+    node_count = np.zeros(n_total_nodes, dtype=np.int64)
+
+    for eps, elem_idx, elem_nodes in [
+        (solid_eps, sel_solid_elem_idx, sel_solid_elem_nodes),
+        (shell_eps, sel_shell_elem_idx, sel_shell_elem_nodes),
+    ]:
+        if eps is None or len(elem_idx) == 0:
+            continue
+        e1         = _average_scalar_to_elem(eps[elem_idx]).astype(np.float64)  # (E,)
+        nodes_flat = elem_nodes.ravel()
+        K          = elem_nodes.shape[1]
+        e_rep      = np.repeat(e1, K)                                            # (E*K,)
+        valid      = nodes_flat >= 0
+        np.add.at(node_sum,   nodes_flat[valid], e_rep[valid])
+        np.add.at(node_count, nodes_flat[valid], 1)
+
+    out   = np.zeros(len(sel_node_idx), dtype=np.float32)
+    denom = node_count[sel_node_idx]
+    good  = denom > 0
+    out[good] = (node_sum[sel_node_idx][good] / denom[good]).astype(np.float32)
     return out
 
 
@@ -422,11 +682,12 @@ def _create_h5_datasets(h5f: h5py.File, n_frames: int, n_nodes: int) -> None:
         sg.create_dataset(name, shape=shape, dtype=dtype,
                           chunks=chunks, compression="gzip", compression_opts=4)
 
-    ds("times",        (n_frames,),          "float64")
-    ds("positions",    (n_frames, n_nodes, 3), "float32")
-    ds("velocity",     (n_frames, n_nodes, 3), "float32")
-    ds("acceleration", (n_frames, n_nodes, 3), "float32")
-    ds("stress",       (n_frames, n_nodes, 6), "float32")
+    ds("times",          (n_frames,),            "float64")
+    ds("positions",      (n_frames, n_nodes, 3), "float32")
+    ds("velocity",       (n_frames, n_nodes, 3), "float32")
+    ds("acceleration",   (n_frames, n_nodes, 3), "float32")
+    ds("stress",         (n_frames, n_nodes, 6), "float32")
+    ds("plastic_strain", (n_frames, n_nodes),    "float32")
 
 
 # ── Main ───────────────────────────────────────────────────────────────────────
@@ -447,6 +708,9 @@ def main() -> None:
                         help="Spatial decimation for Layer 2 (required_parts): keep every N-th node (1 = all).")
     parser.add_argument("--frame-stride",     type=int,   default=DEFAULT_FRAME_STRIDE,
                         help="Temporal decimation: keep every N-th frame (1 = all, 2 = default).")
+    parser.add_argument("--kfile",           type=Path,  default=None,
+                        help="LS-DYNA keyword file (.k) for material metadata. "
+                             "Auto-detected from --src dir if not given.")
     frame_limit_group = parser.add_mutually_exclusive_group()
     frame_limit_group.add_argument("--frame-limit", type=int,   default=None, metavar="K",
                         help="Keep only the first K frames after stride (exact count).")
@@ -589,6 +853,20 @@ def main() -> None:
     sel_part_names    = np.array([part_names[i]               for i in sel_part_idx])
     del d3hdr   # free header memory
 
+    # ── Material metadata from k-file ──────────────────────────────────────────
+    kfile = args.kfile
+    if kfile is None:
+        k_candidates = sorted(args.src.glob("*.k")) + sorted(args.src.glob("*.key"))
+        kfile = k_candidates[0] if k_candidates else None
+    if kfile is not None:
+        print(f"Parsing k-file for material metadata: {kfile.name} …")
+        name_to_props = _parse_kfile_materials(kfile)
+        print(f"  Resolved material props for {len(name_to_props)} unique part names")
+    else:
+        print("WARNING: no .k file found – material metadata will be zero-filled")
+        name_to_props = {}
+    node_mat = _build_node_material_arrays(node_part_name, name_to_props)
+
     # ══════════════════════════════════════════════════════════════════════════
     # Step 2 – Frame selection (every frame_stride-th state, globally sorted)
     # ══════════════════════════════════════════════════════════════════════════
@@ -639,6 +917,20 @@ def main() -> None:
     mg.attrs["stress_components"]   = "sxx,syy,szz,sxy,syz,sxz"
     mg.attrs["velocity_source"]     = "pending"       # updated below
     mg.attrs["acceleration_source"] = "pending"
+
+    # material properties per node (static, from k-file)
+    mg.create_dataset("node_mat_type_id",   data=node_mat["type_id"])
+    mg.create_dataset("node_mat_type_name", data=node_mat["type_name"].astype("S"))
+    mg.create_dataset("node_mat_label",     data=node_mat["label"].astype("S"))
+    mg.create_dataset("node_mat_E",         data=node_mat["E"])
+    mg.create_dataset("node_mat_sigy",      data=node_mat["sigy"])
+    mg.create_dataset("node_mat_rho",       data=node_mat["rho"])
+    mg.create_dataset("node_mat_nu",        data=node_mat["nu"])
+    mg.attrs["mat_type_id_legend"] = (
+        "0=plasticity 1=rigid 2=elastic 3=rubber "
+        "4=concrete 5=foam 6=spotweld 7=spring/damper 8=unknown"
+    )
+    mg.attrs["kfile"] = str(kfile.resolve()) if kfile else "not_provided"
 
     # add front face / barrier part mask for distance calc
     part_names_str = [str(n).strip() for n in node_part_name]
@@ -740,15 +1032,17 @@ def main() -> None:
                 "max": self.max_vals.tolist(),
             }
 
-    pos_stats = FieldStats("positions", 3)
-    vel_stats = FieldStats("velocity", 3)
-    acc_stats = FieldStats("acceleration", 3)
-    stress_stats = FieldStats("stress", 6)
+    pos_stats          = FieldStats("positions", 3)
+    vel_stats          = FieldStats("velocity", 3)
+    acc_stats          = FieldStats("acceleration", 3)
+    stress_stats       = FieldStats("stress", 6)
+    plastic_strain_stats = FieldStats("plastic_strain", 1)
 
     # accumulators for median calculation (store per-frame flattened arrays)
-    vel_accum: list[np.ndarray] = []
-    acc_accum: list[np.ndarray] = []
-    stress_accum: list[np.ndarray] = []
+    vel_accum:            list[np.ndarray] = []
+    acc_accum:            list[np.ndarray] = []
+    stress_accum:         list[np.ndarray] = []
+    plastic_strain_accum: list[np.ndarray] = []
 
     # ══════════════════════════════════════════════════════════════════════════
     # Pass 2/2 – Extract fields frame by frame (globally time-ordered)
@@ -788,6 +1082,8 @@ def main() -> None:
                         ArrayType.node_displacement,
                         ArrayType.element_solid_stress,
                         ArrayType.element_shell_stress,
+                        ArrayType.element_solid_effective_plastic_strain,
+                        ArrayType.element_shell_effective_plastic_strain,
                     ],
                 )
 
@@ -824,6 +1120,23 @@ def main() -> None:
             h5f["states/stress"][fi] = stress_node
             stress_stats.update(stress_node)
             stress_accum.append(stress_node.reshape(-1, 6))
+
+            # ── effective plastic strain (scalar, element-avg → nodes) ─────
+            solid_eps = d3.arrays.get(ArrayType.element_solid_effective_plastic_strain)
+            shell_eps = d3.arrays.get(ArrayType.element_shell_effective_plastic_strain)
+            eps_node = _compute_node_plastic_strain(
+                solid_eps[sidx] if solid_eps is not None else None,
+                shell_eps[sidx] if shell_eps is not None else None,
+                sel_solid_ei,
+                sel_shell_ei,
+                sel_solid_elem_nodes,
+                sel_shell_elem_nodes,
+                sel_node_idx,
+                n_total_nodes,
+            )
+            h5f["states/plastic_strain"][fi] = eps_node
+            plastic_strain_stats.update(eps_node.reshape(-1, 1))
+            plastic_strain_accum.append(eps_node)
 
             if fi % 20 == 0 or fi == n_frames - 1:
                 print(f"  [{fi+1:>5}/{n_frames}]  t = {t*1e3:.3f} ms")
@@ -898,10 +1211,11 @@ def main() -> None:
 
     # Finalize field statistics
     # finalize numeric summaries
-    fs_pos = pos_stats.finalize()
-    fs_vel = vel_stats.finalize()
-    fs_acc = acc_stats.finalize()
-    fs_stress = stress_stats.finalize()
+    fs_pos           = pos_stats.finalize()
+    fs_vel           = vel_stats.finalize()
+    fs_acc           = acc_stats.finalize()
+    fs_stress        = stress_stats.finalize()
+    fs_plastic_strain = plastic_strain_stats.finalize()
 
     # medians
     try:
@@ -915,20 +1229,25 @@ def main() -> None:
         arr = np.concatenate(accum_list, axis=0)
         return np.median(arr, axis=0).tolist()
 
-    vel_median = _safe_median(vel_accum, 3)
-    acc_median = _safe_median(acc_accum, 3)
-    stress_median = _safe_median(stress_accum, 6)
+    vel_median           = _safe_median(vel_accum, 3)
+    acc_median           = _safe_median(acc_accum, 3)
+    stress_median        = _safe_median(stress_accum, 6)
+    plastic_strain_median = _safe_median(
+        [a.reshape(-1, 1) for a in plastic_strain_accum], 1
+    )
 
-    fs_pos["median"] = pos_median
-    fs_vel["median"] = vel_median
-    fs_acc["median"] = acc_median
-    fs_stress["median"] = stress_median
+    fs_pos["median"]            = pos_median
+    fs_vel["median"]            = vel_median
+    fs_acc["median"]            = acc_median
+    fs_stress["median"]         = stress_median
+    fs_plastic_strain["median"] = plastic_strain_median
 
     metadata["field_stats"] = {
-        "positions": fs_pos,
-        "velocity": fs_vel,
-        "acceleration": fs_acc,
-        "stress": fs_stress,
+        "positions":      fs_pos,
+        "velocity":       fs_vel,
+        "acceleration":   fs_acc,
+        "stress":         fs_stress,
+        "plastic_strain": fs_plastic_strain,
     }
 
     with open(meta_path, "w", encoding="utf-8") as f:
@@ -947,7 +1266,7 @@ def main() -> None:
     print(f"Velocity src   : finite difference (dt = 1 frame)")
     print(f"Accel src      : finite difference (dt = 1 frame)")
     print(f"Physical Δt    : {dt_mean*1e3:.4f} ms  (stored as dt_seconds for unit conversion)")
-    print(f"HDF5 layout    : /metadata  +  /states/{{times,positions,velocity,acceleration,stress}}")
+    print(f"HDF5 layout    : /metadata  +  /states/{{times,positions,velocity,acceleration,stress,plastic_strain}}")
     print(f"{'─'*60}")
 
 

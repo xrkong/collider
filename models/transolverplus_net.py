@@ -58,7 +58,16 @@ class TransolverplusNet(nn.Module):
         block_act = m.get("block_act", "gelu")
         slice_num = m.get("slice_num", 64)
 
-        self._init_network(nnode_in, nnode_out, latent, layers, 
+        self.num_node_types = m.get("num_node_types", 0)
+        type_emb_dim        = m.get("type_emb_dim", 0)
+        if self.num_node_types > 0:
+            assert type_emb_dim > 0, "type_emb_dim must be > 0 when num_node_types > 0"
+            self.type_embed = nn.Embedding(self.num_node_types, type_emb_dim)
+        else:
+            self.type_embed = None
+            type_emb_dim = 0
+
+        self._init_network(nnode_in + type_emb_dim, nnode_out, latent, layers,
                            heads, dropout, mlp_ratio, block_act, slice_num)
 
     def _init_network(self, nnode_in, nnode_out, latent_dim, layers,
@@ -85,11 +94,18 @@ class TransolverplusNet(nn.Module):
             )
         # self.output_proj = nn.Linear(latent_dim, nnode_out)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Supports [N, C] or [B, N, C]."""
+    def forward(self, x: torch.Tensor, node_type: torch.Tensor | None = None) -> torch.Tensor:
+        """Supports [N, C] or [B, N, C]. Pass node_type (N,) or (B,N) when type_embed is active."""
         squeeze = x.dim() == 2
         if squeeze:
             x = x.unsqueeze(0)
+        if self.type_embed is not None:
+            assert node_type is not None, "node_type must be provided when type_embed is enabled"
+            nt = node_type.long()
+            if nt.dim() == 1:
+                nt = nt.unsqueeze(0).expand(x.shape[0], -1)  # (B, N)
+            emb = self.type_embed(nt)                         # (B, N, type_emb_dim)
+            x = torch.cat([x, emb], dim=-1)
         tokens = self.input_proj(x)
         for block in self.blocks:
             tokens = block(tokens)

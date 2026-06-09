@@ -1,0 +1,184 @@
+
+========================================================================
+  k_inspect.py  –  LS-DYNA keyword file overview
+========================================================================
+  File   : /home/kong/datasets/barrier/fem/T_lok_F_shape_barrier_9_3_100km/car_and_barriers.k
+  Size   : 274.1 MB  (267,649 KB)
+
+  Parsing … done.
+
+========================================================================
+  SIMULATION SETTINGS
+========================================================================
+  End time     : 1.0 s  (endcyc=0)
+  DT init/tssfac: 0.0 / 0.9
+
+  PARAMETERS
+    VEL_1        = 28074.11  (101.1 km/h)
+    OMEG1        = &VEL_1/391.0
+    DUM_1        = 1
+    DUM_2        = 1
+    LOAD         = 0
+    M1_1         = &DUM_1*0.500e-3
+    M1_2         = &DUM_1*0.166e-3
+    M2_1         = &DUM_2*0.500e-3
+    M2_2         = &DUM_2*0.166e-3
+    M3_1         = &LOAD*
+
+  INITIAL VELOCITY
+    set_id=9000004  styp=1  vx=28074.11 mm/s  (101.1 km/h)  vy=0.0  vz=0.0
+
+------------------------------------------------------------------------
+  DATABASE_EXTENT_BINARY  (fields written to d3plot)
+------------------------------------------------------------------------
+    neiph             : 6  → 6
+    neips             : 0  → no extra shell history vars
+    strflg            : 0  → no strain
+    sigflg            : 2  → global stress
+    epsflg            : 1  → eff. plastic strain written
+    rltflg            : 2  → global strain
+    engflg            : 1  → internal+kinetic energy written
+    ieverp            : 1  → each state in separate d3plot file
+    therm             : 1  → temperatures written
+
+    neiph=6: 6 extra integration-pt history variables per solid element are in d3plot
+
+------------------------------------------------------------------------
+  MATERIALS  (912 total)
+------------------------------------------------------------------------
+  Type summary:
+     656×  PIECEWISE_LINEAR_PLASTICITY
+     108×  RIGID
+      77×  ELASTIC
+      41×  BLATZ-KO_RUBBER
+      11×  MODIFIED_PIECEWISE_LINEAR_PLASTICITY
+       8×  LOW_DENSITY_FOAM
+       4×  SPRING_ELASTIC
+       2×  SPRING_NONLINEAR_ELASTIC
+       2×  DAMPER_NONLINEAR_VISCOUS
+       2×  CONCRETE_DAMAGE_REL3
+       1×  SPOTWELD
+
+  Unique material titles per type:
+
+  [PIECEWISE_LINEAR_PLASTICITY]  656 instances
+    'Steel - 300'  ρ=7.89e-09 t/mm³  E=2e+05 MPa  ν=0.3  σy=300 MPa  fail=0.5
+    'Steel - 200'  ρ=7.89e-09 t/mm³  E=2e+05 MPa  ν=0.3  σy=200 MPa  fail=0.5
+    'Steel - 370'  ρ=7.89e-09 t/mm³  E=2e+05 MPa  ν=0.3  σy=370 MPa  fail=0.5
+    'PLASTIC'  ρ=1.17e-09 t/mm³  E=5000 MPa  ν=0.32  σy=60 MPa  Etan=1e+03  fail=0.5
+    'Steel - 420'  ρ=7.89e-09 t/mm³  E=2e+05 MPa  ν=0.3  σy=420 MPa  fail=0.5
+    'GLASS_POLYMER'  ρ=1e-09 t/mm³  E=250 MPa  ν=0.35  σy=10 MPa  Etan=1  fail=2.5
+    'Steel - 140'  ρ=7.89e-09 t/mm³  E=2e+05 MPa  ν=0.3  σy=140 MPa  fail=0.35
+    'Steel - 270'  ρ=7.89e-09 t/mm³  E=2e+05 MPa  ν=0.3  σy=270 MPa  fail=0.5
+    'Steel - 800'  ρ=7.89e-09 t/mm³  E=2e+05 MPa  ν=0.3  σy=800 MPa  fail=0.5
+    'TIRE_RUBBER'  ρ=2.09e-09 t/mm³  E=1000 MPa  ν=0.45  σy=10 MPa  Etan=100  fail=0.5
+    'anchor rebar and reinforcement'  ρ=7.89e-09 t/mm³  E=2e+05 MPa  ν=0.3  σy=413.7 MPa  fail=0.5
+    'steel tube'  ρ=7.89e-09 t/mm³  E=2e+05 MPa  ν=0.3  σy=317 MPa  fail=0.5
+    'T lok'  ρ=7.89e-09 t/mm³  E=2e+05 MPa  ν=0.3  σy=248 MPa  fail=0.5
+
+  [RIGID]  108 instances
+    '(untitled)'  ρ=7.89e-09 t/mm³  E=2e+05 MPa  ν=0.3
+    'RIGID'  ρ=2.5e-08 t/mm³  E=2e+05 MPa  ν=0.3
+
+  [ELASTIC]  77 instances
+    'ELASTIC'  ρ=5.35e-09 t/mm³  E=2e+05 MPa  ν=0.3
+    'Dummy_Beams'  ρ=7.89e-09 t/mm³  E=2e+05 MPa  ν=0.3
+
+  [BLATZ-KO_RUBBER]  41 instances
+    'RUBBER BUSHINGS'  ρ=2.38e-09 t/mm³  G=100 MPa
+
+  [MODIFIED_PIECEWISE_LINEAR_PLASTICITY]  11 instances
+    'GLASS'  ρ=2.5e-09 t/mm³  E=7e+04 MPa  ν=0.22  σy=30 MPa  Etan=1e+03  fail=0.015
+    'PLASTIC'  ρ=3.87e-09 t/mm³  E=5000 MPa  ν=0.32  σy=60 MPa  Etan=1e+03  fail=0.5
+    '(untitled)'  ρ=7.89e-09 t/mm³  E=2000 MPa  ν=0.3  σy=10 MPa  fail=1.55
+
+  [LOW_DENSITY_FOAM]  8 instances
+    'FOAMS'  ρ=5.62e-10 t/mm³  E=20 MPa
+
+  [SPRING_ELASTIC]  4 instances
+    'SPRING'  ρ=364 t/mm³
+    '(untitled)'  ρ=1e+03 t/mm³
+
+  [SPRING_NONLINEAR_ELASTIC]  2 instances
+    'SPRING'  ρ=2e+06 t/mm³
+
+  [DAMPER_NONLINEAR_VISCOUS]  2 instances
+    'DAMPER'  ρ=2e+06 t/mm³
+
+  [CONCRETE_DAMAGE_REL3]  2 instances
+    'concrete-KCC-default-32.3Mpa'  ρ=2.27e-09 t/mm³  ν=0.19
+    'concrete-KCC-32.3Mpa-modified-curve'  ρ=2.27e-09 t/mm³  ν=0.19
+
+  [SPOTWELD]  1 instances
+    'WELDS'  ρ=7.89e-09 t/mm³
+
+------------------------------------------------------------------------
+  SECTIONS
+------------------------------------------------------------------------
+  [BEAM]  6 instances
+    Elform codes    : [1, 9]
+  [DISCRETE]  8 instances
+  [SHELL]  836 instances
+    Thickness range : 0.5 – 14 mm
+    Unique values   : [0.5, 0.743, 0.754, 0.783, 0.819, 0.825, 0.837, 0.846, 0.855, 0.871, 0.894, 0.906, 0.915, 0.941, 0.951, 0.965, 0.98, 0.992, 0.995, 0.996]…
+    Elform codes    : [2, 16]
+  [SOLID]  61 instances
+    Elform codes    : [1, 2]
+
+------------------------------------------------------------------------
+  PARTS  (934 total)
+------------------------------------------------------------------------
+  Part-name prefix groups (top 15):
+       8×  anchor
+       5×  627
+       5×  640
+       4×  Accelerometers
+       4×  concrete
+       4×  steel
+       4×  T
+       3×  357
+       3×  365
+       3×  275
+       3×  211
+       3×  441
+       3×  622
+       3×  623
+       3×  761
+
+  First 10 parts:
+    pid=1000001   mid=1000001    RIGID FIXED GROUND                             [*MAT_RIGID()]
+    pid=2000001   mid=2000001    713_ob_doorfrontdoormirrorbrkt                 [*MAT_PIECEWISE_LINEAR_PLASTICITY(Steel - 300)]
+    pid=2000002   mid=2000002    714_ob_doorfrontlonguppersprt                  [*MAT_PIECEWISE_LINEAR_PLASTICITY(Steel - 300)]
+    pid=2000003   mid=2000003    715_ob_doorfrontbar                            [*MAT_PIECEWISE_LINEAR_PLASTICITY(Steel - 300)]
+    pid=2000004   mid=2000004    716_ob_doorfrthingesuprt                       [*MAT_PIECEWISE_LINEAR_PLASTICITY(Steel - 300)]
+    pid=2000005   mid=2000005    717_ob_doorfrtwindowguidebrktlwr               [*MAT_PIECEWISE_LINEAR_PLASTICITY(Steel - 300)]
+    pid=2000006   mid=2000006    718_ob_doorfrtlongitudesuprt                   [*MAT_PIECEWISE_LINEAR_PLASTICITY(Steel - 200)]
+    pid=2000007   mid=2000007    719_ob_doorfrtwindowframe                      [*MAT_PIECEWISE_LINEAR_PLASTICITY(Steel - 300)]
+    pid=2000008   mid=2000008    720_ob_doorrearlowerbar                        [*MAT_PIECEWISE_LINEAR_PLASTICITY(Steel - 300)]
+    pid=2000009   mid=2000009    721_ob_doorrearuppersupport                    [*MAT_PIECEWISE_LINEAR_PLASTICITY(Steel - 300)]
+  …
+  Last 10 parts:
+    pid=10000015  mid=9000101    anchor rebar_S-c1                              [*MAT_PIECEWISE_LINEAR_PLASTICITY(anchor rebar and reinforcement)]
+    pid=10000016  mid=9000101    reinforcement-c1                               [*MAT_PIECEWISE_LINEAR_PLASTICITY(anchor rebar and reinforcement)]
+    pid=10000017  mid=9000102    steel tube-c1                                  [*MAT_PIECEWISE_LINEAR_PLASTICITY(steel tube)]
+    pid=10000018  mid=9000103    T lok-c1                                       [*MAT_PIECEWISE_LINEAR_PLASTICITY(T lok)]
+    pid=10000019  mid=9000105    concrete_coarse_mesh-c2                        [*MAT_CONCRETE_DAMAGE_REL3(concrete-KCC-32.3Mpa-modified-curve)]
+    pid=10000020  mid=9000101    anchor rebar_T-c2                              [*MAT_PIECEWISE_LINEAR_PLASTICITY(anchor rebar and reinforcement)]
+    pid=10000021  mid=9000101    anchor rebar_S-c2                              [*MAT_PIECEWISE_LINEAR_PLASTICITY(anchor rebar and reinforcement)]
+    pid=10000022  mid=9000101    reinforcement-c2                               [*MAT_PIECEWISE_LINEAR_PLASTICITY(anchor rebar and reinforcement)]
+    pid=10000023  mid=9000102    steel tube-c2                                  [*MAT_PIECEWISE_LINEAR_PLASTICITY(steel tube)]
+    pid=10000024  mid=9000103    T lok-c2                                       [*MAT_PIECEWISE_LINEAR_PLASTICITY(T lok)]
+
+------------------------------------------------------------------------
+  CONTACTS
+------------------------------------------------------------------------
+      2×  *CONTACT_AUTOMATIC_SINGLE_SURFACE
+      2×  *CONTACT_AUTOMATIC_SURFACE_TO_SURFACE
+      1×  *CONTACT_INTERIOR
+      1×  *CONTACT_TIED_SHELL_EDGE_TO_SURFACE
+      1×  *CONTACT_TIED_SURFACE_TO_SURFACE
+
+========================================================================
+  Done.
+========================================================================
+
