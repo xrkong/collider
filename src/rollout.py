@@ -16,12 +16,12 @@ Conventions (must match the exporter / loader / trainer):
 
 Usage:
     python src/rollout.py \
-        --checkpoint outputs/checkpoints/sc_040/checkpoint-best.safetensors \
-        --experiment configs/experiments/sc_040.yaml \
-        --raw-h5 /home/kong/datasets/barrier/h5dt_50ns_5fs_mat/T_lok_F_shape_barrier_9_3_100km/output.h5 \
+        --checkpoint outputs/checkpoints/dg_001/checkpoint-best.safetensors \
+        --experiment configs/experiments/dg_001.yaml \
+        --raw-h5 /data/curtin_ciraee/curtin_xiangrui/data/h5dt_50ns_5fs_mat/T_lok_F_shape_barrier_9_3_100km/output.h5 \
         --mode both \
         --gif --gif-fps 10 \
-        --gif-name sc040_100kmh
+        --gif-name dg001_100kmh
 
     # GT-only GIF — no checkpoint/experiment needed
     python src/rollout.py \
