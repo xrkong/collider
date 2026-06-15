@@ -90,6 +90,59 @@ wandb artifact put \
     outputs/checkpoints/exp_collider_001/checkpoint-best.safetensors
 ```
 
+# HPC user manual 
+
+## Setup 
+
+## environment 
+install miniconda on head node, then test your script without GPU.
+```bash
+https://www.anaconda.com/docs/getting-started/miniconda/install/linux-install
+```
+
+You may start conda by running the following command:
+```bash
+eval "$(/data/curtin_ciraee/curtin_xiangrui/ENTER/bin/conda shell.bash hook)" 
+```
+
+Creat a conda env in this specific path.
+```bash
+conda create -p /data/curtin_ciraee/curtin_xiangrui/env/conda/collider python=3.11
+```
+
+Install packages
+```bash
+pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
+pip install -r requirements.txt
+```
+
+
 # TODO
-- [ ] Change the input / output data, Input is velocity only and output is the acceleration. 
-- [ ] Write something. 
+
+```bash
+ssh -L 9999:curtin-jupyter.hpc.dug.com:443 dug
+```
+
+## tasks:
+- [ ] scp 9 selected trajs to dug, including [60,80,100kph]x[0,400,800kg]=9 trajs
+- [ ] conda env setup on dug 
+- [ ] modify train.py for HPC, (use config to specify GPUs)
+- [ ] submit job script to HPC (100 epochs for testing)
+- [ ] rollout results, write reports
+- [ ] submit whole job (500 epochs) to HPC
+
+## notes:
+- downsample should be done on laptop locally, then scp the downsampled trajs to dug, to save time on data transfer.
+- conda env should be deplied on /data/.../curtin_xiangrui/env... according to the HPC user manual.
+- use jupyterlab to link GPUs, and run train.py, use wandb to monitor the training process.
+- use 1 A100 or two of them? need to dicuss 
+- dug is available until the end of the month, need to finish the whole training process before then
+
+
+## timeline: 
+9-13, setup data, env;  
+14-16 test run;   
+17-21 500 epoch training;  
+22-28 another training if needed;  
+29-30 download results, save checkpoints.  
+
