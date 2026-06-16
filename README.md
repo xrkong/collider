@@ -53,13 +53,20 @@ python dataset/d3plot_to_h5.py \
     --frame-limit 100
 ```
 
-
-
 ### Training
 ```
 python train.py --experiment configs/experiments/exp_10.yaml --skip-git-check
 ```
 
+### Barrier plate projection on xy plate 
+![Barrier middle plate projection on xy plate](SPEC/lines.png) *Figure. Barrier middle plate projection on xy plate*
+
+*Table. Barrier plate projection parameters*
+| Degree | Slope m = tan(θ) | Line Equation | y-intercept (x=0) | x-intercept (y=0) |
+|--------|------------------|----------------------------|-------------------|-------------------|
+| −25.4° | −0.474835        | y = −0.474835x + 976.536   | 976.536           | 2056.579          |
+| −20°   | −0.363970        | y = −0.363970x + 1019.672  | 1019.672          | 2801.525          |
+| −15°   | −0.267949        | y = −0.267949x + 1092.698  | 1092.698          | 4078.004          |
 
 ### Evaluation and Rollout
 After training, you can evaluate the model on the test set and perform rollouts.
@@ -74,11 +81,12 @@ python src/evaluate.py \
 ### Rollout 
 ```
 python src/rollout.py \
-    --checkpoint outputs/checkpoints/sc_026/checkpoint-best.safetensors \
-    --experiment configs/experiments/sc_026.yaml \
-    --raw-h5 /home/kong/datasets/barrier/h5/T_lok_F_shape_barrier_9_3_100km_50_1_01/output.h5 \
-    --mode autoregressive \
-    --gif --gif-fps 10 
+        --checkpoint outputs/checkpoints/dg002/checkpoint-best.safetensors \
+        --experiment configs/experiments/dg002.yaml \
+        --raw-h5 /data/curtin_ciraee/curtin_xiangrui/data/h5dt_50ns_5fs_mat/T_lok_F_shape_barrier_9_3_80km/output.h5 \
+        --mode both \
+        --gif --gif-fps 10 \
+        --gif-name dg002_80kph
 ```
 
 

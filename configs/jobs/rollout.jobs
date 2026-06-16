@@ -1,0 +1,23 @@
+#!/bin/bash
+#rj queue=curtin_ciraee features=a100 priority=550 runtime=0.5 mem=64g logdir=logs name=rollout_80km_val
+
+set -euo pipefail
+echo "Running on $(hostname), TMPDIR=$TMPDIR"
+
+source /data/curtin_ciraee/curtin_xiangrui/ENTER/etc/profile.d/conda.sh
+conda activate /data/curtin_ciraee/curtin_xiangrui/env/conda/collider
+
+nvidia-smi
+python -c "import torch; print(torch.cuda.is_available(), torch.cuda.get_device_name(0))"
+
+cd /data/curtin_ciraee/curtin_xiangrui/xrkong/collider
+
+python src/rollout.py \
+    --checkpoint outputs/checkpoints/dg003/checkpoint-best.safetensors \
+    --experiment configs/experiments/dg003.yaml \
+    --raw-h5 /data/curtin_ciraee/curtin_xiangrui/data/h5dt_50ns_5fs_mat/T_lok_F_shape_barrier_9_3_80km_plus400kg/output.h5 \
+    --mode both \
+    --gif --gif-fps 10 \
+    --gif-name dg003_80kph_plus400kg
+
+echo "Done."
