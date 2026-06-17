@@ -1348,8 +1348,9 @@ def main():
             "test_set", "traj_id", "mode",
             "pos_rmse_mm", "vel_rmse_mm_dt", "acc_rmse_mm_dt2",
             "weight_kg", "speed_kmh", "angle_deg", "concrete_type",
-            "gif",
         ])
+
+    all_gif_media: dict = {}
 
     mse_by_ts: dict[str, list[float]] = {}
     all_pos_rmse: list[float] = []
@@ -1428,6 +1429,8 @@ def main():
                     save_png_dir      = str(out_dir / f"{gif_stem}_pngs"),
                 )
                 gif_paths["os"] = gif_path
+                if wandb_run:
+                    all_gif_media[f"gifs/{ts_name}_os"] = wandb.Video(gif_path, fps=args.gif_fps, format="gif")
 
             if autoreg is not None:
                 gif_stem = base_stem if args.mode != "both" else f"{base_stem}_ar"
@@ -1442,15 +1445,13 @@ def main():
                     save_png_dir      = str(out_dir / f"{gif_stem}_pngs"),
                 )
                 gif_paths["ar"] = gif_path
+                if wandb_run:
+                    all_gif_media[f"gifs/{ts_name}_ar"] = wandb.Video(gif_path, fps=args.gif_fps, format="gif")
 
         print_summary(onestep, autoreg, baseline)
 
         # ── Add rows to W&B Table ─────────────────────────────────────────
         if table is not None:
-            def _video(key):
-                p = gif_paths.get(key)
-                return wandb.Video(p, fps=args.gif_fps, format="gif") if p else None
-
             if onestep is not None:
                 pos_rmse_os = float(onestep["rmse_pos"].mean())
                 table.add_data(
@@ -1459,7 +1460,6 @@ def main():
                     float(onestep["rmse_vel"].mean()),
                     float(onestep["rmse_acc"].mean()),
                     weight_kg, speed_kmh, angle_deg, "N",
-                    _video("os"),
                 )
                 mse_by_ts.setdefault(ts_name, []).append(pos_rmse_os)
                 all_pos_rmse.append(pos_rmse_os)
@@ -1472,7 +1472,6 @@ def main():
                     float(autoreg["rmse_vel"].mean()),
                     float(autoreg["rmse_acc"].mean()),
                     weight_kg, speed_kmh, angle_deg, "N",
-                    _video("ar"),
                 )
                 mse_by_ts.setdefault(ts_name, []).append(pos_rmse_ar)
                 all_pos_rmse.append(pos_rmse_ar)
@@ -1500,6 +1499,8 @@ def main():
     # ── Log Table + summary to W&B ────────────────────────────────────────
     if wandb_run:
         wandb_run.log({"rollout_results": table})
+        if all_gif_media:
+            wandb_run.log(all_gif_media)
         for ts_name, rmse_vals in mse_by_ts.items():
             wandb_run.summary[f"mean_mse/{ts_name}"] = float(np.mean(rmse_vals))
         if all_pos_rmse:

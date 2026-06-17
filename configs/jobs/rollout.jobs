@@ -13,7 +13,7 @@ python -c "import torch; print(torch.cuda.is_available(), torch.cuda.get_device_
 cd /data/curtin_ciraee/curtin_xiangrui/xrkong/collider
 
 # ── Change only this line to switch experiments ────────────────────────────────
-EXP=dg006
+EXP=dg007
 
 # ── All test sets in one run → one W&B group, one Table ──────────────────────
 DATA=/data/curtin_ciraee/curtin_xiangrui/data/h5dt_50ns_5fs_mat
