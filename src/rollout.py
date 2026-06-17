@@ -53,6 +53,7 @@ sys.path.insert(0, str(PROJECT_ROOT))
 import models  # noqa: F401
 from models.registry import build_model
 from src.dataset import NormStats
+from src.conditions import parse_conditions
 
 try:
     import h5py
@@ -102,6 +103,34 @@ FEAT_SLICES   = {
 }
 
 FONTSIZE=12
+
+# ── W&B meta helpers ──────────────────────────────────────────────────────────
+
+def load_meta(ckpt_dir: "Path | str") -> dict:
+    """Load meta.json written by train.py from a checkpoint directory."""
+    meta_path = Path(ckpt_dir) / "meta.json"
+    if not meta_path.exists():
+        raise FileNotFoundError(
+            f"meta.json not found in {ckpt_dir}. "
+            "Ensure train.py wrote it (requires updated train.py)."
+        )
+    with open(meta_path) as f:
+        return json.load(f)
+
+
+def _find_weights_file(ckpt_dir: Path) -> Path:
+    """Find checkpoint weights (.safetensors or .pt) in a directory."""
+    for name_stem in ("checkpoint-best", "checkpoint-latest"):
+        for ext in (".safetensors", ".pt"):
+            p = ckpt_dir / (name_stem + ext)
+            if p.exists():
+                return p
+    for ext in (".safetensors", ".pt"):
+        candidates = sorted(ckpt_dir.glob(f"*{ext}"))
+        if candidates:
+            return candidates[-1]
+    raise FileNotFoundError(f"No checkpoint weights (.safetensors / .pt) found in {ckpt_dir}")
+
 
 # ── Model loading ─────────────────────────────────────────────────────────────
 
@@ -1132,56 +1161,57 @@ def upload_to_wandb(
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────
+# NOTE: rollout depends on train.py having written meta.json and logged the
+# checkpoint-{exp}:best W&B artifact before this script is run.
 
 def main():
     parser = argparse.ArgumentParser(description="BVC rollout visualization")
     parser.add_argument("--checkpoint",
                         default=None,
-                        help="Local .safetensors checkpoint (not required for --mode raw_gt)")
-    parser.add_argument("--experiment",
-                        default=None,
-                        help="Experiment yaml (not required for --mode raw_gt)")
-    parser.add_argument("--raw-h5",      required=True,
-                        help="Path to original (non-windowed) h5 trajectory")
+                        help="Local checkpoint path (fallback when artifact unavailable)")
+    parser.add_argument("--ckpt-dir",   default=None,
+                        help="Checkpoint directory containing meta.json "
+                             "(derived from --checkpoint parent if omitted)")
+    parser.add_argument("--experiment", default=None,
+                        help="Experiment yaml (auto-derived from meta.json when omitted)")
+    parser.add_argument("--raw-h5",     required=True, nargs="+",
+                        help="One or more h5 trajectory paths (one per test set)")
     parser.add_argument("--mode",
                         choices=["onestep", "autoregressive", "both", "raw_gt"],
                         default="both")
     parser.add_argument("--plot",         action="store_true",
-                        help="Save RMSE vs timestep plot for the current run")
+                        help="Save RMSE vs timestep plot (single test set only)")
     parser.add_argument("--compare-dirs", nargs="+", default=[],
                         metavar="NAME:DIR",
-                        help="Compare multiple experiments. Format: 'label:output_dir' "
-                             "where output_dir contains onestep.pkl / autoregressive.pkl")
-    parser.add_argument("--gif",         action="store_true",
+                        help="Compare experiments. Format: 'label:output_dir'")
+    parser.add_argument("--gif",          action="store_true",
                         help="Render GIF animations")
-    parser.add_argument("--gif-fps",     type=int, default=10)
-    parser.add_argument("--gif-max-frames", type=int, default=200,
-                        help="Cap frames rendered (for speed)")
-    parser.add_argument("--gif-name",    default=None,
-                        help="Custom GIF filename stem (no extension), e.g. 'sc026_ar_100kmh'. "
-                             "Defaults to mode name (onestep / autoregressive / raw_gt).")
+    parser.add_argument("--gif-fps",      type=int, default=10)
+    parser.add_argument("--gif-max-frames", type=int, default=200)
+    parser.add_argument("--gif-name",     default=None,
+                        help="GIF filename stem override (single test set). "
+                             "Ignored when multiple --raw-h5 are given.")
     parser.add_argument("--stats-path",   default=None,
-                        help="Path to training-run global_stats.json. "
-                             "Defaults to <checkpoint_dir>/global_stats.json.")
+                        help="Path to global_stats.json (defaults to <ckpt_dir>/global_stats.json)")
     parser.add_argument("--device",
                         default="cuda" if torch.cuda.is_available() else "cpu")
-    parser.add_argument("--output-dir",  default=None,
+    parser.add_argument("--output-dir",   default=None,
                         help="Override output directory")
     parser.add_argument("--wandb-project", default=None,
-                        help="WandB project name. If set, GIFs are uploaded as Video "
-                             "media and an artifact after rendering.")
+                        help="WandB project override (defaults to meta.json project)")
     parser.add_argument("--wandb-run-name", default=None,
-                        help="WandB run name (defaults to --gif-name or experiment name).")
+                        help="WandB run name override")
+    parser.add_argument("--no-artifact",  action="store_true",
+                        help="Load checkpoint from local disk, skip use_artifact (debugging)")
     args = parser.parse_args()
 
-    tee = _Tee() if args.wandb_project else None
-
-    # ── raw_gt mode: skip model entirely ─────────────────────────────────
+    # ── raw_gt mode: no model, optional GIF upload ────────────────────────
     if args.mode == "raw_gt":
-        raw_data = load_raw_h5(args.raw_h5)
-        h5_stem  = Path(args.raw_h5).parent.name  # use parent folder name as exp label
-        out_dir  = Path(args.output_dir or
-                        PROJECT_ROOT / "outputs" / "rollouts" / h5_stem)
+        h5_path  = args.raw_h5[0]
+        tee      = _Tee() if args.wandb_project else None
+        raw_data = load_raw_h5(h5_path)
+        h5_stem  = Path(h5_path).parent.name
+        out_dir  = Path(args.output_dir or PROJECT_ROOT / "outputs" / "rollouts" / h5_stem)
         out_dir.mkdir(parents=True, exist_ok=True)
 
         if args.gif:
@@ -1202,7 +1232,7 @@ def main():
                     project=args.wandb_project,
                     run_name=args.wandb_run_name or gif_stem,
                     fps=args.gif_fps,
-                    metadata={"mode": "raw_gt", "h5": args.raw_h5},
+                    metadata={"mode": "raw_gt", "h5": h5_path},
                     gif_paths=[gif_path],
                     log_text=log_text,
                 )
@@ -1212,145 +1242,250 @@ def main():
                 tee.restore()
         return
 
-    # ── Model-based modes (onestep / autoregressive / both) ───────────────
-    if args.checkpoint is None or args.experiment is None:
-        parser.error("--checkpoint and --experiment are required for modes: "
-                     "onestep, autoregressive, both")
+    # ── Model-based modes ─────────────────────────────────────────────────
+
+    # Resolve checkpoint directory (needed for meta.json and stats)
+    ckpt_dir: Path | None = (
+        Path(args.ckpt_dir) if args.ckpt_dir
+        else Path(args.checkpoint).parent if args.checkpoint
+        else None
+    )
+
+    # ── W&B: init with group + use_artifact for checkpoint lineage ────────
+    wandb_run       = None
+    artifact_ckpt_dir: Path | None = None
+    exp_meta: dict | None = None
+
+    if _WANDB and ckpt_dir and not args.no_artifact:
+        try:
+            exp_meta = load_meta(ckpt_dir)
+        except FileNotFoundError as e:
+            print(f"[W&B] {e}")
+
+        if exp_meta is not None:
+            exp     = exp_meta["experiment"]
+            project = args.wandb_project or exp_meta["project"]
+            wandb_run = wandb.init(
+                project=project,
+                group=exp_meta["group"],
+                job_type="rollout",
+                name=args.wandb_run_name or f"rollout_{exp}_best",
+                config={"experiment": exp, "checkpoint": "best"},
+            )
+            # use_artifact builds the train→checkpoint→rollout lineage in W&B
+            try:
+                ckpt_artifact = wandb_run.use_artifact(f"checkpoint-{exp}:best")
+                artifact_ckpt_dir = Path(ckpt_artifact.download())
+                print(f"[W&B] Downloaded checkpoint-{exp}:best → {artifact_ckpt_dir}")
+            except Exception as e:
+                print(f"[W&B] Warning: artifact download failed ({e}); falling back to local disk")
+
+    # ── Resolve weights path and experiment config ─────────────────────────
+    if artifact_ckpt_dir:
+        weights_path    = _find_weights_file(artifact_ckpt_dir)
+        experiment_path = args.experiment or str(
+            PROJECT_ROOT / "configs" / "experiments" / f"{exp_meta['experiment']}.yaml"
+        )
+    else:
+        if args.checkpoint:
+            weights_path = Path(args.checkpoint)
+        elif ckpt_dir:
+            weights_path = _find_weights_file(ckpt_dir)
+        else:
+            parser.error("--checkpoint or --ckpt-dir is required for model modes "
+                         "when wandb artifact is unavailable")
+        experiment_path = args.experiment
+        if experiment_path is None and exp_meta:
+            experiment_path = str(
+                PROJECT_ROOT / "configs" / "experiments" / f"{exp_meta['experiment']}.yaml"
+            )
+        if experiment_path is None:
+            parser.error("--experiment is required (or provide --ckpt-dir with meta.json)")
 
     device     = torch.device(args.device)
-    model, cfg = load_model(args.checkpoint, args.experiment, device)
+    model, cfg = load_model(str(weights_path), experiment_path, device)
     exp_name   = cfg["name"]
 
-    # ── INPUT_FRAMES from config (must match training) ────────────────────
     global INPUT_FRAMES
     INPUT_FRAMES = int(cfg["data"].get("input_frames", INPUT_FRAMES))
     print(f"[Rollout] INPUT_FRAMES = {INPUT_FRAMES} (from config)")
 
-    out_dir = Path(args.output_dir or
-                   PROJECT_ROOT / "outputs" / "rollouts" / exp_name)
+    out_dir = Path(args.output_dir or PROJECT_ROOT / "outputs" / "rollouts" / exp_name)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    # ── Load data ─────────────────────────────────────────────────────────
-    use_node_type    = bool(cfg["data"].get("node_type", False))
-    node_type_field  = cfg["data"].get("node_type_field", None) if use_node_type else None
-    raw_data = load_raw_h5(args.raw_h5, node_type_field=node_type_field)
-    node_type = (
-        torch.from_numpy(raw_data["node_type"]).to(device) if use_node_type else None
-    )
+    # ── Shared setup (norm stats, node type) ──────────────────────────────
+    use_node_type   = bool(cfg["data"].get("node_type", False))
+    node_type_field = cfg["data"].get("node_type_field", None) if use_node_type else None
 
     stats_path = (
-        Path(args.stats_path)
-        if args.stats_path
-        else Path(args.checkpoint).parent / "global_stats.json"
+        Path(args.stats_path) if args.stats_path
+        else ckpt_dir / "global_stats.json" if ckpt_dir
+        else weights_path.parent / "global_stats.json"
     )
-    norm_stats = NormStats.from_global_stats(
-        stats_path,
-        acc_scale=cfg["data"].get("acc_scale"),
-    )
-    normed = normalize_raw(raw_data, norm_stats)
+    norm_stats = NormStats.from_global_stats(stats_path, acc_scale=cfg["data"].get("acc_scale"))
 
-    # ── Baseline (dt=1, per-frame; same forward-Euler convention) ─────────
-    baseline = compute_baseline(raw_data, dt=DT, input_frames=INPUT_FRAMES)
+    # ── W&B Table (one per run, all test sets and modes) ──────────────────
+    table: "wandb.Table | None" = None
+    if wandb_run:
+        table = wandb.Table(columns=[
+            "test_set", "traj_id", "mode",
+            "pos_rmse_mm", "vel_rmse_mm_dt", "acc_rmse_mm_dt2",
+            "weight_kg", "speed_kmh", "angle_deg", "concrete_type",
+            "gif",
+        ])
 
-    # ── Run inference ─────────────────────────────────────────────────────
-    onestep = autoreg = None
+    mse_by_ts: dict[str, list[float]] = {}
+    all_pos_rmse: list[float] = []
 
-    t0 = time.time()
+    # Track last results for --plot (single-test-set use)
+    last_onestep = last_autoreg = last_baseline = None
 
-    if args.mode in ("onestep", "both"):
-        onestep = run_onestep(model, raw_data, normed, norm_stats, device, node_type)
-        pkl_path = out_dir / "onestep.pkl"
-        with open(pkl_path, "wb") as f:
-            pickle.dump(onestep, f)
-        print(f"[Rollout] PKL saved → {pkl_path}")
-
-    if args.mode in ("autoregressive", "both"):
-        autoreg = run_autoregressive(model, raw_data, normed, norm_stats, device, node_type)
-        pkl_path = out_dir / "autoregressive.pkl"
-        with open(pkl_path, "wb") as f:
-            pickle.dump(autoreg, f)
-        print(f"[Rollout] PKL saved → {pkl_path}")
-
-    print(f"[Rollout] Inference done in {time.time() - t0:.1f}s")
-
-    # ── GIF ───────────────────────────────────────────────────────────────
     _DPI = 120
-    if args.gif:
-        if onestep is not None:
-            gif_stem = args.gif_name or "onestep"
-            render_vis(
-                onestep, raw_data,
-                out_path          = str(out_dir / f"{gif_stem}.gif"),
-                fps               = args.gif_fps,
-                max_frames        = args.gif_max_frames,
-                dpi               = _DPI,
-                group_config_path = "configs/data/required_parts.config",
-                save_png_dir      = str(out_dir / f"{gif_stem}_pngs"),
-            )
-        if autoreg is not None:
-            # if both modes run and no custom name, suffix to distinguish them
-            if args.gif_name and args.mode == "both":
-                gif_stem = f"{args.gif_name}_ar"
-            elif args.gif_name:
-                gif_stem = args.gif_name
-            else:
-                gif_stem = "autoregressive"
-            render_vis(
-                autoreg, raw_data,
-                out_path          = str(out_dir / f"{gif_stem}.gif"),
-                fps               = args.gif_fps,
-                max_frames        = args.gif_max_frames,
-                dpi               = _DPI,
-                group_config_path = "configs/data/required_parts.config",
-                save_png_dir      = str(out_dir / f"{gif_stem}_pngs"),
-            )
 
-    # ── Summary ───────────────────────────────────────────────────────────
-    print_summary(onestep, autoreg, baseline)
+    # ── Per-test-set loop ─────────────────────────────────────────────────
+    for h5_path in args.raw_h5:
+        ts_name = Path(h5_path).parent.name
+        multi   = len(args.raw_h5) > 1
+        print(f"\n[Rollout] === Test set: {ts_name} ===")
 
-    # ── WandB upload (GIFs + console log + RMSE metrics) ─────────────────────
-    if args.wandb_project:
-        log_text = tee.restore() if tee else None
+        # Extract condition metadata for table columns
+        try:
+            raw_conds = parse_conditions(None, ts_name)
+            speed_kmh = float(raw_conds["speed"])
+            weight_kg = float(raw_conds["mass"])
+            angle_deg = float(raw_conds["angle"])
+        except Exception:
+            speed_kmh = weight_kg = angle_deg = float("nan")
 
-        gif_name_base = args.gif_name or exp_name
-        gif_paths = []
-        if args.gif:
-            if onestep is not None:
-                gif_paths.append(str(out_dir / f"{gif_name_base}.gif"))
-            if autoreg is not None:
-                ar_stem = f"{gif_name_base}_ar" if args.mode == "both" else gif_name_base
-                gif_paths.append(str(out_dir / f"{ar_stem}.gif"))
-
-        metrics = {}
-        if onestep is not None:
-            metrics["onestep/pos_rmse_mean"]  = float(onestep["rmse_pos"].mean())
-            metrics["onestep/vel_rmse_mean"]  = float(onestep["rmse_vel"].mean())
-            metrics["onestep/acc_rmse_mean"]  = float(onestep["rmse_acc"].mean())
-            metrics["onestep/pos_rmse_final"] = float(onestep["rmse_pos"][-1])
-        if autoreg is not None:
-            metrics["autoreg/pos_rmse_mean"]  = float(autoreg["rmse_pos"].mean())
-            metrics["autoreg/vel_rmse_mean"]  = float(autoreg["rmse_vel"].mean())
-            metrics["autoreg/acc_rmse_mean"]  = float(autoreg["rmse_acc"].mean())
-            metrics["autoreg/pos_rmse_final"] = float(autoreg["rmse_pos"][-1])
-
-        upload_to_wandb(
-            project=args.wandb_project,
-            run_name=args.wandb_run_name or gif_name_base,
-            fps=args.gif_fps,
-            metadata={
-                "mode":       args.mode,
-                "checkpoint": args.checkpoint,
-                "h5":         args.raw_h5,
-                "exp_name":   exp_name,
-            },
-            gif_paths=gif_paths,
-            log_text=log_text,
-            metrics=metrics,
+        raw_data  = load_raw_h5(h5_path, node_type_field=node_type_field)
+        node_type = (
+            torch.from_numpy(raw_data["node_type"]).to(device) if use_node_type else None
         )
+        normed   = normalize_raw(raw_data, norm_stats)
+        baseline = compute_baseline(raw_data, dt=DT, input_frames=INPUT_FRAMES)
 
-    # ── RMSE plot ─────────────────────────────────────────────────────────
-    if args.plot:
-        plot_rmse_vs_timestep(onestep, autoreg, out_dir)
+        # ── Inference ─────────────────────────────────────────────────────
+        onestep = autoreg = None
+        t0 = time.time()
+
+        pkl_stem = f"{ts_name}_" if multi else ""
+
+        if args.mode in ("onestep", "both"):
+            onestep = run_onestep(model, raw_data, normed, norm_stats, device, node_type)
+            pkl_path = out_dir / f"{pkl_stem}onestep.pkl"
+            with open(pkl_path, "wb") as f:
+                pickle.dump(onestep, f)
+            print(f"[Rollout] PKL saved → {pkl_path}")
+
+        if args.mode in ("autoregressive", "both"):
+            autoreg = run_autoregressive(model, raw_data, normed, norm_stats, device, node_type)
+            pkl_path = out_dir / f"{pkl_stem}autoregressive.pkl"
+            with open(pkl_path, "wb") as f:
+                pickle.dump(autoreg, f)
+            print(f"[Rollout] PKL saved → {pkl_path}")
+
+        print(f"[Rollout] Inference done in {time.time() - t0:.1f}s")
+
+        # ── GIF rendering ─────────────────────────────────────────────────
+        gif_paths: dict[str, str] = {}
+        if args.gif:
+            base_stem = (args.gif_name if not multi else None) or ts_name
+
+            if onestep is not None:
+                gif_stem = base_stem if args.mode != "both" else f"{base_stem}_os"
+                gif_path = str(out_dir / f"{gif_stem}.gif")
+                render_vis(
+                    onestep, raw_data,
+                    out_path          = gif_path,
+                    fps               = args.gif_fps,
+                    max_frames        = args.gif_max_frames,
+                    dpi               = _DPI,
+                    group_config_path = "configs/data/required_parts.config",
+                    save_png_dir      = str(out_dir / f"{gif_stem}_pngs"),
+                )
+                gif_paths["os"] = gif_path
+
+            if autoreg is not None:
+                gif_stem = base_stem if args.mode != "both" else f"{base_stem}_ar"
+                gif_path = str(out_dir / f"{gif_stem}.gif")
+                render_vis(
+                    autoreg, raw_data,
+                    out_path          = gif_path,
+                    fps               = args.gif_fps,
+                    max_frames        = args.gif_max_frames,
+                    dpi               = _DPI,
+                    group_config_path = "configs/data/required_parts.config",
+                    save_png_dir      = str(out_dir / f"{gif_stem}_pngs"),
+                )
+                gif_paths["ar"] = gif_path
+
+        print_summary(onestep, autoreg, baseline)
+
+        # ── Add rows to W&B Table ─────────────────────────────────────────
+        if table is not None:
+            def _video(key):
+                p = gif_paths.get(key)
+                return wandb.Video(p, fps=args.gif_fps, format="gif") if p else None
+
+            if onestep is not None:
+                pos_rmse_os = float(onestep["rmse_pos"].mean())
+                table.add_data(
+                    ts_name, ts_name, "os",
+                    pos_rmse_os,
+                    float(onestep["rmse_vel"].mean()),
+                    float(onestep["rmse_acc"].mean()),
+                    weight_kg, speed_kmh, angle_deg, "N",
+                    _video("os"),
+                )
+                mse_by_ts.setdefault(ts_name, []).append(pos_rmse_os)
+                all_pos_rmse.append(pos_rmse_os)
+
+            if autoreg is not None:
+                pos_rmse_ar = float(autoreg["rmse_pos"].mean())
+                table.add_data(
+                    ts_name, ts_name, "ar",
+                    pos_rmse_ar,
+                    float(autoreg["rmse_vel"].mean()),
+                    float(autoreg["rmse_acc"].mean()),
+                    weight_kg, speed_kmh, angle_deg, "N",
+                    _video("ar"),
+                )
+                mse_by_ts.setdefault(ts_name, []).append(pos_rmse_ar)
+                all_pos_rmse.append(pos_rmse_ar)
+
+            # Zero-acceleration baseline rows (no GIF)
+            table.add_data(
+                ts_name, ts_name, "zero_os",
+                float(baseline["rmse_pos_onestep"].mean()),
+                float(baseline["rmse_vel_onestep"].mean()),
+                float(baseline["rmse_acc_onestep"].mean()),
+                weight_kg, speed_kmh, angle_deg, "N", None,
+            )
+            table.add_data(
+                ts_name, ts_name, "zero_ar",
+                float(baseline["rmse_pos_rollout"].mean()),
+                float(baseline["rmse_vel_rollout"].mean()),
+                float(baseline["rmse_acc_rollout"].mean()),
+                weight_kg, speed_kmh, angle_deg, "N", None,
+            )
+
+        last_onestep = onestep
+        last_autoreg = autoreg
+        last_baseline = baseline
+
+    # ── Log Table + summary to W&B ────────────────────────────────────────
+    if wandb_run:
+        wandb_run.log({"rollout_results": table})
+        for ts_name, rmse_vals in mse_by_ts.items():
+            wandb_run.summary[f"mean_mse/{ts_name}"] = float(np.mean(rmse_vals))
+        if all_pos_rmse:
+            wandb_run.summary["mean_mse_overall"] = float(np.mean(all_pos_rmse))
+        wandb_run.finish()
+        print("[W&B] Rollout run finished")
+
+    # ── RMSE plot (single test set only) ──────────────────────────────────
+    if args.plot and len(args.raw_h5) == 1:
+        plot_rmse_vs_timestep(last_onestep, last_autoreg, out_dir)
 
     # ── Multi-experiment comparison plot ──────────────────────────────────
     if args.compare_dirs:

@@ -34,6 +34,7 @@ BARRIER_PARAMS: dict[float, dict[str, float]] = {
     -15.0: {"x_intercept": 4078.004},
 }
 _DEFAULT_BARRIER_DEG: float = -25.4
+_DEFAULT_PROJECT: str = "barrier-vehicle-collision"
 
 
 def parse_dir_entry(entry: str) -> tuple[str, float]:
@@ -156,18 +157,31 @@ def load_config(experiment_path: str) -> dict:
 
 # ── W&B setup ─────────────────────────────────────────────────────────────────
 
-def setup_wandb(cfg: dict, git_commit: str):
+def _write_meta_json(save_dir: Path, cfg: dict) -> dict:
+    """Write meta.json to checkpoint dir for train→rollout group linkage; return the meta dict."""
+    wandb_cfg = cfg.get("wandb", {})
+    project = wandb_cfg.get("project") or os.environ.get("WANDB_PROJECT", _DEFAULT_PROJECT)
+    meta = {
+        "group":      cfg["name"],
+        "project":    project,
+        "experiment": cfg["name"],
+    }
+    (save_dir / "meta.json").write_text(json.dumps(meta, indent=2))
+    return meta
+
+
+def setup_wandb(cfg: dict, git_commit: str, meta: dict):
     """Initialise W&B run. Returns run or None if disabled."""
     wandb_cfg = cfg.get("wandb", {})
     if not _WANDB_AVAILABLE or not wandb_cfg.get("log", True):
         return None
 
-    project = wandb_cfg.get("project") or os.environ.get("WANDB_PROJECT", "my-project")
     return wandb.init(
-        project=project,
-        name=cfg["name"],
+        project=meta["project"],
+        group=meta["group"],
+        job_type="train",
+        name="train",
         config={**cfg, "git_commit": git_commit},
-        reinit=True,
     )
 
 
@@ -189,38 +203,46 @@ def _save_checkpoint(model: torch.nn.Module, path: Path, metadata: dict | None =
 
 # ── W&B Artifact upload ───────────────────────────────────────────────────────
 
-def upload_artifact(cfg: dict, run, git_commit: str, val_loss: float):
-    """Upload best checkpoint + config to W&B Artifacts."""
+def _log_best_artifact(
+    run,
+    meta: dict,
+    save_dir: Path,
+    epoch: int,
+    step: int,
+    val_loss: float,
+    cfg: dict,
+):
+    """Log best checkpoint as W&B artifact with 'best' and 'epoch_N' aliases.
+    No-op when wandb is disabled or unavailable.
+    """
     if run is None:
         return
-
-    model_name = cfg["model"]["name"]
-    artifact   = wandb.Artifact(
-        name=model_name,
-        type="model",
-        metadata={
-            "git_commit":  git_commit,
-            "experiment":  cfg["name"],
-            "val_loss":    val_loss,
-            "description": cfg.get("description", ""),
-            "model_name":  cfg["model"]["name"],
-        },
-    )
-
-    save_dir  = PROJECT_ROOT / "outputs" / "checkpoints" / cfg["name"]
-    best_path = save_dir / "checkpoint-best"
-    for ext in (".safetensors", ".pt"):
-        p = best_path.with_suffix(ext)
-        if p.exists():
-            artifact.add_file(str(p))
-            break
-
-    meta_json = best_path.with_suffix(".json")
-    if meta_json.exists():
-        artifact.add_file(str(meta_json))
-
-    run.log_artifact(artifact)
-    print(f"[Artifact] Uploaded '{model_name}' to W&B Artifacts")
+    try:
+        artifact = wandb.Artifact(
+            name=f"checkpoint-{meta['group']}",
+            type="model",
+            metadata={
+                "epoch":      epoch,
+                "step":       step,
+                "val_loss":   val_loss,
+                "experiment": meta["group"],
+                "lr":         cfg["train"].get("lr"),
+                "batch_size": cfg["train"].get("batch_size"),
+            },
+        )
+        best_path = save_dir / "checkpoint-best"
+        for ext in (".safetensors", ".pt"):
+            p = best_path.with_suffix(ext)
+            if p.exists():
+                artifact.add_file(str(p))
+                break
+        meta_json = best_path.with_suffix(".json")
+        if meta_json.exists():
+            artifact.add_file(str(meta_json))
+        run.log_artifact(artifact, aliases=[f"epoch_{epoch}", "best"])
+        print(f"[Artifact] Uploaded checkpoint-{meta['group']}:best (epoch {epoch})")
+    except Exception as e:
+        print(f"[Artifact] Warning: upload failed — {e}")
 
 def push_forward_step(
     v_window_norm:   torch.Tensor,    # (B, N, T_in, 3)  normalized velocity window
@@ -517,13 +539,15 @@ def train(cfg: dict, git_commit: str = "unknown"):
     # ── Checkpoint state ──────────────────────────────────────────────────
     save_dir      = PROJECT_ROOT / "outputs" / "checkpoints" / cfg["name"]
     save_dir.mkdir(parents=True, exist_ok=True)
+    exp_meta      = _write_meta_json(save_dir, cfg)
     manifest_path = save_dir / "checkpoint_manifest.json"
     ckpt_history  = json.loads(manifest_path.read_text()) if manifest_path.exists() else []
     best_val_loss = min((r["val_loss"] for r in ckpt_history), default=float("inf"))
     keep_top_k    = int(train_cfg.get("keep_top_k", 3))
 
     # ── W&B ──────────────────────────────────────────────────────────────
-    wandb_run = setup_wandb(cfg, git_commit)
+    # rollout.py reads meta.json from the checkpoint dir to join the same group
+    wandb_run = setup_wandb(cfg, git_commit, exp_meta)
 
     val_every = int(train_cfg.get("val_every_epochs", 1))
 
@@ -688,6 +712,7 @@ def train(cfg: dict, git_commit: str = "unknown"):
                     best_val_loss = val_loss
                     _save_checkpoint(model, save_dir / "checkpoint-best", meta_payload)
                     tick = "✓ NEW BEST"
+                    _log_best_artifact(wandb_run, exp_meta, save_dir, epoch + 1, step, val_loss, cfg)
                 else:
                     tick = ""
 
@@ -725,10 +750,7 @@ def main():
     print(f"[Config] Loaded experiment: {cfg['name']}")
 
     try:
-        best_val_loss = train(cfg, git_commit)
-        wandb_run = wandb.run if _WANDB_AVAILABLE else None
-        if wandb_run:
-            upload_artifact(cfg, wandb_run, git_commit, best_val_loss)
+        train(cfg, git_commit)
     finally:
         if _WANDB_AVAILABLE and wandb.run is not None:
             wandb.finish()
