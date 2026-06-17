@@ -1,5 +1,5 @@
 #!/bin/bash
-#rj queue=curtin_ciraee features=a100 priority=550 runtime=0.5 mem=64g logdir=logs name=rollout_80km_val
+#rj queue=curtin_ciraee features=a100 priority=550 runtime=1 mem=64g logdir=logs name=rollout_t_lok
 
 set -euo pipefail
 echo "Running on $(hostname), TMPDIR=$TMPDIR"
@@ -12,12 +12,48 @@ python -c "import torch; print(torch.cuda.is_available(), torch.cuda.get_device_
 
 cd /data/curtin_ciraee/curtin_xiangrui/xrkong/collider
 
+# validation
 python src/rollout.py \
     --checkpoint outputs/checkpoints/dg003/checkpoint-best.safetensors \
     --experiment configs/experiments/dg003.yaml \
     --raw-h5 /data/curtin_ciraee/curtin_xiangrui/data/h5dt_50ns_5fs_mat/T_lok_F_shape_barrier_9_3_80km_plus400kg/output.h5 \
     --mode both \
     --gif --gif-fps 10 \
-    --gif-name dg003_80kph_plus400kg
+    --gif-name dg003_80kph_plus400kg \
+    --wandb-project barrier-vehicle-collision \
+    --wandb-run-name dg003_80kph_plus400kg
+
+# training
+python src/rollout.py \
+    --checkpoint outputs/checkpoints/dg003/checkpoint-best.safetensors \
+    --experiment configs/experiments/dg003.yaml \
+    --raw-h5 /data/curtin_ciraee/curtin_xiangrui/data/h5dt_50ns_5fs_mat/T_lok_F_shape_barrier_9_3_80km/output.h5 \
+    --mode both \
+    --gif --gif-fps 10 \
+    --gif-name dg003_80kph \
+    --wandb-project barrier-vehicle-collision \
+    --wandb-run-name dg003_80kph
+
+# training slowest case
+python src/rollout.py \
+    --checkpoint outputs/checkpoints/dg003/checkpoint-best.safetensors \
+    --experiment configs/experiments/dg003.yaml \
+    --raw-h5 /data/curtin_ciraee/curtin_xiangrui/data/h5dt_50ns_5fs_mat/T_lok_F_shape_barrier_9_3_60km/output.h5 \
+    --mode both \
+    --gif --gif-fps 10 \
+    --gif-name dg003_60kph \
+    --wandb-project barrier-vehicle-collision \
+    --wandb-run-name dg003_60kph
+
+# training fastest case
+python src/rollout.py \
+    --checkpoint outputs/checkpoints/dg003/checkpoint-best.safetensors \
+    --experiment configs/experiments/dg003.yaml \
+    --raw-h5 /data/curtin_ciraee/curtin_xiangrui/data/h5dt_50ns_5fs_mat/T_lok_F_shape_barrier_9_3_100km_plus800kg/output.h5 \
+    --mode both \
+    --gif --gif-fps 10 \
+    --gif-name dg003_100kph_plus800kg \
+    --wandb-project barrier-vehicle-collision \
+    --wandb-run-name dg003_100kph_plus800kg
 
 echo "Done."

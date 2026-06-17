@@ -45,6 +45,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import io
 import json
 import pickle
 import sys
@@ -89,6 +90,13 @@ try:
     _SAFETENSORS = True
 except ImportError:
     _SAFETENSORS = False
+
+try:
+    import wandb
+    _WANDB = True
+except ImportError:
+    _WANDB = False
+    print("Warning: wandb not installed — GIF upload will be skipped")
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 # INPUT_FRAMES is overridden from cfg["data"]["input_frames"] in main().
@@ -498,7 +506,7 @@ def compute_baseline(raw_data: dict, dt: float, input_frames: int) -> dict:
 # ── RMSE plot ────────────────────────────────────────────────────────────────
 
 _RCPARAMS = {
-    "font.family":     "Times New Roman",
+    "font.family":     "DejaVu Serif",
     "font.size":       11,
     "axes.titlesize":  12,
     "axes.labelsize":  11,
@@ -532,7 +540,7 @@ def plot_rmse_vs_timestep(onestep: dict | None, autoreg: dict | None, out_dir: P
     col_data = [onestep, autoreg]
 
     fig, axs = plt.subplots(3, 2, figsize=(12, 10), constrained_layout=True)
-    fig.suptitle("Rollout RMSE vs Timestep", fontsize=13, fontfamily="Times New Roman")
+    fig.suptitle("Rollout RMSE vs Timestep", fontsize=13, fontfamily="DejaVu Serif")
 
     for row, (feat, unit, scale, rkey) in enumerate(
             zip(_FEAT_NAMES, _FEAT_UNITS, _FEAT_SCALES, _RMSE_KEYS)):
@@ -576,7 +584,7 @@ def plot_multi_rmse(
 
     fig, axs = plt.subplots(3, 2, figsize=(12, 10), constrained_layout=True)
     fig.suptitle("RMSE vs Timestep — Multi-Experiment Comparison",
-                 fontsize=13, fontfamily="Times New Roman")
+                 fontsize=13, fontfamily="DejaVu Serif")
 
     for row, (feat, unit, scale, rkey) in enumerate(
             zip(_FEAT_NAMES, _FEAT_UNITS, _FEAT_SCALES, _RMSE_KEYS)):
@@ -754,7 +762,7 @@ def render_vis(
     z_range = (-500, 4000)
 
     # Visual Setup
-    plt.rcParams['font.family'] = 'Times New Roman'
+    plt.rcParams['font.family'] = 'DejaVu Serif'
     plt.rcParams['font.size']   = 12
 
     # 按各行的数据纵向跨度分配行高,使 equal-aspect 下各行填满格子、消除空白
@@ -912,7 +920,7 @@ def render_gt_only(
     y_range = (-10000,  8000)
     z_range =   (-500,  4000)
 
-    plt.rcParams['font.family'] = 'Times New Roman'
+    plt.rcParams['font.family'] = 'DejaVu Serif'
     plt.rcParams['font.size']   = 12
 
     x_span = x_range[1] - x_range[0]
@@ -1040,6 +1048,95 @@ def print_summary(onestep: dict | None, autoreg: dict | None, baseline: dict):
     print("=" * 72)
 
 
+# ── WandB upload ──────────────────────────────────────────────────────────────
+
+class _Tee:
+    """Duplicate writes to both the real stdout and an internal StringIO buffer."""
+    def __init__(self):
+        self._real = sys.stdout
+        self._buf  = io.StringIO()
+        sys.stdout = self
+
+    def write(self, s: str):
+        self._real.write(s)
+        self._buf.write(s)
+
+    def flush(self):
+        self._real.flush()
+
+    def restore(self) -> str:
+        sys.stdout = self._real
+        return self._buf.getvalue()
+
+
+def upload_to_wandb(
+    project:   str,
+    run_name:  str,
+    fps:       int,
+    metadata:  dict | None = None,
+    gif_paths: list[str] | None = None,
+    log_text:  str | None = None,
+    metrics:   dict | None = None,
+):
+    """Upload GIFs, console log, and RMSE metrics to a single WandB run.
+
+    - GIFs appear in the Media panel (viewable in-browser) and as a versioned
+      artifact (shareable download URL).
+    - Console log is saved as rollout.log inside the same artifact and rendered
+      as HTML in the run's Media panel.
+    - RMSE summary values are logged as run summary metrics.
+    """
+    if not _WANDB:
+        print("[WandB] wandb not installed — skipping upload")
+        return
+
+    run = wandb.init(
+        project=project,
+        name=run_name,
+        job_type="rollout",
+        config=metadata or {},
+    )
+
+    artifact = wandb.Artifact(name=run_name, type="rollout")
+
+    # ── GIFs ──────────────────────────────────────────────────────────────
+    existing_gifs = [p for p in (gif_paths or []) if Path(p).exists()]
+    media_dict = {}
+    for gif_path in existing_gifs:
+        key = f"gif/{Path(gif_path).stem}"
+        media_dict[key] = wandb.Video(gif_path, fps=fps, format="gif")
+        artifact.add_file(gif_path)
+
+    # ── Console log ───────────────────────────────────────────────────────
+    if log_text:
+        log_path = Path(wandb.run.dir) / "rollout.log"
+        log_path.write_text(log_text)
+        artifact.add_file(str(log_path), name="rollout.log")
+        # Render as HTML so it's readable in the Files / Media tab
+        html_body = log_text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+        media_dict["log/console"] = wandb.Html(
+            f"<pre style='font-family:monospace;font-size:12px;white-space:pre-wrap'>"
+            f"{html_body}</pre>"
+        )
+
+    if media_dict:
+        wandb.log(media_dict)
+
+    # ── RMSE summary metrics ──────────────────────────────────────────────
+    if metrics:
+        for key, val in metrics.items():
+            wandb.run.summary[key] = val
+
+    run.log_artifact(artifact)
+
+    run_id     = run.id
+    run_entity = run.entity
+    run.finish()
+
+    print(f"[WandB] Uploaded to project '{project}' run '{run_name}'")
+    print(f"[WandB] View at: https://wandb.ai/{run_entity}/{project}/runs/{run_id}")
+
+
 # ── Entry point ───────────────────────────────────────────────────────────────
 
 def main():
@@ -1076,7 +1173,14 @@ def main():
                         default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--output-dir",  default=None,
                         help="Override output directory")
+    parser.add_argument("--wandb-project", default=None,
+                        help="WandB project name. If set, GIFs are uploaded as Video "
+                             "media and an artifact after rendering.")
+    parser.add_argument("--wandb-run-name", default=None,
+                        help="WandB run name (defaults to --gif-name or experiment name).")
     args = parser.parse_args()
+
+    tee = _Tee() if args.wandb_project else None
 
     # ── raw_gt mode: skip model entirely ─────────────────────────────────
     if args.mode == "raw_gt":
@@ -1088,17 +1192,30 @@ def main():
 
         if args.gif:
             gif_stem = args.gif_name or "raw_gt"
+            gif_path = str(out_dir / f"{gif_stem}.gif")
             render_gt_only(
                 raw_data,
-                out_path          = str(out_dir / f"{gif_stem}.gif"),
+                out_path          = gif_path,
                 fps               = args.gif_fps,
                 max_frames        = args.gif_max_frames,
                 dpi               = 120,
                 group_config_path = "configs/data/required_parts.config",
                 save_png_dir      = str(out_dir / f"{gif_stem}_pngs"),
             )
+            if args.wandb_project:
+                log_text = tee.restore()
+                upload_to_wandb(
+                    project=args.wandb_project,
+                    run_name=args.wandb_run_name or gif_stem,
+                    fps=args.gif_fps,
+                    metadata={"mode": "raw_gt", "h5": args.raw_h5},
+                    gif_paths=[gif_path],
+                    log_text=log_text,
+                )
         else:
             print("[raw_gt] No --gif flag — nothing to do. Add --gif to render.")
+            if tee:
+                tee.restore()
         return
 
     # ── Model-based modes (onestep / autoregressive / both) ───────────────
@@ -1193,6 +1310,46 @@ def main():
                 group_config_path = "configs/data/required_parts.config",
                 save_png_dir      = str(out_dir / f"{gif_stem}_pngs"),
             )
+
+    # ── WandB upload (GIFs + console log + RMSE metrics) ─────────────────────
+    if args.wandb_project:
+        log_text = tee.restore() if tee else None
+
+        gif_name_base = args.gif_name or exp_name
+        gif_paths = []
+        if args.gif:
+            if onestep is not None:
+                gif_paths.append(str(out_dir / f"{gif_name_base}.gif"))
+            if autoreg is not None:
+                ar_stem = f"{gif_name_base}_ar" if args.mode == "both" else gif_name_base
+                gif_paths.append(str(out_dir / f"{ar_stem}.gif"))
+
+        metrics = {}
+        if onestep is not None:
+            metrics["onestep/pos_rmse_mean"]  = float(onestep["rmse_pos"].mean())
+            metrics["onestep/vel_rmse_mean"]  = float(onestep["rmse_vel"].mean())
+            metrics["onestep/acc_rmse_mean"]  = float(onestep["rmse_acc"].mean())
+            metrics["onestep/pos_rmse_final"] = float(onestep["rmse_pos"][-1])
+        if autoreg is not None:
+            metrics["autoreg/pos_rmse_mean"]  = float(autoreg["rmse_pos"].mean())
+            metrics["autoreg/vel_rmse_mean"]  = float(autoreg["rmse_vel"].mean())
+            metrics["autoreg/acc_rmse_mean"]  = float(autoreg["rmse_acc"].mean())
+            metrics["autoreg/pos_rmse_final"] = float(autoreg["rmse_pos"][-1])
+
+        upload_to_wandb(
+            project=args.wandb_project,
+            run_name=args.wandb_run_name or gif_name_base,
+            fps=args.gif_fps,
+            metadata={
+                "mode":       args.mode,
+                "checkpoint": args.checkpoint,
+                "h5":         args.raw_h5,
+                "exp_name":   exp_name,
+            },
+            gif_paths=gif_paths,
+            log_text=log_text,
+            metrics=metrics,
+        )
 
     # ── RMSE plot ─────────────────────────────────────────────────────────
     if args.plot:
