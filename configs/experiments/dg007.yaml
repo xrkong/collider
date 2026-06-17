@@ -1,4 +1,4 @@
-name: "dg006"
+name: "dg007"
 description: "Method A condition encoder: broadcast-concat (speed, mass) onto every node input. 8 train trajs, 1 val traj. Based on dg005 with nnode_in_features bumped from 20 to 22."
 model:
   name: "transolverplus_net"
@@ -20,7 +20,7 @@ overrides:
   train.min_lr: 0.000001
   train.batch_size: 4
   train.accum_steps: 2
-  train.n_epochs: 500
+  train.n_epochs: 20
   train.push_forward_k: 1
   train.noise_std: 0.05
   train.grad_clip: 5.0
@@ -39,16 +39,16 @@ overrides:
   # condition: inherited from params (enabled: [speed, mass], n_cond=2)
 
   data.train_dirs:
-    - "/data/curtin_ciraee/curtin_xiangrui/data/h5dt_50ns_5fs_mat/T_lok_F_shape_barrier_9_3_100km:-25.4"
-    - "/data/curtin_ciraee/curtin_xiangrui/data/h5dt_50ns_5fs_mat/T_lok_F_shape_barrier_9_3_100km_plus400kg:-25.4"
-    - "/data/curtin_ciraee/curtin_xiangrui/data/h5dt_50ns_5fs_mat/T_lok_F_shape_barrier_9_3_100km_plus800kg:-25.4"
-    - "/data/curtin_ciraee/curtin_xiangrui/data/h5dt_50ns_5fs_mat/T_lok_F_shape_barrier_9_3_60km:-25.4"
-    - "/data/curtin_ciraee/curtin_xiangrui/data/h5dt_50ns_5fs_mat/T_lok_F_shape_barrier_9_3_60km_plus400kg:-25.4"
-    - "/data/curtin_ciraee/curtin_xiangrui/data/h5dt_50ns_5fs_mat/T_lok_F_shape_barrier_9_3_60km_plus800kg:-25.4"
-    - "/data/curtin_ciraee/curtin_xiangrui/data/h5dt_50ns_5fs_mat/T_lok_F_shape_barrier_9_3_80km:-25.4"
-    - "/data/curtin_ciraee/curtin_xiangrui/data/h5dt_50ns_5fs_mat/T_lok_F_shape_barrier_9_3_80km_plus800kg:-25.4"
+    - "/data/curtin_ciraee/curtin_xiangrui/data/h5dt_50ns_10fs_mat/T_lok_F_shape_barrier_9_3_100km:-25.4"
+    - "/data/curtin_ciraee/curtin_xiangrui/data/h5dt_50ns_10fs_mat/T_lok_F_shape_barrier_9_3_100km_plus400kg:-25.4"
+    - "/data/curtin_ciraee/curtin_xiangrui/data/h5dt_50ns_10fs_mat/T_lok_F_shape_barrier_9_3_100km_plus800kg:-25.4"
+    - "/data/curtin_ciraee/curtin_xiangrui/data/h5dt_50ns_10fs_mat/T_lok_F_shape_barrier_9_3_60km:-25.4"
+    - "/data/curtin_ciraee/curtin_xiangrui/data/h5dt_50ns_10fs_mat/T_lok_F_shape_barrier_9_3_60km_plus400kg:-25.4"
+    - "/data/curtin_ciraee/curtin_xiangrui/data/h5dt_50ns_10fs_mat/T_lok_F_shape_barrier_9_3_60km_plus800kg:-25.4"
+    - "/data/curtin_ciraee/curtin_xiangrui/data/h5dt_50ns_10fs_mat/T_lok_F_shape_barrier_9_3_80km:-25.4"
+    - "/data/curtin_ciraee/curtin_xiangrui/data/h5dt_50ns_10fs_mat/T_lok_F_shape_barrier_9_3_80km_plus800kg:-25.4"
 
   data.val_dirs:
-    - "/data/curtin_ciraee/curtin_xiangrui/data/h5dt_50ns_5fs_mat/T_lok_F_shape_barrier_9_3_80km_plus400kg:-25.4"
+    - "/data/curtin_ciraee/curtin_xiangrui/data/h5dt_50ns_10fs_mat/T_lok_F_shape_barrier_9_3_80km_plus400kg:-25.4"
 
 notes: "Condition encoder Method A. Delta from dg005: nnode_in_features 20→22, speed+mass broadcast-concat at D6. Verify §5 checklist before full run."

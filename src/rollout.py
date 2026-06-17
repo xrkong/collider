@@ -21,7 +21,7 @@ Usage:
         --raw-h5 /data/curtin_ciraee/curtin_xiangrui/data/h5dt_50ns_5fs_mat/T_lok_F_shape_barrier_9_3_100km/output.h5 \
         --mode both \
         --gif --gif-fps 10 \
-        --gif-name dg001_100kmh
+        --gif-name 100kph
 
     # GT-only GIF — no checkpoint/experiment needed
     python src/rollout.py \
@@ -53,7 +53,7 @@ sys.path.insert(0, str(PROJECT_ROOT))
 import models  # noqa: F401
 from models.registry import build_model
 from src.dataset import NormStats
-from src.conditions import parse_conditions
+from src.conditions import CondConfig, parse_conditions, normalize_conditions
 
 try:
     import h5py
@@ -306,28 +306,35 @@ def compute_sdf_batch(
 
 # ── Inference ─────────────────────────────────────────────────────────────────
 @torch.no_grad()
-def run_onestep(model, raw_data, normed, norm_stats, device, node_type=None) -> dict:
+def run_onestep(model, raw_data, normed, norm_stats, device,
+                node_type=None, cond_t=None) -> dict:
     T      = raw_data["positions"].shape[0]
     T_eval = T - 2          # last 2 frames have padded GT vel/acc (forward diff)
     print(f"[One-step] dt = 1 (per-frame), steps = {T_eval - INPUT_FRAMES}")
 
     normed_v = normed["velocity"]                       # (T, N, 3)
+    N        = normed_v.shape[1]
     pred_pos_list, gt_pos_list, rmse_pos_steps = [], [], []
     rmse_vel_steps, rmse_acc_steps = [], []
     pred_acc_list, gt_acc_list = [], []
     pred_acc_norm_list, gt_acc_norm_list = [], []
 
+    # Method A: broadcast cond once, reuse every step (D3). Empty tensor when n_cond=0.
+    if cond_t is None:
+        cond_t = torch.zeros(0)
+    cond_b = cond_t[None, None, :].expand(1, N, -1).to(device)   # (1, N, n_cond)
+
     for t in range(INPUT_FRAMES, T_eval):
-        x_in        = build_velocity_input(normed_v, t - 1).to(device)
+        x_vel_flat  = build_velocity_input(normed_v, t - 1).to(device)  # (1, N, T_in*3)
 
-        input_pos = raw_data["positions"][t - INPUT_FRAMES + 1: t + 1].transpose(1, 0, 2) # (N,T,3)
+        input_pos = raw_data["positions"][t - INPUT_FRAMES + 1: t + 1].transpose(1, 0, 2)  # (N, T_in, 3)
+        x_sdf = compute_sdf_batch(
+            torch.from_numpy(input_pos[..., 0:2])
+        ).to(device).unsqueeze(0)                                        # (1, N, T_in)
 
-        x_sdf = compute_sdf_batch(torch.from_numpy(input_pos[..., 0:2])).to(device)
+        x_in = torch.cat([x_vel_flat, x_sdf, cond_b], dim=-1)           # (1, N, T_in*4 + n_cond)
 
-        x = torch.cat([x_in, x_sdf.unsqueeze(0) ], dim=-1)
-        # x = x_in
-
-        a_pred_norm = model(x, node_type).squeeze(0)  # (N, 3)
+        a_pred_norm = model(x_in, node_type).squeeze(0)  # (N, 3)
 
         # 上一帧 GT 速度 / 位置 (物理量) — one-step 模式始终用 GT
         v_last = raw_data["velocity"][t - 1]
@@ -380,7 +387,8 @@ def run_onestep(model, raw_data, normed, norm_stats, device, node_type=None) -> 
     }
 
 @torch.no_grad()
-def run_autoregressive(model, raw_data, normed, norm_stats, device, node_type=None) -> dict:
+def run_autoregressive(model, raw_data, normed, norm_stats, device,
+                       node_type=None, cond_t=None) -> dict:
     T      = raw_data["positions"].shape[0]
     T_eval = T - 2          # last 2 frames have padded GT vel/acc (forward diff)
     print(f"[Autoregressive] dt = 1 (per-frame), steps = {T_eval - INPUT_FRAMES}")
@@ -393,22 +401,28 @@ def run_autoregressive(model, raw_data, normed, norm_stats, device, node_type=No
     # ── 初始化 ──
     # 速度窗口 (归一化, 模型输入用)
     v_window_norm = normed["velocity"][:INPUT_FRAMES].copy()       # (5, N, 3)
-    x_window_phys = raw_data["positions"][:INPUT_FRAMES].copy()  
+    x_window_phys = raw_data["positions"][:INPUT_FRAMES].copy()
+    N = v_window_norm.shape[1]
     # 物理速度 / 位置当前状态
     v_phys = raw_data["velocity"][INPUT_FRAMES - 1].copy()         # (N, 3)
     x_phys = raw_data["positions"][INPUT_FRAMES - 1].copy()        # (N, 3)
 
+    # Method A: broadcast cond once, reuse every step (D3). Empty tensor when n_cond=0.
+    if cond_t is None:
+        cond_t = torch.zeros(0)
+    cond_b = cond_t[None, None, :].expand(1, N, -1).to(device)   # (1, N, n_cond)
+
     for t in range(INPUT_FRAMES, T_eval):
-        x_in        = build_velocity_input_from_window(v_window_norm).to(device) # (1,N,T*C)
+        x_vel_flat  = build_velocity_input_from_window(v_window_norm).to(device)  # (1, N, T_in*3)
 
-        # SDF 用滚动窗口,不再读 raw_data
-        x_sdf_in = torch.from_numpy(
-            x_window_phys[..., 0:2].transpose(1, 0, 2)              # (N, 5, 2)
-        ).float()
-        x_sdf = compute_sdf_batch(x_sdf_in).to(device)               # (N, 5)
-        x = torch.cat([x_in, x_sdf.unsqueeze(0)], dim=-1)
+        # SDF uses rolling position window
+        x_sdf = compute_sdf_batch(
+            torch.from_numpy(x_window_phys[..., 0:2].transpose(1, 0, 2)).float()
+        ).to(device).unsqueeze(0)                                                   # (1, N, T_in)
 
-        a_pred_norm = model(x, node_type).squeeze(0)  # (N, 3)
+        x_in = torch.cat([x_vel_flat, x_sdf, cond_b], dim=-1)                     # (1, N, T_in*4 + n_cond)
+
+        a_pred_norm = model(x_in, node_type).squeeze(0)  # (N, 3)
 
         a_phys_new, v_phys_new, x_phys_new = integrate_accel(
             a_pred_norm, v_phys, x_phys, DT, norm_stats)
@@ -1310,6 +1324,9 @@ def main():
     INPUT_FRAMES = int(cfg["data"].get("input_frames", INPUT_FRAMES))
     print(f"[Rollout] INPUT_FRAMES = {INPUT_FRAMES} (from config)")
 
+    cond_cfg = CondConfig(**(cfg.get("condition") or {}))
+    print(f"[Rollout] Condition: enabled={list(cond_cfg.enabled)}, n_cond={cond_cfg.n_cond()}")
+
     out_dir = Path(args.output_dir or PROJECT_ROOT / "outputs" / "rollouts" / exp_name)
     out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -1348,14 +1365,19 @@ def main():
         multi   = len(args.raw_h5) > 1
         print(f"\n[Rollout] === Test set: {ts_name} ===")
 
-        # Extract condition metadata for table columns
+        # Parse conditions from dir name for both the table and model input
         try:
             raw_conds = parse_conditions(None, ts_name)
             speed_kmh = float(raw_conds["speed"])
             weight_kg = float(raw_conds["mass"])
             angle_deg = float(raw_conds["angle"])
-        except Exception:
+            cond_vec  = normalize_conditions(raw_conds, cond_cfg)   # (n_cond,) float32
+            cond_t    = torch.from_numpy(cond_vec).float()          # passed to inference
+            print(f"[Rollout] cond_raw={raw_conds} cond={cond_vec}")
+        except Exception as e:
+            print(f"[Rollout] Warning: condition parse failed for {ts_name}: {e}")
             speed_kmh = weight_kg = angle_deg = float("nan")
+            cond_t = torch.zeros(cond_cfg.n_cond())
 
         raw_data  = load_raw_h5(h5_path, node_type_field=node_type_field)
         node_type = (
@@ -1371,14 +1393,16 @@ def main():
         pkl_stem = f"{ts_name}_" if multi else ""
 
         if args.mode in ("onestep", "both"):
-            onestep = run_onestep(model, raw_data, normed, norm_stats, device, node_type)
+            onestep = run_onestep(model, raw_data, normed, norm_stats, device,
+                                  node_type=node_type, cond_t=cond_t)
             pkl_path = out_dir / f"{pkl_stem}onestep.pkl"
             with open(pkl_path, "wb") as f:
                 pickle.dump(onestep, f)
             print(f"[Rollout] PKL saved → {pkl_path}")
 
         if args.mode in ("autoregressive", "both"):
-            autoreg = run_autoregressive(model, raw_data, normed, norm_stats, device, node_type)
+            autoreg = run_autoregressive(model, raw_data, normed, norm_stats, device,
+                                         node_type=node_type, cond_t=cond_t)
             pkl_path = out_dir / f"{pkl_stem}autoregressive.pkl"
             with open(pkl_path, "wb") as f:
                 pickle.dump(autoreg, f)

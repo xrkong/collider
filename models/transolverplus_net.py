@@ -40,7 +40,7 @@ class TransolverplusNet(nn.Module):
 
     cfg keys used (all under ``model``):
         nnode_in_features, nnode_out_features, hidden_dim, layers,
-        nmlp_layers, num_heads, dropout, mlp_ratio, block_act, slice_num.
+        num_heads, dropout, mlp_ratio, block_act, slice_num.
     """
 
     def __init__(self, cfg):
@@ -51,7 +51,6 @@ class TransolverplusNet(nn.Module):
         nnode_out = m["nnode_out_features"]
         latent    = m["hidden_dim"]
         layers    = m["layers"]
-        nmlp      = m.get("nmlp_layers", 2)
         heads     = m.get("num_heads", 8)
         dropout   = m.get("dropout", 0.0)
         mlp_ratio = m.get("mlp_ratio", 1)

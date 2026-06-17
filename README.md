@@ -110,7 +110,7 @@ install miniconda on head node, then test your script without GPU.
 https://www.anaconda.com/docs/getting-started/miniconda/install/linux-install
 ```
 
-You may start conda by running the following command:
+You may activate conda by running the following command:
 ```bash
 eval "$(/data/curtin_ciraee/curtin_xiangrui/ENTER/bin/conda shell.bash hook)" 
 ```
