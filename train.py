@@ -24,6 +24,51 @@ from models.registry import build_model
 from src.dataset import NormStats, build_dataloader, load_or_compute_global_stats, _DEFAULT_NORM_FIELDS
 from src.utils.metrics import MetricTracker
 
+# ── Barrier plate parameters (README: "Barrier plate projection on xy plate") ─
+# Anchor = (x_intercept, 0): point where the barrier line crosses y = 0.
+# Source: physical measurement table; degrees are impact angles.
+BARRIER_PARAMS: dict[float, dict[str, float]] = {
+    -25.4: {"x_intercept": 2056.579},
+    -20.0: {"x_intercept": 2801.525},
+    -15.0: {"x_intercept": 4078.004},
+}
+_DEFAULT_BARRIER_DEG: float = -25.4
+
+
+def parse_dir_entry(entry: str) -> tuple[str, float]:
+    """Parse '<h5_dir>:<barrier_angle_deg>' or plain '<h5_dir>' → (path, deg).
+
+    The degree must match a key in BARRIER_PARAMS.  Omitting it defaults to
+    _DEFAULT_BARRIER_DEG (-25.4°).  Uses rsplit so Unix paths with colons work.
+    """
+    if ":" in entry:
+        path, deg_str = entry.rsplit(":", 1)
+        try:
+            deg = float(deg_str.strip())
+        except ValueError:
+            raise ValueError(
+                f"Could not parse barrier degree from '{entry}'. "
+                f"Expected '<path>:<float>', e.g. '/data/foo:-25.4'"
+            )
+        return path.strip(), deg
+    return entry.strip(), _DEFAULT_BARRIER_DEG
+
+
+def _parse_dirs(raw: list[str]) -> tuple[list[str], list[float]]:
+    """Return (clean_paths, barrier_degs) from a list of '<path>[:<deg>]' entries."""
+    paths, degs = [], []
+    for entry in raw:
+        p, deg = parse_dir_entry(entry)
+        if deg not in BARRIER_PARAMS:
+            raise ValueError(
+                f"Barrier angle {deg}° not in BARRIER_PARAMS. "
+                f"Known: {sorted(BARRIER_PARAMS.keys())}. "
+                f"Add it to BARRIER_PARAMS in train.py if it's a new simulation setup."
+            )
+        paths.append(p)
+        degs.append(deg)
+    return paths, degs
+
 try:
     import wandb
     _WANDB_AVAILABLE = True
@@ -207,13 +252,15 @@ def push_forward_step(
 
 
 def build_sdf_window(
-    pos_window: torch.Tensor,    # (B, N, T_in, 3)  physical positions
+    pos_window:       torch.Tensor,  # (B, N, T_in, 3)  physical positions
+    barrier_angle_deg: float = _DEFAULT_BARRIER_DEG,
+    x_intercept:       float = BARRIER_PARAMS[_DEFAULT_BARRIER_DEG]["x_intercept"],
 ) -> torch.Tensor:
     """Compute SDF for every frame in the position window.
-    
+
     Returns: (B, N, T_in)  SDF per node per frame
     """
-    return compute_sdf_batch(pos_window[..., :2])  
+    return compute_sdf_batch(pos_window[..., :2], barrier_angle_deg, x_intercept)
 
 
 # ── Loss functions ────────────────────────────────────────────────────────────
@@ -245,28 +292,26 @@ def compute_loss(pred: torch.Tensor, target: torch.Tensor) -> tuple[torch.Tensor
 
 
 
-def compute_sdf_batch(xy: torch.Tensor, 
-                    barrier_angle_deg: float=-25.4, 
-                    barrier_anchor: Optional[torch.Tensor] = None) -> torch.Tensor:
-    """
-    sdf: signed distance field
-    car_points: (B, N, 2) 整个 Batch 的车辆点云，必须已经在 GPU 上
-    barrier_angle_deg: 护栏角度 (标量) impace degree -25.4
-    barrier_anchor: (2,) 护栏基准点，必须在 GPU 上 xy=(0,2000)
-    """
-    device = xy.device
-    if barrier_anchor is None:
-        barrier_anchor = torch.tensor([0.0, 2000.0], device=device)
-    else:
-        barrier_anchor = barrier_anchor.to(device)
+def compute_sdf_batch(
+    xy:                torch.Tensor,
+    barrier_angle_deg: float = _DEFAULT_BARRIER_DEG,
+    x_intercept:       float = BARRIER_PARAMS[_DEFAULT_BARRIER_DEG]["x_intercept"],
+) -> torch.Tensor:
+    """Signed distance (metres) from each point to the barrier line.
 
+    xy: (..., 2)  XY positions in mm, any leading batch dims
+    barrier_angle_deg: impact angle in degrees (see BARRIER_PARAMS)
+    x_intercept: x-coordinate (mm) where the barrier line crosses y = 0
+                 — use BARRIER_PARAMS[deg]["x_intercept"] for each simulation.
+    """
+    device    = xy.device
+    anchor    = torch.tensor([x_intercept, 0.0], device=device)
     angle_rad = torch.deg2rad(torch.tensor(barrier_angle_deg, device=device))
-    normal_2d = torch.tensor([-torch.sin(angle_rad), torch.cos(angle_rad)], device=device)
-    
-    diff_2d = xy - barrier_anchor[:2]
-    distances = (diff_2d * normal_2d).sum(dim=-1)
-    
-    return distances / 1000.0  
+    normal_2d = torch.tensor(
+        [-torch.sin(angle_rad), torch.cos(angle_rad)], device=device
+    )
+    diff_2d   = xy - anchor
+    return (diff_2d * normal_2d).sum(dim=-1) / 1000.0
 
 
 # ── Validation loop ───────────────────────────────────────────────────────────
@@ -278,13 +323,16 @@ def run_validation(model, val_loader, device, use_node_type: bool = False) -> di
         x_vel      = batch[0].to(device)
         future_acc = batch[1].to(device)
         input_pos  = batch[2].to(device)
-        node_type  = batch[5].to(device) if use_node_type else None
+        # batch[5]=barrier_angle_deg, batch[6]=x_intercept, batch[7]=node_type
+        barrier_angle_deg = float(batch[5][0].item())
+        x_intercept       = float(batch[6][0].item())
+        node_type = batch[7].to(device) if use_node_type else None
 
         # Validation: one-step only (k=0)
         B, N, _ = x_vel.shape
         T_in    = input_pos.shape[2]
 
-        x_sdf = compute_sdf_batch(input_pos[..., :2])   # (B, N, T_in)
+        x_sdf = compute_sdf_batch(input_pos[..., :2], barrier_angle_deg, x_intercept)
         x_in  = torch.cat([x_vel, x_sdf], dim=-1)
         # x_in = x_vel  # ablation: no SDF
 
@@ -339,8 +387,15 @@ def train(cfg: dict, git_commit: str = "unknown"):
     )
 
     # ── Data ──────────────────────────────────────────────────────────────
-    train_dirs = data_cfg["train_dirs"]
-    val_dirs   = data_cfg["val_dirs"]
+    # Parse '<path>[:<barrier_angle_deg>]' entries; degree defaults to -25.4°
+    train_dirs, train_degs = _parse_dirs(data_cfg["train_dirs"])
+    val_dirs,   val_degs   = _parse_dirs(data_cfg["val_dirs"])
+
+    # Log barrier params for this run
+    unique_degs = sorted(set(train_degs + val_degs))
+    for deg in unique_degs:
+        xi = BARRIER_PARAMS[deg]["x_intercept"]
+        print(f"[Train] Barrier angle {deg:+.1f}°  x-intercept = {xi:.3f} mm")
 
     # Fail fast if train and val dirs overlap
     train_resolved = {str(Path(d).resolve()) for d in train_dirs}
@@ -358,18 +413,30 @@ def train(cfg: dict, git_commit: str = "unknown"):
         fields      = norm_fields,
     )
 
+    # Build per-trajectory barrier param dicts for the dataset
+    train_barrier = [
+        {"barrier_angle_deg": d, "x_intercept": BARRIER_PARAMS[d]["x_intercept"]}
+        for d in train_degs
+    ]
+    val_barrier = [
+        {"barrier_angle_deg": d, "x_intercept": BARRIER_PARAMS[d]["x_intercept"]}
+        for d in val_degs
+    ]
+
     # Both loaders share the same train stats (critical: val must NOT use its own stats)
     train_loader = build_dataloader(
         cfg, train_dirs,
-        shuffle    = True,
-        batch_size = train_cfg.get("batch_size", 1),
-        stats      = train_stats,
+        shuffle          = True,
+        batch_size       = train_cfg.get("batch_size", 1),
+        stats            = train_stats,
+        barrier_params   = train_barrier,
     )
     val_loader = build_dataloader(
         cfg, val_dirs,
-        shuffle    = False,
-        batch_size = train_cfg.get("val_batch_size", 1),
-        stats      = train_stats,
+        shuffle          = False,
+        batch_size       = train_cfg.get("val_batch_size", 1),
+        stats            = train_stats,
+        barrier_params   = val_barrier,
     )
 
     # ── Push-forward & noise config ──────────────────────────────────────
@@ -456,19 +523,23 @@ def train(cfg: dict, git_commit: str = "unknown"):
             pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{n_epochs}", unit="batch",
                         dynamic_ncols=True, leave=True)
             for batch_idx, batch in enumerate(pbar):
-                # ── Unpack batch (5 or 6 tensors from BVCSlicedDataset) ──
-                # x_vel:       (B, N, T_in*3)   normalized velocity, flattened
-                # future_acc:  (B, N, K, 3)     K-step normalized acceleration targets
-                # input_pos:   (B, N, T_in, 3)  raw input positions
-                # future_pos:  (B, N, K, 3)     raw future positions (for SDF rolling)
-                # v_last_phys: (B, N, 3)        physical velocity at last input frame
-                # node_type:   (B, N)           per-node int label (only when use_node_type)
+                # ── Unpack batch (7 or 8 tensors from BVCSlicedDataset) ──
+                # [0] x_vel:             (B, N, T_in*3)   normalized velocity, flattened
+                # [1] future_acc:        (B, N, K, 3)     K-step normalized acceleration targets
+                # [2] input_pos:         (B, N, T_in, 3)  raw input positions
+                # [3] future_pos:        (B, N, K, 3)     raw future positions (for SDF rolling)
+                # [4] v_last_phys:       (B, N, 3)        physical velocity at last input frame
+                # [5] barrier_angle_deg: (B,)             per-trajectory barrier angle (degrees)
+                # [6] x_intercept:       (B,)             barrier x-intercept (mm)
+                # [7] node_type:         (B, N)           per-node int label (only when use_node_type)
                 x_vel       = batch[0].to(device)
                 future_acc  = batch[1].to(device)
                 input_pos   = batch[2].to(device)
                 future_pos  = batch[3].to(device)
                 v_last_phys = batch[4].to(device)
-                node_type   = batch[5].to(device) if use_node_type else None
+                barrier_angle_deg = float(batch[5][0].item())
+                x_intercept       = float(batch[6][0].item())
+                node_type   = batch[7].to(device) if use_node_type else None
 
                 B, N, _ = x_vel.shape
                 T_in    = input_pos.shape[2]
@@ -491,9 +562,9 @@ def train(cfg: dict, git_commit: str = "unknown"):
 
                     # Build model input: flatten T_in dim into channels, concat SDF
                     x_vel_flat = v_window_input.reshape(B, N, -1)         # (B, N, T_in*3)
-                    x_sdf      = build_sdf_window(pos_window)             # (B, N, T_in)
-                    # sdf_threshold = 50.0 / 1000.0  # 50mm in SDF units (metres)
-
+                    x_sdf      = build_sdf_window(                        # (B, N, T_in)
+                        pos_window, barrier_angle_deg, x_intercept
+                    )
                     x_in       = torch.cat([x_vel_flat, x_sdf], dim=-1)   # (B, N, T_in*4)
 
                     # Forward

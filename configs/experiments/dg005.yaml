@@ -1,0 +1,55 @@
+name: "dg005"
+description: "Change barrier anchor to the accurate location and send as a parameter." 
+model:
+  name: "transolverplus_net"
+  params: "configs/params/transolverplus_net.yaml"
+
+overrides:
+  model.hidden_dim: 256
+  model.layers: 8
+  model.nmlp_layers: 2
+  model.num_heads: 8
+  model.slice_num: 256
+
+  model.nnode_in_features: 20  # 5 frames x (3 vel + 1 sdf); type_emb_dim added internally
+  model.nnode_out_features: 3
+  model.num_node_types: 16     # vocab size; node_mat_type_id max=8, 16 > max
+  model.type_emb_dim: 4       # 7 material classes, 4 dims sufficient
+
+  train.lr: 0.0005
+  train.min_lr: 0.000001
+  train.batch_size: 4
+  train.accum_steps: 2
+  train.n_epochs: 500
+  train.push_forward_k: 1
+  train.noise_std: 0.05
+  train.grad_clip: 5.0
+  train.val_every_epochs: 10
+  train.val_batch_size: 1
+
+  data.input_frames: 5
+  data.acc_scale: 5.0e5
+  data.norm_fields:
+    - "positions"
+    - "velocity"
+    - "acceleration"
+  data.node_type: true
+  data.node_type_field: node_mat_type_id #node_part_label
+
+  # Format: "<h5_dir>[:<barrier_angle_deg>]"
+  # Angle suffix is optional; omitting it defaults to -25.4° (barrier_9_3 family).
+  # Known angles: -25.4 (x_intercept=2056.579), -20.0 (2801.525), -15.0 (4078.004)
+  data.train_dirs:
+    - "/data/curtin_ciraee/curtin_xiangrui/data/h5dt_50ns_5fs_mat/T_lok_F_shape_barrier_9_3_100km:-25.4"
+    - "/data/curtin_ciraee/curtin_xiangrui/data/h5dt_50ns_5fs_mat/T_lok_F_shape_barrier_9_3_100km_plus400kg:-25.4"
+    - "/data/curtin_ciraee/curtin_xiangrui/data/h5dt_50ns_5fs_mat/T_lok_F_shape_barrier_9_3_100km_plus800kg:-25.4"
+    - "/data/curtin_ciraee/curtin_xiangrui/data/h5dt_50ns_5fs_mat/T_lok_F_shape_barrier_9_3_60km:-25.4"
+    - "/data/curtin_ciraee/curtin_xiangrui/data/h5dt_50ns_5fs_mat/T_lok_F_shape_barrier_9_3_60km_plus400kg:-25.4"
+    - "/data/curtin_ciraee/curtin_xiangrui/data/h5dt_50ns_5fs_mat/T_lok_F_shape_barrier_9_3_60km_plus800kg:-25.4"
+    - "/data/curtin_ciraee/curtin_xiangrui/data/h5dt_50ns_5fs_mat/T_lok_F_shape_barrier_9_3_80km:-25.4"
+    - "/data/curtin_ciraee/curtin_xiangrui/data/h5dt_50ns_5fs_mat/T_lok_F_shape_barrier_9_3_80km_plus800kg:-25.4"
+
+  data.val_dirs:
+    - "/data/curtin_ciraee/curtin_xiangrui/data/h5dt_50ns_5fs_mat/T_lok_F_shape_barrier_9_3_80km_plus400kg:-25.4"
+
+notes: ""

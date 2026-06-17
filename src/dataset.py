@@ -283,6 +283,10 @@ class BVCSlicedDataset(BaseDataset):
         data_cfg  = cfg["data"]
         train_cfg = cfg.get("train", {})
 
+        # Per-trajectory barrier params injected by build_dataloader
+        # List of {"barrier_angle_deg": float, "x_intercept": float}, one per path.
+        self._barrier_params: list[dict] = data_cfg.get("barrier_params_list") or []
+
         # ── Resolve paths ──────────────────────────────────────────────────
         paths = data_cfg.get("paths") or data_cfg.get("path")
         if paths is None:
@@ -372,6 +376,12 @@ class BVCSlicedDataset(BaseDataset):
             print(f"[BVCSlicedDataset] traj[{idx}] {dir_name}{meta_label} "
                   f"— T={T}, windows={n_windows}")
 
+            # Barrier SDF params: use per-traj values if provided, else defaults
+            if idx < len(self._barrier_params):
+                bp = self._barrier_params[idx]
+            else:
+                bp = {"barrier_angle_deg": -25.4, "x_intercept": 2056.579}
+
             traj_entry = {
                 "vel_norm":          vel_norm,
                 "vel_phys":          vel,
@@ -383,6 +393,8 @@ class BVCSlicedDataset(BaseDataset):
                 "vel_derived_phys":  vel_derived,
                 "acc_derived_norm":  acc_derived_norm,
                 "T_derived":         T - 2,
+                "barrier_angle_deg": bp["barrier_angle_deg"],
+                "x_intercept":       bp["x_intercept"],
             }
             if self.use_node_type:
                 traj_entry["node_type"] = node_type_arr  # (N,) int64, static
@@ -450,15 +462,17 @@ class BVCSlicedDataset(BaseDataset):
         input_pos  = input_pos.transpose(1, 0, 2)                  # (N, T_in, 3)
 
         base = (
-            torch.from_numpy(np.ascontiguousarray(x_vel)),         # (N, T_in*3)
-            torch.from_numpy(np.ascontiguousarray(future_acc)),    # (N, K, 3)
-            torch.from_numpy(np.ascontiguousarray(input_pos)),     # (N, T_in, 3)
-            torch.from_numpy(np.ascontiguousarray(future_pos)),    # (N, K, 3)
-            torch.from_numpy(np.ascontiguousarray(v_last_phys)),   # (N, 3)
+            torch.from_numpy(np.ascontiguousarray(x_vel)),                       # [0] (N, T_in*3)
+            torch.from_numpy(np.ascontiguousarray(future_acc)),                  # [1] (N, K, 3)
+            torch.from_numpy(np.ascontiguousarray(input_pos)),                   # [2] (N, T_in, 3)
+            torch.from_numpy(np.ascontiguousarray(future_pos)),                  # [3] (N, K, 3)
+            torch.from_numpy(np.ascontiguousarray(v_last_phys)),                 # [4] (N, 3)
+            torch.tensor(traj["barrier_angle_deg"], dtype=torch.float32),        # [5] scalar
+            torch.tensor(traj["x_intercept"],       dtype=torch.float32),        # [6] scalar
         )
         if self.use_node_type:
-            nt = traj["node_type"]                                  # (N,) int64
-            return base + (torch.from_numpy(np.ascontiguousarray(nt)),)  # (N,) long
+            nt = traj["node_type"]                                                # (N,) int64
+            return base + (torch.from_numpy(np.ascontiguousarray(nt)),)          # [7] (N,) long
         return base
 
 
@@ -476,16 +490,19 @@ def build_dataloader(
     shuffle: bool,
     batch_size: int,
     stats: dict | None = None,
+    barrier_params: list[dict] | None = None,
 ) -> torch.utils.data.DataLoader:
     """Build a DataLoader from a list of trajectory dirs.
 
     Args:
-        cfg:        full experiment config dict
-        dirs:       one or more trajectory dirs (each must contain output.h5 + metadata.json)
-        shuffle:    whether to shuffle windows across all trajs
-        batch_size: batch size
-        stats:      global normalization stats from load_or_compute_global_stats.
-                    MUST be train stats even for val loader.
+        cfg:             full experiment config dict
+        dirs:            one or more trajectory dirs (each must contain output.h5 + metadata.json)
+        shuffle:         whether to shuffle windows across all trajs
+        batch_size:      batch size
+        stats:           global normalization stats from load_or_compute_global_stats.
+                         MUST be train stats even for val loader.
+        barrier_params:  list of {"barrier_angle_deg": float, "x_intercept": float},
+                         one entry per dir.  Defaults to -25.4° / 2056.579 mm if omitted.
     """
     data_cfg = cfg.get("data", {})
 
@@ -502,8 +519,9 @@ def build_dataloader(
     trajectories = [_resolve_traj_dir(d) for d in dirs]
     ds_cfg = {**cfg, "data": {
         **data_cfg,
-        "paths":          [t["h5"]       for t in trajectories],
-        "metadata_paths": [t["metadata"] for t in trajectories],
+        "paths":               [t["h5"]       for t in trajectories],
+        "metadata_paths":      [t["metadata"] for t in trajectories],
+        "barrier_params_list": barrier_params or [],
     }}
 
     dataset = dataset_cls(ds_cfg, stats=stats)

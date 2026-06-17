@@ -254,31 +254,36 @@ def _pack_pos_only(pos_list):
         arr[i, :, 0:3] = p
     return arr
 
-# ── Signed Distance Field ────────────────────────────────────────────────────────
+# ── Barrier plate parameters (must match train.py BARRIER_PARAMS) ─────────────
+# Source: README "Barrier plate projection on xy plate" table
+BARRIER_PARAMS: dict[float, dict[str, float]] = {
+    -25.4: {"x_intercept": 2056.579},
+    -20.0: {"x_intercept": 2801.525},
+    -15.0: {"x_intercept": 4078.004},
+}
+_DEFAULT_BARRIER_DEG: float = -25.4
 
-def compute_sdf_batch(xy: torch.Tensor, 
-                    barrier_angle_deg: float=-25.4, 
-                    barrier_anchor: Optional[torch.Tensor] = None) -> torch.Tensor:
+# ── Signed Distance Field ─────────────────────────────────────────────────────
+
+def compute_sdf_batch(
+    xy:                torch.Tensor,
+    barrier_angle_deg: float = _DEFAULT_BARRIER_DEG,
+    x_intercept:       float = BARRIER_PARAMS[_DEFAULT_BARRIER_DEG]["x_intercept"],
+) -> torch.Tensor:
+    """Signed distance (metres) from each point to the barrier line.
+
+    xy: (..., 2)  XY positions in mm
+    barrier_angle_deg: impact angle (see BARRIER_PARAMS)
+    x_intercept: x-coord (mm) where barrier line crosses y = 0
     """
-    sdf: signed distance field
-    car_points: (N, T, 2) 
-    barrier_angle_deg: 护栏角度 (标量) impace degree -25.4
-    barrier_anchor: (3,) 护栏基准点，必须在 GPU 上 xy=(0,2000)
-
-    """
-    device = xy.device
-    if barrier_anchor is None:
-        barrier_anchor = torch.tensor([0.0, 2000.0], device=device)
-    else:
-        barrier_anchor = barrier_anchor.to(device)
-
+    device    = xy.device
+    anchor    = torch.tensor([x_intercept, 0.0], device=device)
     angle_rad = torch.deg2rad(torch.tensor(barrier_angle_deg, device=device))
-    normal_2d = torch.tensor([-torch.sin(angle_rad), torch.cos(angle_rad)], device=device)
-    
-    diff_2d = xy - barrier_anchor[:2]
-    distances = (diff_2d * normal_2d).sum(dim=-1)
-    
-    return distances / 1000.0
+    normal_2d = torch.tensor(
+        [-torch.sin(angle_rad), torch.cos(angle_rad)], device=device
+    )
+    diff_2d   = xy - anchor
+    return (diff_2d * normal_2d).sum(dim=-1) / 1000.0
 
 
 # ── Inference ─────────────────────────────────────────────────────────────────
