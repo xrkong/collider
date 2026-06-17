@@ -21,6 +21,7 @@ REPO_ROOT = PROJECT_ROOT
 
 import models  # triggers auto-import of all registered models
 from models.registry import build_model
+from src.conditions import CondConfig
 from src.dataset import NormStats, build_dataloader, load_or_compute_global_stats, _DEFAULT_NORM_FIELDS
 from src.utils.metrics import MetricTracker
 
@@ -323,10 +324,12 @@ def run_validation(model, val_loader, device, use_node_type: bool = False) -> di
         x_vel      = batch[0].to(device)
         future_acc = batch[1].to(device)
         input_pos  = batch[2].to(device)
-        # batch[5]=barrier_angle_deg, batch[6]=x_intercept, batch[7]=node_type
+        # batch[5]=barrier_angle_deg, batch[6]=x_intercept
+        # batch[7]=cond (n_cond,), batch[8]=node_type (when use_node_type)
         barrier_angle_deg = float(batch[5][0].item())
         x_intercept       = float(batch[6][0].item())
-        node_type = batch[7].to(device) if use_node_type else None
+        cond      = batch[7].to(device)                      # (B, n_cond)
+        node_type = batch[8].to(device) if use_node_type else None
 
         # Validation: one-step only (k=0)
         B, N, _ = x_vel.shape
@@ -334,7 +337,11 @@ def run_validation(model, val_loader, device, use_node_type: bool = False) -> di
 
         x_sdf = compute_sdf_batch(input_pos[..., :2], barrier_angle_deg, x_intercept)
         x_in  = torch.cat([x_vel, x_sdf], dim=-1)
-        # x_in = x_vel  # ablation: no SDF
+
+        # Method A: broadcast cond to (B, N, n_cond) and concat last (D6)
+        if cond.shape[-1] > 0:
+            cond_b = cond[:, None, :].expand(-1, N, -1)
+            x_in = torch.cat([x_in, cond_b], dim=-1)
 
         with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
             pred = model(x_in, node_type)
@@ -372,6 +379,18 @@ def train(cfg: dict, git_commit: str = "unknown"):
         )
 
     print(f"[Train] Device: {device}")
+
+    # ── Condition config ─────────────────────────────────────────────────
+    cond_cfg = CondConfig(**(cfg.get("condition") or {}))
+    n_cond   = cond_cfg.n_cond()
+    T_in     = int(data_cfg.get("input_frames", 5))
+    base_features = T_in * 4   # T_in * (3 vel + 1 sdf)
+    assert model_cfg["nnode_in_features"] == base_features + n_cond, (
+        f"nnode_in_features={model_cfg['nnode_in_features']} != "
+        f"{base_features} + n_cond={n_cond} = {base_features + n_cond}"
+    )
+    print(f"[Train] Condition: enabled={list(cond_cfg.enabled)}, n_cond={n_cond}, "
+          f"nnode_in_features={model_cfg['nnode_in_features']}")
 
     # ── Build model ───────────────────────────────────────────────────────
     model = build_model(model_cfg["name"], cfg)
@@ -523,7 +542,7 @@ def train(cfg: dict, git_commit: str = "unknown"):
             pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{n_epochs}", unit="batch",
                         dynamic_ncols=True, leave=True)
             for batch_idx, batch in enumerate(pbar):
-                # ── Unpack batch (7 or 8 tensors from BVCSlicedDataset) ──
+                # ── Unpack batch (8 or 9 tensors from BVCSlicedDataset) ──
                 # [0] x_vel:             (B, N, T_in*3)   normalized velocity, flattened
                 # [1] future_acc:        (B, N, K, 3)     K-step normalized acceleration targets
                 # [2] input_pos:         (B, N, T_in, 3)  raw input positions
@@ -531,7 +550,8 @@ def train(cfg: dict, git_commit: str = "unknown"):
                 # [4] v_last_phys:       (B, N, 3)        physical velocity at last input frame
                 # [5] barrier_angle_deg: (B,)             per-trajectory barrier angle (degrees)
                 # [6] x_intercept:       (B,)             barrier x-intercept (mm)
-                # [7] node_type:         (B, N)           per-node int label (only when use_node_type)
+                # [7] cond:              (B, n_cond)      normalized condition vector
+                # [8] node_type:         (B, N)           per-node int label (only when use_node_type)
                 x_vel       = batch[0].to(device)
                 future_acc  = batch[1].to(device)
                 input_pos   = batch[2].to(device)
@@ -539,7 +559,8 @@ def train(cfg: dict, git_commit: str = "unknown"):
                 v_last_phys = batch[4].to(device)
                 barrier_angle_deg = float(batch[5][0].item())
                 x_intercept       = float(batch[6][0].item())
-                node_type   = batch[7].to(device) if use_node_type else None
+                cond        = batch[7].to(device)                   # (B, n_cond)
+                node_type   = batch[8].to(device) if use_node_type else None
 
                 B, N, _ = x_vel.shape
                 T_in    = input_pos.shape[2]
@@ -548,6 +569,9 @@ def train(cfg: dict, git_commit: str = "unknown"):
                 v_window_norm = x_vel.view(B, N, T_in, 3)        # (B, N, T_in, 3)
                 pos_window    = input_pos                          # (B, N, T_in, 3)
                 v_phys_curr   = v_last_phys                        # (B, N, 3)
+
+                # Method A: broadcast cond once; reuse unchanged across all unroll steps (D3)
+                cond_b = cond[:, None, :].expand(-1, N, -1)       # (B, N, n_cond) — view, no copy
 
                 # ── Push-forward K-step training loop ─────────────────────
                 total_loss = 0.0
@@ -560,12 +584,14 @@ def train(cfg: dict, git_commit: str = "unknown"):
                     else:
                         v_window_input = v_window_norm
 
-                    # Build model input: flatten T_in dim into channels, concat SDF
+                    # Build model input: flatten T_in dim into channels, concat SDF, concat cond (D6)
                     x_vel_flat = v_window_input.reshape(B, N, -1)         # (B, N, T_in*3)
                     x_sdf      = build_sdf_window(                        # (B, N, T_in)
                         pos_window, barrier_angle_deg, x_intercept
                     )
-                    x_in       = torch.cat([x_vel_flat, x_sdf], dim=-1)   # (B, N, T_in*4)
+                    x_in       = torch.cat([x_vel_flat, x_sdf, cond_b], dim=-1)  # (B, N, T_in*4+n_cond)
+                    assert x_in.shape[-1] == model_cfg["nnode_in_features"], \
+                        f"x_in dim {x_in.shape[-1]} != nnode_in_features {model_cfg['nnode_in_features']}"
 
                     # Forward
                     with torch.autocast(device_type="cuda", dtype=torch.bfloat16):

@@ -14,6 +14,8 @@ try:
 except ImportError:
     raise ImportError("h5py is required: pip install h5py")
 
+from src.conditions import CondConfig, parse_conditions, normalize_conditions
+
 
 # ── Normalization stats (legacy — used by rollout / evaluate) ─────────────────
 class NormStats:
@@ -311,6 +313,11 @@ class BVCSlicedDataset(BaseDataset):
             raise ValueError(f"push_forward_k must be >= 1, got {self.K}")
         self.window_len = self.input_frames + self.K
 
+        # ── Condition config (shared across all trajectories) ─────────────
+        self._cond_cfg = CondConfig(**(cfg.get("condition") or {}))
+        print(f"[BVCSlicedDataset] condition: enabled={list(self._cond_cfg.enabled)}, "
+              f"n_cond={self._cond_cfg.n_cond()}")
+
         # ── Normalization ──────────────────────────────────────────────────
         # Priority: external stats dict > first-traj metadata fallback > no-norm
         self._stats_dict: dict | None = None          # global scalar stats
@@ -365,16 +372,23 @@ class BVCSlicedDataset(BaseDataset):
 
             dir_name = p.parent.name
             meta_label = ""
+            raw_metadata: dict | None = None
             if idx < len(metadata_paths):
                 try:
                     with open(metadata_paths[idx]) as mf:
-                        mc = json.load(mf).get("config", {})
+                        raw_metadata = json.load(mf)
+                    mc = raw_metadata.get("config", {})
                     speed = mc.get("source", "")
                     meta_label = f"  [{speed.split('/')[-1]}]" if speed else ""
                 except Exception:
                     pass
+
+            # Parse and normalize physical conditions for this trajectory
+            cond_raw = parse_conditions(raw_metadata, dir_name)
+            cond_vec = normalize_conditions(cond_raw, self._cond_cfg)
             print(f"[BVCSlicedDataset] traj[{idx}] {dir_name}{meta_label} "
-                  f"— T={T}, windows={n_windows}")
+                  f"— T={T}, windows={n_windows} | "
+                  f"cond_raw={cond_raw} cond={cond_vec}")
 
             # Barrier SDF params: use per-traj values if provided, else defaults
             if idx < len(self._barrier_params):
@@ -395,6 +409,8 @@ class BVCSlicedDataset(BaseDataset):
                 "T_derived":         T - 2,
                 "barrier_angle_deg": bp["barrier_angle_deg"],
                 "x_intercept":       bp["x_intercept"],
+                "cond":              cond_vec,    # np.float32 (n_cond,) — constant per traj
+                "cond_raw":          cond_raw,    # physical values for logging
             }
             if self.use_node_type:
                 traj_entry["node_type"] = node_type_arr  # (N,) int64, static
@@ -469,10 +485,11 @@ class BVCSlicedDataset(BaseDataset):
             torch.from_numpy(np.ascontiguousarray(v_last_phys)),                 # [4] (N, 3)
             torch.tensor(traj["barrier_angle_deg"], dtype=torch.float32),        # [5] scalar
             torch.tensor(traj["x_intercept"],       dtype=torch.float32),        # [6] scalar
+            torch.from_numpy(np.ascontiguousarray(traj["cond"])),                # [7] (n_cond,)
         )
         if self.use_node_type:
             nt = traj["node_type"]                                                # (N,) int64
-            return base + (torch.from_numpy(np.ascontiguousarray(nt)),)          # [7] (N,) long
+            return base + (torch.from_numpy(np.ascontiguousarray(nt)),)          # [8] (N,) long
         return base
 
 

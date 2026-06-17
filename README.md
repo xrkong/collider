@@ -68,6 +68,8 @@ python train.py --experiment configs/experiments/exp_10.yaml --skip-git-check
 | −20°   | −0.363970        | y = −0.363970x + 1019.672  | 1019.672          | 2801.525          |
 | −15°   | −0.267949        | y = −0.267949x + 1092.698  | 1092.698          | 4078.004          |
 
+weight part id: 2000353
+
 ### Evaluation and Rollout
 After training, you can evaluate the model on the test set and perform rollouts.
 

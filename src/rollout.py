@@ -29,17 +29,6 @@ Usage:
         --mode raw_gt \
         --gif --gif-fps 10 --gif-name traj_9_3_gt
 
-    python src/rollout.py \
-        --checkpoint outputs/checkpoints/sc_021/checkpoint-best.safetensors \
-        --experiment configs/experiments/sc_021.yaml \
-        --raw-h5 /home/kong/datasets/barrier/h5/T_lok_F_shape_barrier_9_3_100km_50_5/output.h5 \
-        --mode both --plot \
-        --compare-dirs \
-            sc_018:outputs/rollouts/sc_018 \
-            sc_019:outputs/rollouts/sc_019 \
-            sc_020:outputs/rollouts/sc_020 \
-            sc_021:outputs/rollouts/sc_021
-
 """
 
 from __future__ import annotations
@@ -1316,6 +1305,9 @@ def main():
                 save_png_dir      = str(out_dir / f"{gif_stem}_pngs"),
             )
 
+    # ── Summary ───────────────────────────────────────────────────────────
+    print_summary(onestep, autoreg, baseline)
+
     # ── WandB upload (GIFs + console log + RMSE metrics) ─────────────────────
     if args.wandb_project:
         log_text = tee.restore() if tee else None
@@ -1377,9 +1369,6 @@ def main():
             print(f"[Compare] loaded '{label}' from {cdir}")
         if experiments:
             plot_multi_rmse(experiments, out_dir / "multi_experiment_rmse.png")
-
-    # ── Summary ───────────────────────────────────────────────────────────
-    print_summary(onestep, autoreg, baseline)
 
 
 if __name__ == "__main__":

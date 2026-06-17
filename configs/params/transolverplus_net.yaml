@@ -49,6 +49,15 @@ data:
   # collision_threshold: 100.0
   # normalize_dist: false
 
+condition:
+  enabled: [speed, mass]          # D4: only vary-across-trajs scalars; angle/material OFF
+  ranges:
+    speed: [60.0, 100.0]          # tested envelope; 60→-1, 80→0, 100→+1
+    mass:  [0.0, 1000.0]          # 0→-1, 400→-0.2, 800→+0.6
+    angle: [0.0, 30.0]            # magnitude; abs() applied before norm
+  material_vocab: [F]
+  use_material: false             # single barrier type; flip when a 2nd type joins
+
 wandb:
   project: barrier-vehicle-collision
   log: true
