@@ -1482,14 +1482,14 @@ def main():
                 float(baseline["rmse_pos_onestep"].mean()),
                 float(baseline["rmse_vel_onestep"].mean()),
                 float(baseline["rmse_acc_onestep"].mean()),
-                weight_kg, speed_kmh, angle_deg, "N", None,
+                weight_kg, speed_kmh, angle_deg, "N",
             )
             table.add_data(
                 ts_name, ts_name, "zero_ar",
                 float(baseline["rmse_pos_rollout"].mean()),
                 float(baseline["rmse_vel_rollout"].mean()),
                 float(baseline["rmse_acc_rollout"].mean()),
-                weight_kg, speed_kmh, angle_deg, "N", None,
+                weight_kg, speed_kmh, angle_deg, "N",
             )
 
         last_onestep = onestep

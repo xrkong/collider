@@ -66,3 +66,4 @@ urllib3==2.6.3
 wandb==0.26.1
 wheel==0.47.0
 wrapt==2.1.2
+accelerate

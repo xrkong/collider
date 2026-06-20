@@ -11,6 +11,7 @@ from typing import Optional
 import torch
 import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint
+from accelerate import Accelerator
 from tqdm import tqdm
 import yaml
 
@@ -339,7 +340,7 @@ def compute_sdf_batch(
 
 # ── Validation loop ───────────────────────────────────────────────────────────
 @torch.no_grad()
-def run_validation(model, val_loader, device, use_node_type: bool = False) -> dict:
+def run_validation(model, val_loader, device, use_node_type: bool = False, accelerator=None) -> dict:
     model.eval()
     total, n_batches = 0.0, 0
     for batch in val_loader:
@@ -365,12 +366,20 @@ def run_validation(model, val_loader, device, use_node_type: bool = False) -> di
             cond_b = cond[:, None, :].expand(-1, N, -1)
             x_in = torch.cat([x_in, cond_b], dim=-1)
 
-        with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+        autocast_ctx = accelerator.autocast() if accelerator is not None else torch.autocast(device_type="cuda", dtype=torch.bfloat16)
+        with autocast_ctx:
             pred = model(x_in, node_type)
             target = future_acc[:, :, 0, :]                  # first step target
             loss, _ = compute_loss(pred, target)
         total += loss.item()
         n_batches += 1
+
+    if accelerator is not None:
+        total_t   = torch.tensor(total,     device=device)
+        n_t       = torch.tensor(n_batches, device=device)
+        total_t   = accelerator.reduce(total_t, reduction="sum")
+        n_t       = accelerator.reduce(n_t,     reduction="sum")
+        return {"loss": (total_t / n_t.clamp(min=1)).item()}
     return {"loss": total / max(n_batches, 1)}
 
 # ── Main training loop ────────────────────────────────────────────────────────
@@ -381,7 +390,8 @@ def train(cfg: dict, git_commit: str = "unknown"):
         BVCDataset  →  (x: B,N,D_vel)  →  TransolverNet  →  (pred: B,N,D_acc)
                        (y: B,N,D_acc)  →  relative L2 loss
     """
-    device    = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    accelerator = Accelerator(mixed_precision="bf16")
+    device      = accelerator.device
     train_cfg = cfg["train"]
     model_cfg = cfg["model"]
     data_cfg  = cfg["data"]
@@ -400,7 +410,7 @@ def train(cfg: dict, git_commit: str = "unknown"):
             "set both to 0 or enable data.node_type"
         )
 
-    print(f"[Train] Device: {device}")
+    accelerator.print(f"[Train] Device: {device}  |  num_processes: {accelerator.num_processes}")
 
     # ── Condition config ─────────────────────────────────────────────────
     cond_cfg = CondConfig(**(cfg.get("condition") or {}))
@@ -416,7 +426,6 @@ def train(cfg: dict, git_commit: str = "unknown"):
 
     # ── Build model ───────────────────────────────────────────────────────
     model = build_model(model_cfg["name"], cfg)
-    model.to(device)
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"[Train] Model '{model_cfg['name']}' — {n_params:,} trainable params")
 
@@ -480,6 +489,9 @@ def train(cfg: dict, git_commit: str = "unknown"):
         barrier_params   = val_barrier,
     )
 
+    # Distribute loaders across ranks; len(train_loader) now reflects per-rank count
+    train_loader, val_loader = accelerator.prepare(train_loader, val_loader)
+
     # ── Push-forward & noise config ──────────────────────────────────────
     push_K     = int(train_cfg.get("push_forward_k", 1))
     noise_std  = float(train_cfg.get("noise_std", 0.0))
@@ -515,44 +527,47 @@ def train(cfg: dict, git_commit: str = "unknown"):
     print(f"active ratio (>0.5):  {n_active_05 / n_total:.4%}")
 
     grad_clip = float(train_cfg.get("grad_clip", 1.0))
-    accum_steps = int(train_cfg.get("accum_steps", 1))   # <-- 新增
+    accum_steps = int(train_cfg.get("accum_steps", 1))   
     print(f"[Train] accum_steps = {accum_steps} | effective batch = {train_cfg['batch_size'] * accum_steps}")
 
     n_epochs        = int(train_cfg["n_epochs"])
     steps_per_epoch = len(train_loader)
-    opt_steps_per_epoch = (steps_per_epoch + accum_steps - 1) // accum_steps   # ceil
-    total_steps     = n_epochs * opt_steps_per_epoch
 
     lr     = float(train_cfg.get("lr", 1e-3))
     min_lr = float(train_cfg.get("min_lr", lr))
-    div_factor = 25
 
-    scheduler = torch.optim.lr_scheduler.OneCycleLR(
+    # Cosine decay from lr → min_lr over n_epochs epochs (stepped once per epoch)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
         optimizer,
-        max_lr=lr,
-        total_steps=total_steps,
-        pct_start=0.01,
-        div_factor=div_factor,
-        final_div_factor=(lr / div_factor) / min_lr,
+        T_max=n_epochs * accelerator.num_processes,
+        eta_min=min_lr,
     )
+
+    model, optimizer, scheduler = accelerator.prepare(model, optimizer, scheduler)
 
     # ── Checkpoint state ──────────────────────────────────────────────────
     save_dir      = PROJECT_ROOT / "outputs" / "checkpoints" / cfg["name"]
     save_dir.mkdir(parents=True, exist_ok=True)
-    exp_meta      = _write_meta_json(save_dir, cfg)
     manifest_path = save_dir / "checkpoint_manifest.json"
-    ckpt_history  = json.loads(manifest_path.read_text()) if manifest_path.exists() else []
-    best_val_loss = min((r["val_loss"] for r in ckpt_history), default=float("inf"))
     keep_top_k    = int(train_cfg.get("keep_top_k", 3))
+
+    if accelerator.is_main_process:
+        exp_meta      = _write_meta_json(save_dir, cfg)
+        ckpt_history  = json.loads(manifest_path.read_text()) if manifest_path.exists() else []
+        best_val_loss = min((r["val_loss"] for r in ckpt_history), default=float("inf"))
+    else:
+        exp_meta      = {}
+        ckpt_history  = []
+        best_val_loss = float("inf")
 
     # ── W&B ──────────────────────────────────────────────────────────────
     # rollout.py reads meta.json from the checkpoint dir to join the same group
-    wandb_run = setup_wandb(cfg, git_commit, exp_meta)
+    wandb_run = setup_wandb(cfg, git_commit, exp_meta) if accelerator.is_main_process else None
 
     val_every = int(train_cfg.get("val_every_epochs", 1))
 
     print(f"[Train] Starting — {n_epochs} epochs | {steps_per_epoch} steps/epoch | "
-          f"batch={train_cfg['batch_size']} | lr={train_cfg['lr']} | val_every={val_every}")
+          f"batch={train_cfg['batch_size']} | lr={lr}→{min_lr} (cosine) | val_every={val_every}")
 
     step = 0
     model.train()
@@ -564,7 +579,7 @@ def train(cfg: dict, git_commit: str = "unknown"):
             model.train()
 
             pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{n_epochs}", unit="batch",
-                        dynamic_ncols=True, leave=True)
+                        dynamic_ncols=True, leave=True, disable=not accelerator.is_main_process)
             for batch_idx, batch in enumerate(pbar):
                 # ── Unpack batch (8 or 9 tensors from BVCSlicedDataset) ──
                 # [0] x_vel:             (B, N, T_in*3)   normalized velocity, flattened
@@ -618,7 +633,7 @@ def train(cfg: dict, git_commit: str = "unknown"):
                         f"x_in dim {x_in.shape[-1]} != nnode_in_features {model_cfg['nnode_in_features']}"
 
                     # Forward
-                    with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                    with accelerator.autocast():
                         a_pred = model(x_in, node_type)                       # (B, N, 3)
 
                         # Loss for this step — only nodes within threshold of barrier
@@ -648,14 +663,13 @@ def train(cfg: dict, git_commit: str = "unknown"):
                 # torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
                 # optimizer.step()
                 # scheduler.step()
-                (loss / accum_steps).backward()                            # <-- 缩放 loss
-    
+                accelerator.backward(loss / accum_steps)
+
                 is_accum_boundary = ((batch_idx + 1) % accum_steps == 0) \
                                     or (batch_idx + 1 == len(train_loader))
                 if is_accum_boundary:
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+                    accelerator.clip_grad_norm_(model.parameters(), grad_clip)
                     optimizer.step()
-                    scheduler.step()
                     optimizer.zero_grad()
 
                 step           += 1
@@ -682,53 +696,59 @@ def train(cfg: dict, git_commit: str = "unknown"):
             epoch_log = {"epoch": epoch + 1, "train/epoch_loss": epoch_avg_loss}
 
             if (epoch + 1) % val_every == 0:
-                val_metrics = run_validation(model, val_loader, device, use_node_type)
+                val_metrics = run_validation(model, val_loader, device, use_node_type, accelerator=accelerator)
                 val_loss    = val_metrics["loss"]
 
-                meta_payload = {
-                    "epoch":      epoch + 1,
-                    "step":       step,
-                    "val_loss":   val_loss,
-                    "git_commit": git_commit,
-                    "experiment": cfg["name"],
-                }
+                accelerator.wait_for_everyone()
+                if accelerator.is_main_process:
+                    unwrapped = accelerator.unwrap_model(model)
+                    meta_payload = {
+                        "epoch":      epoch + 1,
+                        "step":       step,
+                        "val_loss":   val_loss,
+                        "git_commit": git_commit,
+                        "experiment": cfg["name"],
+                    }
 
-                _save_checkpoint(model, save_dir / "checkpoint-latest", meta_payload)
+                    _save_checkpoint(unwrapped, save_dir / "checkpoint-latest", meta_payload)
 
-                ckpt_name = f"model-epoch-{epoch+1:04d}"
-                _save_checkpoint(model, save_dir / ckpt_name, meta_payload)
+                    ckpt_name = f"model-epoch-{epoch+1:04d}"
+                    _save_checkpoint(unwrapped, save_dir / ckpt_name, meta_payload)
 
-                ckpt_history.append({"epoch": epoch + 1, "step": step, "val_loss": val_loss, "file": ckpt_name})
-                ckpt_history.sort(key=lambda r: r["val_loss"])
-                for stale in ckpt_history[keep_top_k:]:
-                    for ext in (".safetensors", ".pt", ".json"):
-                        p = save_dir / f"{stale['file']}{ext}"
-                        if p.exists():
-                            p.unlink()
-                ckpt_history = ckpt_history[:keep_top_k]
-                manifest_path.write_text(json.dumps(ckpt_history, indent=2))
+                    ckpt_history.append({"epoch": epoch + 1, "step": step, "val_loss": val_loss, "file": ckpt_name})
+                    ckpt_history.sort(key=lambda r: r["val_loss"])
+                    for stale in ckpt_history[keep_top_k:]:
+                        for ext in (".safetensors", ".pt", ".json"):
+                            p = save_dir / f"{stale['file']}{ext}"
+                            if p.exists():
+                                p.unlink()
+                    ckpt_history = ckpt_history[:keep_top_k]
+                    manifest_path.write_text(json.dumps(ckpt_history, indent=2))
 
-                if val_loss < best_val_loss:
-                    best_val_loss = val_loss
-                    _save_checkpoint(model, save_dir / "checkpoint-best", meta_payload)
-                    tick = "✓ NEW BEST"
-                    _log_best_artifact(wandb_run, exp_meta, save_dir, epoch + 1, step, val_loss, cfg)
-                else:
-                    tick = ""
+                    if val_loss < best_val_loss:
+                        best_val_loss = val_loss
+                        _save_checkpoint(unwrapped, save_dir / "checkpoint-best", meta_payload)
+                        tick = "✓ NEW BEST"
+                        _log_best_artifact(wandb_run, exp_meta, save_dir, epoch + 1, step, val_loss, cfg)
+                    else:
+                        tick = ""
 
-                print(f"[Val]   Epoch {epoch+1}/{n_epochs} | "
-                      f"train_loss={epoch_avg_loss:.5f} | val_loss={val_loss:.5f} | "
-                      f"best={best_val_loss:.5f} {tick}")
+                    print(f"[Val]   Epoch {epoch+1}/{n_epochs} | "
+                          f"train_loss={epoch_avg_loss:.5f} | val_loss={val_loss:.5f} | "
+                          f"best={best_val_loss:.5f} {tick}")
 
                 epoch_log.update({f"val/{k}": v for k, v in val_metrics.items()})
 
+            scheduler.step()  # advance LR once per epoch; min_lr reached at epoch n_epochs
+
             if wandb_run:
                 wandb_run.log(epoch_log, step=step)
-    
+
     except KeyboardInterrupt:
         print("[Train] Interrupted by user")
     
-    print(f"[Train] Done — best val_loss: {best_val_loss:.5f}")
+    accelerator.wait_for_everyone()
+    accelerator.print(f"[Train] Done — best val_loss: {best_val_loss:.5f}")
     return best_val_loss
 
 # ── Entry point ───────────────────────────────────────────────────────────────

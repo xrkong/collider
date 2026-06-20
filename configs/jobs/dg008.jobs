@@ -1,5 +1,5 @@
 #!/bin/bash
-#rj queue=curtin_ciraee features=a100 priority=550 runtime=24 mem=64g logdir=logs name=dg007_200
+#rj queue=curtin_ciraee features=a100 priority=550 runtime=24 mem=64g logdir=logs name=dg008
 
 set -euo pipefail
 echo "Running on $(hostname), TMPDIR=$TMPDIR"
@@ -19,6 +19,6 @@ echo "Launching with ${NUM_GPUS} GPU(s)"
 accelerate launch \
     --num_processes=${NUM_GPUS} \
     --mixed_precision=bf16 \
-    train.py --experiment configs/experiments/dg007.yaml --skip-git-check
+    train.py --experiment configs/experiments/dg008.yaml --skip-git-check
 
 echo "Done."

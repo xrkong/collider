@@ -16,15 +16,15 @@ cd /data/curtin_ciraee/curtin_xiangrui/xrkong/collider
 EXP=dg007
 
 # ── All test sets in one run → one W&B group, one Table ──────────────────────
-DATA=/data/curtin_ciraee/curtin_xiangrui/data/h5dt_50ns_5fs_mat
+DATA=/data/curtin_ciraee/curtin_xiangrui/data/h5dt_50ns_10fs_mat
 
 python src/rollout.py \
     --experiment configs/experiments/${EXP}.yaml \
     --ckpt-dir  outputs/checkpoints/${EXP} \
     --raw-h5 \
-        ${DATA}/T_lok_F_shape_barrier_9_3_80km_plus400kg/output.h5 \
-        ${DATA}/T_lok_F_shape_barrier_9_3_80km/output.h5 \
         ${DATA}/T_lok_F_shape_barrier_9_3_60km/output.h5 \
+        ${DATA}/T_lok_F_shape_barrier_9_3_80km/output.h5 \
+        ${DATA}/T_lok_F_shape_barrier_9_3_80km_plus400kg/output.h5 \
         ${DATA}/T_lok_F_shape_barrier_9_3_100km_plus800kg/output.h5 \
     --mode both \
     --gif --gif-fps 10
