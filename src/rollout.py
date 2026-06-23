@@ -25,9 +25,9 @@ Usage:
 
     # GT-only GIF — no checkpoint/experiment needed
     python src/rollout.py \
-        --raw-h5 /home/kong/datasets/barrier/h5dt_50ns_5fs_mat/T_lok_F_shape_barrier_9_3_100km/output.h5 \
+        --raw-h5 /data/curtin_ciraee/curtin_xiangrui/data/h5dt_50ns_5fs_mat/T_lok_F_shape_barrier_9_3_100km_plus800kg/output.h5 \
         --mode raw_gt \
-        --gif --gif-fps 10 --gif-name traj_9_3_gt
+        --gif --gif-fps 10 --gif-name 100kph_plus800kg
 
 """
 
@@ -657,6 +657,47 @@ def plot_multi_rmse(
 import os
 import re
 
+
+def compute_erosion_mask(
+    positions: np.ndarray,
+    velocity_threshold: float = 1500.0,
+    max_yz_drift: float = 8000.0,
+) -> np.ndarray:
+    """Return a bool mask (T, N) — False once a node is classified as eroded.
+
+    Two complementary criteria (both use monotone "once eroded, stays eroded"):
+
+    1. Velocity threshold: inter-frame displacement > velocity_threshold mm/frame.
+       Catches fast runaways (steel-tube/T-lok barrier weights erode at ~4245 mm/frame).
+       Normal crash-zone nodes stay below ~700 mm/frame.
+
+    2. Y/Z cumulative-drift filter: |pos[t,y/z] - pos[0,y/z]| > max_yz_drift.
+       Catches slower runaways (~250-550 mm/frame) whose elements erode while
+       carrying the crash velocity as free-body motion.  Over 50 frames a node
+       moving at 300 mm/frame drifts 15 000 mm — 2× the car's width.  X drift
+       is not filtered because the car legitimately travels far in X during impact.
+
+    Both filters are needed: the f-shape offset barrier in this simulation creates
+    large lateral forces that eject front-end parts sideways at crash velocity,
+    which is indistinguishable from legitimate crash-zone motion by velocity alone.
+    """
+    T, N, _ = positions.shape
+    valid   = np.ones((T, N), dtype=bool)
+    ref_yz  = positions[0, :, 1:3].copy()   # (N, 2)  initial Y and Z
+
+    for t in range(1, T):
+        # criterion 1 — velocity
+        speed = np.linalg.norm(positions[t] - positions[t - 1], axis=1)  # (N,)
+        # criterion 2 — cumulative Y/Z drift from initial position
+        yz_drift = np.abs(positions[t, :, 1:3] - ref_yz).max(axis=1)    # (N,)
+        valid[t] = valid[t - 1] & (speed <= velocity_threshold) & (yz_drift <= max_yz_drift)
+
+    n_eroded = int((~valid[-1]).sum())
+    if n_eroded > 0:
+        print(f"[ErosionMask] {n_eroded}/{N} nodes masked by frame {T-1} "
+              f"(vel>{velocity_threshold:.0f} mm/frame OR Y/Z drift>{max_yz_drift:.0f} mm)")
+    return valid  # True = still valid
+
 def _get_grouped_colormap(node_part_id, node_part_name, config_path):
     """根据自定义纯文本格式的 required_parts.config 将节点按组分配颜色"""
     group_dict = {}
@@ -771,6 +812,7 @@ def render_vis(
     dpi:              int   = 300,  # 默认提高到 300 保证清晰度
     group_config_path: str  = None, # 传入你的 required_parts.config 路径
     save_png_dir:     str   = None, # 如果传入路径，则额外保存高清 PNG 序列
+    filter_eroded:    bool  = False, # 过滤侵蚀节点；False = 关闭过滤
 ):
     """Render pred (left) vs gt (right) animation, with optional PNG export and grouped coloring."""
     if not _VIS:
@@ -878,12 +920,20 @@ def render_vis(
     axs[1, 1].set_title("GT (X-Y Plane)", color="black", fontsize=FONTSIZE, pad=3)
 
     # 取消了原有的 fig.axes[0].legend() 避免画面遮挡
+    N_nodes = gt_pos.shape[1]
+    if filter_eroded:
+        erosion_valid_gt   = compute_erosion_mask(gt_pos)
+        erosion_valid_pred = compute_erosion_mask(pred_pos)
+    else:
+        erosion_valid_gt   = np.ones((len(gt_pos),   N_nodes), dtype=bool)
+        erosion_valid_pred = np.ones((len(pred_pos), N_nodes), dtype=bool)
+
     fig.canvas.draw()
-    
+
     # ── Fast Rendering Loop & PNG export ───────────────────────────────────
     print(f"[Vis] Rendering {T} frames ({mode}) at {dpi} DPI...")
     gif_frames = []
-    
+
     if save_png_dir:
         Path(save_png_dir).mkdir(parents=True, exist_ok=True)
 
@@ -893,9 +943,12 @@ def render_vis(
 
         for row in range(2):
             for col in range(2):
-                pos = pred_pos[t] if col == 0 else gt_pos[t]
+                raw_pos = pred_pos[t] if col == 0 else gt_pos[t]
+                valid_t = erosion_valid_pred[t] if col == 0 else erosion_valid_gt[t]
+                pos = raw_pos.copy()
+                pos[~valid_t] = np.nan   # eroded nodes → invisible
                 x_idx, y_idx = 0, (2 if row == 0 else 1)
-                
+
                 scatters[row][col].set_offsets(np.c_[pos[:, x_idx], pos[:, y_idx]])
 
         # Update canvas
@@ -935,6 +988,7 @@ def render_gt_only(
     dpi:               int  = 120,
     group_config_path: str  = None,
     save_png_dir:      str  = None,
+    filter_eroded:     bool = False,
 ):
     """Render a GT-only single-column animation (no model required).
 
@@ -954,8 +1008,8 @@ def render_gt_only(
     gt_pos         = raw_data["positions"][:T]   # (T, N, 3)
 
     x_range = (-14000, 20000)
-    y_range = (-10000,  8000)
-    z_range =   (-500,  4000)
+    y_range = (-15000,  8000)
+    z_range =   (-500,  8000)
 
     plt.rcParams['font.family'] = 'DejaVu Serif'
     plt.rcParams['font.size']   = 12
@@ -1006,6 +1060,11 @@ def render_gt_only(
     title_xz = axs[0].set_title("", color="black", fontsize=FONTSIZE, pad=3)
     axs[1].set_title("GT (X-Y Plane)", color="black", fontsize=FONTSIZE, pad=3)
 
+    if filter_eroded:
+        erosion_valid = compute_erosion_mask(gt_pos)
+    else:
+        erosion_valid = np.ones(gt_pos.shape[:2], dtype=bool)
+
     fig.canvas.draw()
 
     if save_png_dir:
@@ -1016,8 +1075,11 @@ def render_gt_only(
 
     for t in range(T):
         title_xz.set_text(f"GT (X-Z Plane)\nstep={t+1}")
-        sc_xz.set_offsets(np.c_[gt_pos[t, :, 0], gt_pos[t, :, 2]])
-        sc_xy.set_offsets(np.c_[gt_pos[t, :, 0], gt_pos[t, :, 1]])
+        # mask eroded nodes with NaN so matplotlib skips them
+        pos_t = gt_pos[t].copy()
+        pos_t[~erosion_valid[t]] = np.nan
+        sc_xz.set_offsets(np.c_[pos_t[:, 0], pos_t[:, 2]])
+        sc_xy.set_offsets(np.c_[pos_t[:, 0], pos_t[:, 1]])
 
         fig.canvas.draw()
         rgba    = np.asarray(fig.canvas.buffer_rgba())
@@ -1202,6 +1264,8 @@ def main():
                         help="Render GIF animations")
     parser.add_argument("--gif-fps",      type=int, default=10)
     parser.add_argument("--gif-max-frames", type=int, default=200)
+    parser.add_argument("--no-erosion-filter", action="store_true",
+                        help="Disable eroded-node masking in GIF rendering (show all nodes)")
     parser.add_argument("--gif-name",     default=None,
                         help="GIF filename stem override (single test set). "
                              "Ignored when multiple --raw-h5 are given.")

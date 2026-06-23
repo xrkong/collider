@@ -1,15 +1,15 @@
-name: "dg015_1"
+name: "dg015_2"
 description: "Suspension removed. Noise std = 0.1, k = 1."
 model:
   name: "transolverplus_net"
   params: "configs/params/transolverplus_net.yaml"
 
 overrides:
-  wandb.run_name: "dg015-bs16-slice64-noSuspension"
+  wandb.run_name: "dg015-bs8-slice128-noSuspension"
   model.hidden_dim: 256
   model.layers: 8
   model.num_heads: 8
-  model.slice_num: 64
+  model.slice_num: 128
 
   # 20 base (5 frames × (3 vel + 1 sdf)) + 2 cond (speed, mass) = 22
   model.nnode_in_features: 22
@@ -19,7 +19,7 @@ overrides:
 
   train.lr: 0.001
   train.min_lr: 0.0001
-  train.batch_size: 16
+  train.batch_size: 8
   train.accum_steps: 2
   train.n_epochs: 200
   train.push_forward_k: 1

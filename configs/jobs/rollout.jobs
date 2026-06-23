@@ -1,7 +1,8 @@
 #!/bin/bash
 #rj queue=curtin_ciraee features=a100 priority=550 runtime=1 mem=64g logdir=logs name=rollout
 
-EXP=dg010
+EXP=dg015_1
+CKPT=dg015   # checkpoint saved under this name (dg015_1 was trained before name fix)
 
 set -euo pipefail
 echo "Running on $(hostname), TMPDIR=$TMPDIR"
@@ -19,7 +20,7 @@ DATA=/data/curtin_ciraee/curtin_xiangrui/data/h5dt_50ns_10fs_mat_no_suspension
 
 python src/rollout.py \
     --experiment configs/experiments/${EXP}.yaml \
-    --ckpt-dir  outputs/checkpoints/${EXP} \
+    --ckpt-dir  outputs/checkpoints/${CKPT} \
     --raw-h5 \
         ${DATA}/T_lok_F_shape_barrier_9_3_60km/output.h5 \
         ${DATA}/T_lok_F_shape_barrier_9_3_80km_plus400kg/output.h5 \
