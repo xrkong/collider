@@ -1,0 +1,54 @@
+name: "dg011"
+description: "noise std = 0.3."
+model:
+  name: "transolverplus_net"
+  params: "configs/params/transolverplus_net.yaml"
+
+overrides:
+  model.hidden_dim: 256
+  model.layers: 8
+  model.num_heads: 8
+  model.slice_num: 32
+
+  # 20 base (5 frames × (3 vel + 1 sdf)) + 2 cond (speed, mass) = 22
+  model.nnode_in_features: 22
+  model.nnode_out_features: 3
+  model.num_node_types: 16
+  model.type_emb_dim: 4
+
+  train.lr: 0.001
+  train.min_lr: 0.0001
+  train.batch_size: 16
+  train.accum_steps: 2
+  train.n_epochs: 200
+  train.push_forward_k: 1
+  train.noise_std: 0.3
+  train.grad_clip: 5.0
+  train.val_every_epochs: 10
+  train.val_batch_size: 1
+
+  data.input_frames: 5
+  data.acc_scale: 5.0e5
+  data.norm_fields:
+    - "positions"
+    - "velocity"
+    - "acceleration"
+  data.node_type: true
+  data.node_type_field: node_mat_type_id
+
+  # condition: inherited from params (enabled: [speed, mass], n_cond=2)
+
+  data.train_dirs:
+    - "/data/curtin_ciraee/curtin_xiangrui/data/h5dt_50ns_10fs_mat/T_lok_F_shape_barrier_9_3_100km:-25.4"
+    - "/data/curtin_ciraee/curtin_xiangrui/data/h5dt_50ns_10fs_mat/T_lok_F_shape_barrier_9_3_100km_plus400kg:-25.4"
+    - "/data/curtin_ciraee/curtin_xiangrui/data/h5dt_50ns_10fs_mat/T_lok_F_shape_barrier_9_3_100km_plus800kg:-25.4"
+    - "/data/curtin_ciraee/curtin_xiangrui/data/h5dt_50ns_10fs_mat/T_lok_F_shape_barrier_9_3_60km:-25.4"
+    - "/data/curtin_ciraee/curtin_xiangrui/data/h5dt_50ns_10fs_mat/T_lok_F_shape_barrier_9_3_60km_plus400kg:-25.4"
+    - "/data/curtin_ciraee/curtin_xiangrui/data/h5dt_50ns_10fs_mat/T_lok_F_shape_barrier_9_3_60km_plus800kg:-25.4"
+    - "/data/curtin_ciraee/curtin_xiangrui/data/h5dt_50ns_10fs_mat/T_lok_F_shape_barrier_9_3_80km:-25.4"
+    - "/data/curtin_ciraee/curtin_xiangrui/data/h5dt_50ns_10fs_mat/T_lok_F_shape_barrier_9_3_80km_plus800kg:-25.4"
+
+  data.val_dirs:
+    - "/data/curtin_ciraee/curtin_xiangrui/data/h5dt_50ns_10fs_mat/T_lok_F_shape_barrier_9_3_80km_plus400kg:-25.4"
+
+notes: "Condition encoder Method A. Delta from dg005: nnode_in_features 20→22, speed+mass broadcast-concat at D6. Verify §5 checklist before full run."

@@ -112,7 +112,7 @@ https://www.anaconda.com/docs/getting-started/miniconda/install/linux-install
 
 You may activate conda by running the following command:
 ```bash
-eval "$(/data/curtin_ciraee/curtin_xiangrui/ENTER/bin/conda shell.bash hook)" 
+eval "$(/data/curtin_ciraee/curtin_xiangrui/ENTER/bin/conda shell.bash hook)" && conda activate collider
 ```
 
 Creat a conda env in this specific path.

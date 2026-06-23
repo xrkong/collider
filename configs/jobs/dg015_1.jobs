@@ -1,0 +1,26 @@
+#!/bin/bash
+#rj queue=curtin_ciraee features=a100 priority=550 runtime=24 mem=64g logdir=logs name=dg015
+
+EXP=dg015_1
+
+set -euo pipefail
+echo "Running on $(hostname), TMPDIR=$TMPDIR"
+
+source /data/curtin_ciraee/curtin_xiangrui/ENTER/etc/profile.d/conda.sh
+conda activate /data/curtin_ciraee/curtin_xiangrui/env/conda/collider
+
+nvidia-smi
+python -c "import torch; print(torch.cuda.is_available(), torch.cuda.get_device_name(0))"
+
+cd /data/curtin_ciraee/curtin_xiangrui/xrkong/collider
+
+# Set NUM_GPUS to however many GPUs this node has (check with: nvidia-smi -L | wc -l)
+NUM_GPUS=$(nvidia-smi --query-gpu=name --format=csv,noheader | wc -l)
+echo "Launching with ${NUM_GPUS} GPU(s)"
+
+accelerate launch \
+    --num_processes=${NUM_GPUS} \
+    --mixed_precision=bf16 \
+    train.py --experiment configs/experiments/${EXP}.yaml --skip-git-check
+
+echo "Done."

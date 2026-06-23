@@ -177,11 +177,12 @@ def setup_wandb(cfg: dict, git_commit: str, meta: dict):
     if not _WANDB_AVAILABLE or not wandb_cfg.get("log", True):
         return None
 
+    run_name = wandb_cfg.get("run_name") or cfg["name"]
     return wandb.init(
         project=meta["project"],
         group=meta["group"],
         job_type="train",
-        name="train",
+        name=run_name,
         config={**cfg, "git_commit": git_commit},
     )
 

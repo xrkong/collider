@@ -7,3 +7,4 @@ bin/
 wandb/
 outputs/
 configs/jobs/logs/
+artifacts/

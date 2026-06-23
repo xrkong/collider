@@ -160,11 +160,11 @@ class Transolver_plus_block(nn.Module):
 
     def forward(self, fx):
         if self.training:
-            fx = checkpoint(self.Attn, self.ln_1(fx), use_reentrant=True) + fx
+            fx = checkpoint(self.Attn, self.ln_1(fx), use_reentrant=False) + fx
         else:
             fx += self.Attn(self.ln_1(fx))
         if self.training:
-            fx = checkpoint(self.mlp, self.ln_2(fx), use_reentrant=True) + fx
+            fx = checkpoint(self.mlp, self.ln_2(fx), use_reentrant=False) + fx
         else:
             fx = self.mlp(self.ln_2(fx)) + fx
         if self.last_layer:
