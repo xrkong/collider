@@ -1,0 +1,33 @@
+#!/bin/bash
+#rj queue=curtin_ciraee features=a100 priority=550 runtime=1 mem=64g logdir=logs name=rollout17
+
+EXP=dg017
+CKPT=dg017   # checkpoint saved under this name (dg015_1 was trained before name fix)
+
+set -euo pipefail
+echo "Running on $(hostname), TMPDIR=$TMPDIR"
+
+source /data/curtin_ciraee/curtin_xiangrui/ENTER/etc/profile.d/conda.sh
+conda activate /data/curtin_ciraee/curtin_xiangrui/env/conda/collider
+
+nvidia-smi
+python -c "import torch; print(torch.cuda.is_available(), torch.cuda.get_device_name(0))"
+
+cd /data/curtin_ciraee/curtin_xiangrui/xrkong/collider
+
+# ── All test sets in one run → one W&B group, one Table ──────────────────────
+DATA=/data/curtin_ciraee/curtin_xiangrui/data/h5dt_50ns_10fs_mat
+
+python src/rollout.py \
+    --experiment configs/experiments/${EXP}.yaml \
+    --ckpt-dir  outputs/checkpoints/${CKPT} \
+    --raw-h5 ${DATA}/T_lok_F_shape_barrier_9_3_80km_plus400kg/output.h5 \
+    --mode both \
+    --gif --gif-fps 10
+
+echo "Done."
+
+ 
+        # ${DATA}/T_lok_F_shape_barrier_9_3_60km/output.h5 \
+        # 
+        # ${DATA}/T_lok_F_shape_barrier_9_3_100km_plus800kg/output.h5 \

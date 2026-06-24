@@ -359,7 +359,7 @@ def run_onestep(model, raw_data, normed, norm_stats, device,
         rmse_pos_steps.append(rmse)
 
         if (t - INPUT_FRAMES + 1) % 50 == 0:
-            print(f"  step {t-INPUT_FRAMES+1}/{T_eval-INPUT_FRAMES} | pos_rmse={rmse:.3f}")
+            print(f"  step {t-INPUT_FRAMES+1}/{T_eval-INPUT_FRAMES} | acc_rmse={rmse_acc_steps[-1]:.4f} mm/dt²")
 
     pred_acc_all = np.stack(pred_acc_list)   # (T_steps, N, 3)
     gt_acc_all   = np.stack(gt_acc_list)
@@ -455,7 +455,7 @@ def run_autoregressive(model, raw_data, normed, norm_stats, device,
             [x_window_phys[1:], x_phys_new[None]], axis=0)                  # (5, N, 3)
 
         if (t - INPUT_FRAMES + 1) % 50 == 0:
-            print(f"  step {t-INPUT_FRAMES+1}/{T_eval-INPUT_FRAMES} | pos_rmse={rmse:.3f}")
+            print(f"  step {t-INPUT_FRAMES+1}/{T_eval-INPUT_FRAMES} | acc_rmse={rmse_acc_steps[-1]:.4f} mm/dt²")
 
     pred_acc_all = np.stack(pred_acc_list)   # (T_steps, N, 3)
     gt_acc_all   = np.stack(gt_acc_list)
@@ -1123,24 +1123,24 @@ def print_summary(onestep: dict | None, autoreg: dict | None, baseline: dict):
     print("-" * 72)
 
     print(f"{'onestep baseline':<20} "
-          f"{baseline['rmse_pos_onestep'].mean():>14.3f} "
+          f"{baseline['rmse_pos_onestep'].mean():>14.3e} "
           f"{baseline['rmse_vel_onestep'].mean():>16.3f} "
           f"{baseline['rmse_acc_onestep'].mean():>17.3f}")
 
     if onestep is not None:
         print(f"{'one-step':<20} "
-              f"{onestep['rmse_pos'].mean():>14.3f} "
+              f"{onestep['rmse_pos'].mean():>14.3e} "
               f"{onestep['rmse_vel'].mean():>16.3f} "
               f"{onestep['rmse_acc'].mean():>17.3f}")
-    
+
     print(f"{'rollout baseline':<20} "
-          f"{baseline['rmse_pos_rollout'].mean():>14.3f} "
+          f"{baseline['rmse_pos_rollout'].mean():>14.3e} "
           f"{baseline['rmse_vel_rollout'].mean():>16.3f} "
           f"{baseline['rmse_acc_rollout'].mean():>17.3f}")
 
     if autoreg is not None:
         print(f"{'autoregressive':<20} "
-              f"{autoreg['rmse_pos'].mean():>14.3f} "
+              f"{autoreg['rmse_pos'].mean():>14.3e} "
               f"{autoreg['rmse_vel'].mean():>16.3f} "
               f"{autoreg['rmse_acc'].mean():>17.3f}")
 

@@ -19,10 +19,11 @@ Usage:
         outputs/rollouts/dg013/T_lok_F_shape_barrier_9_3_60km_autoregressive.pkl \
 
     python tools/collision_rmse.py \
-        --h5 /data/curtin_ciraee/curtin_xiangrui/data/h5dt_50ns_10fs_mat_no_suspension/T_lok_F_shape_barrier_9_3_100km_plus800kg/output.h5  \
-        --top-k 5000 --warmup-frames 10 \
+        --h5 /data/curtin_ciraee/curtin_xiangrui/data/h5dt_50ns_10fs_mat/T_lok_F_shape_barrier_9_3_100km_plus800kg/output.h5  \
+        --top-k 10000 --warmup-frames 1 \
         --sampling-config configs/data/sampling_config.yaml \
-        --out outputs/collision_rmse/100kph800kg_5k_10.png --use-rho
+        --out outputs/collision_rmse/100kph800kg_10k_1.png 
+        --use-rho
 """
 
 from __future__ import annotations
