@@ -29,13 +29,12 @@ Pipeline
         • material props  stored once in /metadata (from --kfile)
 
 python dataset/d3plot_to_h5_dt.py \
-    --src /home/kong/datasets/barrier/fem/T_lok_F_shape_barrier_9_3_60km \
+    --src /home/kong/datasets/barrier/fem/T_lok_F_shape_barrier_9_3_100km_plus800kg \
     --tmp /home/kong/datasets/barrier/tmp \
-    --out /home/kong/datasets/barrier/h5dt_50ns_5fs_mat/T_lok_F_shape_barrier_9_3_60km/output.h5 \
+    --out /home/kong/datasets/barrier/h5dt_50ns_10fs_mat/T_lok_F_shape_barrier_9_3_100km_plus800kg/output.h5 \
     --sampling-config configs/data/sampling_config.yaml \
     --node-stride 50 \
-    --frame-stride 5 \
-    --frame-limit 100
+    --frame-stride 10 
 
 
 HDF5 layout
@@ -1010,14 +1009,19 @@ def main() -> None:
         def update(self, arr: np.ndarray):
             """arr shape (N, D) or (T, N, D) – flatten to (M, D)"""
             arr = arr.astype(np.float64).reshape(-1, self.dim)
-            for row in arr:
-                self.count += 1
-                self.min_vals = np.minimum(self.min_vals, row)
-                self.max_vals = np.maximum(self.max_vals, row)
-                delta = row - self.mean
-                self.mean += delta / self.count
-                delta2 = row - self.mean
-                self.M2 += delta * delta2
+            m = len(arr)
+            if m == 0:
+                return
+            self.min_vals = np.minimum(self.min_vals, arr.min(axis=0))
+            self.max_vals = np.maximum(self.max_vals, arr.max(axis=0))
+            # parallel Welford merge: combine existing (count, mean, M2) with new batch
+            batch_mean = arr.mean(axis=0)
+            batch_M2   = ((arr - batch_mean) ** 2).sum(axis=0)
+            new_count  = self.count + m
+            delta      = batch_mean - self.mean
+            self.mean  = (self.count * self.mean + m * batch_mean) / new_count
+            self.M2   += batch_M2 + delta ** 2 * (self.count * m / new_count)
+            self.count = new_count
 
         def finalize(self) -> dict:
             """Return {mean, std, min, max} as lists."""
