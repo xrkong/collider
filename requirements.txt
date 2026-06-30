@@ -68,3 +68,4 @@ wheel==0.47.0
 wrapt==2.1.2
 accelerate
 lasso-python
+pyvista==0.48.4
