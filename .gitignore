@@ -8,3 +8,4 @@ wandb/
 outputs/
 configs/jobs/logs/
 artifacts/
+out/
