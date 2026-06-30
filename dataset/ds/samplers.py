@@ -20,7 +20,7 @@ class SamplerConfig:
     method: str = "fps"           # stride | random | poisson_disk | fps
     n_points: int = 10000
     seed: int = 42
-    stride_order: str = "morton"  # file | morton | x
+    stride_order: str = "file"  # file | morton | x
     poisson_radius: Optional[float] = None
     enforce_exact_n: bool = True
     density_weighted: bool = False

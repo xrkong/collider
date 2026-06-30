@@ -7,6 +7,11 @@ Axis limits are fixed to the full position range across every frame so the
 view doesn't rescale as the vehicle travels — that's the whole point of a
 sanity-check GIF: confirm the downsampled set tracks the real motion.
 
+Eroded nodes (/states/node_alive == 0, see build_dataset.py) are dropped
+from each frame's scatter — otherwise a dead node's stale last position
+keeps appearing forever after its elements erode away. Older H5 files
+without node_alive fall back to showing every node.
+
 Usage
 -----
 python -m dataset.ds.visualize --h5 output.h5 --out anim.gif
@@ -48,6 +53,10 @@ def make_gif(
         positions = f["states/positions"][:]                       # (T, N, 3)
         times = f["states/times"][:]                                # (T,)
         region_label = f["metadata/region_label"][:].astype(str)    # (N,)
+        if "node_alive" in f["states"]:
+            alive = f["states/node_alive"][:].astype(bool)          # (T, N)
+        else:
+            alive = np.ones(positions.shape[:2], dtype=bool)
 
     T = positions.shape[0]
     idx = np.arange(0, T, frame_stride)
@@ -63,10 +72,11 @@ def make_gif(
 
     print(f"Rendering {len(idx)} GIF frames (of {T} available) …")
     frames: list[Image.Image] = []
-    for n, fi in enumerate(idx):
+    for fi in idx:
         fig, ax = plt.subplots(figsize=(11, 6), dpi=dpi)
+        n_eroded = int((~alive[fi]).sum())
         for reg in present_regions:
-            mask = region_label == reg
+            mask = (region_label == reg) & alive[fi]
             st = REGION_STYLE.get(reg, DEFAULT_STYLE)
             ax.scatter(positions[fi, mask, 0], positions[fi, mask, 1],
                       c=st["color"], s=st["s"], alpha=st["alpha"],
@@ -76,9 +86,15 @@ def make_gif(
         ax.set_aspect("equal")
         ax.set_xlabel("X (mm)")
         ax.set_ylabel("Y (mm)")
-        ax.set_title(f"t = {times[fi] * 1e3:.1f} ms   (frame {fi + 1}/{T})")
-        if n == 0:
-            ax.legend(loc="upper right", fontsize=7, markerscale=4, framealpha=0.9)
+        title = f"t = {times[fi] * 1e3:.1f} ms   (frame {fi + 1}/{T})"
+        if n_eroded:
+            title += f"   [{n_eroded} eroded]"
+        ax.set_title(title)
+        # fixed loc + bbox_to_anchor on every frame so the legend box sits at
+        # the exact same pixel position throughout the animation, regardless
+        # of which regions/markers happen to be present in this frame
+        ax.legend(loc="upper right", bbox_to_anchor=(1.0, 1.0), fontsize=7,
+                  markerscale=4, framealpha=0.9)
         fig.tight_layout()
 
         fig.canvas.draw()

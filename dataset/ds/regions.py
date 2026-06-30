@@ -21,8 +21,17 @@ def centerline_distance(x: np.ndarray, y: np.ndarray) -> np.ndarray:
     return np.abs(a * x + b * y + c) / CENTERLINE_DENOM
 
 
-def build_region_masks(mesh: MeshData) -> dict[str, np.ndarray]:
-    """Boolean masks (len = mesh.n_nodes) for each of the six sampling regions."""
+def build_region_masks(
+    mesh: MeshData,
+    exclude_pids: set[int] | None = None,
+) -> dict[str, np.ndarray]:
+    """Boolean masks (len = mesh.n_nodes) for each of the six sampling regions.
+
+    exclude_pids: PIDs to drop from every region before any sampling happens
+    (e.g. continuously-rotating tire/rim/spindle parts — see
+    dataset/ds/part_filters.py). Excluded nodes are never candidates for any
+    region, not just filtered post-hoc from the final 100k.
+    """
     pid = mesh.node_pid
     coords = mesh.coords
 
@@ -39,7 +48,7 @@ def build_region_masks(mesh: MeshData) -> dict[str, np.ndarray]:
     mask_veh_near    = mask_vehicle_all & (d >= 500.0) & (d < 1000.0)
     mask_veh_far     = mask_vehicle_all & (d >= 1000.0)
 
-    return {
+    masks = {
         "barrier_fine":   mask_fine,
         "barrier_coarse": mask_coarse,
         "force_keep":     mask_force_keep,
@@ -47,3 +56,9 @@ def build_region_masks(mesh: MeshData) -> dict[str, np.ndarray]:
         "veh_near":       mask_veh_near,
         "veh_far":        mask_veh_far,
     }
+
+    if exclude_pids:
+        mask_excluded = np.isin(pid, list(exclude_pids))
+        masks = {name: m & ~mask_excluded for name, m in masks.items()}
+
+    return masks

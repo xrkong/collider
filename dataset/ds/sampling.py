@@ -106,8 +106,13 @@ def allocate_per_part(
 def sample_mesh(
     mesh: MeshData,
     region_configs: list[RegionConfig] | None = None,
+    exclude_pids: set[int] | None = None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Run the full sampling pipeline.
+
+    exclude_pids: PIDs dropped from every region before sampling (e.g.
+    continuously-rotating tire/rim/spindle parts — see part_filters.py).
+    These nodes are never candidates for any region, including force_keep.
 
     Returns
     -------
@@ -118,7 +123,7 @@ def sample_mesh(
     if region_configs is None:
         region_configs = DEFAULT_REGION_CONFIGS
 
-    masks = build_region_masks(mesh)
+    masks = build_region_masks(mesh, exclude_pids=exclude_pids)
 
     fk_idx = np.where(masks["force_keep"])[0]
     all_sampled: list[np.ndarray] = [fk_idx]

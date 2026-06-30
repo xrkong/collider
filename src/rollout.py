@@ -16,12 +16,12 @@ Conventions (must match the exporter / loader / trainer):
 
 Usage:
     python src/rollout.py \
-        --checkpoint outputs/checkpoints/dg_001/checkpoint-best.safetensors \
-        --experiment configs/experiments/dg_001.yaml \
-        --raw-h5 /data/curtin_ciraee/curtin_xiangrui/data/h5dt_50ns_5fs_mat/T_lok_F_shape_barrier_9_3_100km/output.h5 \
+        --checkpoint outputs/checkpoints/lc001/checkpoint-best.safetensors \
+        --experiment configs/experiments/lc001.yaml \
+        --raw-h5 /home/kong/datasets/barrier/h5_fps/T_lok_F_shape_barrier_9_3_60km.h5 \
         --mode both \
         --gif --gif-fps 10 \
-        --gif-name 100kph
+        --gif-name 60kph
 
     # GT-only GIF — no checkpoint/experiment needed
     python src/rollout.py \
@@ -52,7 +52,7 @@ sys.path.insert(0, str(PROJECT_ROOT))
 
 import models  # noqa: F401
 from models.registry import build_model
-from src.dataset import NormStats
+from src.dataset import NormStats, traj_name_from_h5
 from src.conditions import CondConfig, parse_conditions, normalize_conditions
 
 try:
@@ -172,49 +172,125 @@ def load_model(checkpoint_path: str, experiment_path: str, device: torch.device)
 
 # ── Raw h5 loading ────────────────────────────────────────────────────────────
 
+def _derive_padded_kinematics(pos: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Forward-diff velocity/acceleration (dt=1) at full T length, tail-padded.
+
+    Mirrors exactly what the legacy exporter (dataset/d3plot_to_h5_dt.py)
+    stored directly: vel[i]=pos[i+1]-pos[i], acc[i]=vel[i+1]-vel[i], with the
+    last 1-2 frames repeating the last valid value (no real finite difference
+    exists there). Used when states/velocity or states/acceleration are
+    absent from the h5 (the new dataset/ds/build_dataset.py format only
+    stores positions) so every downstream index raw_data["velocity"][t] for
+    t in [0, T) behaves identically to the legacy stored arrays.
+    """
+    T = pos.shape[0]
+    pos64 = pos.astype(np.float64)
+    vel = np.zeros_like(pos64)
+    acc = np.zeros_like(pos64)
+    n_vel_valid = max(T - 1, 0)
+    n_acc_valid = max(T - 2, 0)
+    if n_vel_valid > 0:
+        vel[:n_vel_valid] = np.diff(pos64, axis=0)
+        vel[n_vel_valid:] = vel[n_vel_valid - 1]
+    if n_acc_valid > 0:
+        acc[:n_acc_valid] = np.diff(vel[:n_vel_valid], axis=0)
+        acc[n_acc_valid:] = acc[n_acc_valid - 1]
+    return vel.astype(np.float32), acc.astype(np.float32)
+
+
 def load_raw_h5(h5_path: str, node_type_field: str | None = None) -> dict:
     """Load full trajectory and part metadata from raw h5.
 
     Returns dict with:
         positions:    (T, N, 3)  float32
-        velocity:     (T, N, 3)  float32
-        acceleration: (T, N, 3)  float32
-        stress:       (T, N, 6)  float32
+        velocity:     (T, N, 3)  float32   read directly, or derived from
+        acceleration: (T, N, 3)  float32   positions (forward diff, tail-padded)
+        node_alive:   (T, N)     bool      erosion mask; all-True if absent
         times:        (T,)       float64
         node_part_id:   (N,)     int64
         node_part_name: (N,)     str
-        part_ids:       (P,)     int64
+        part_ids:       (P,)     int64     unique part IDs (derived if absent)
         part_names:     (P,)     str
     """
     if not _H5PY:
         raise ImportError("h5py required")
 
     with h5py.File(h5_path, "r") as f:
+        positions = f["states/positions"][:].astype(np.float32)
+
+        if "states/velocity" in f and "states/acceleration" in f:
+            velocity     = f["states/velocity"][:].astype(np.float32)
+            acceleration = f["states/acceleration"][:].astype(np.float32)
+        else:
+            velocity, acceleration = _derive_padded_kinematics(positions)
+
+        has_node_alive = "states/node_alive" in f
+        node_alive = (
+            f["states/node_alive"][:].astype(bool) if has_node_alive
+            else np.ones(positions.shape[:2], dtype=bool)
+        )
+
         data = {
-            "positions":    f["states/positions"][:].astype(np.float32),
-            "velocity":     f["states/velocity"][:].astype(np.float32),
-            "acceleration": f["states/acceleration"][:].astype(np.float32),
+            "positions":    positions,
+            "velocity":     velocity,
+            "acceleration": acceleration,
+            "node_alive":   node_alive,
+            "has_node_alive": has_node_alive,  # False ⇒ node_alive is a stub (all-True), use compute_erosion_mask instead
             "times":        f["states/times"][:],
             "node_part_id":  f["metadata/node_part_id"][:],
             "node_part_name": np.array([
                 n.decode("utf-8").strip("\x00") if isinstance(n, bytes) else str(n)
                 for n in f["metadata/node_part_name"][:]
             ]),
-            "part_ids":   f["metadata/part_ids"][:],
-            "part_names": np.array([
+        }
+        if "metadata/part_ids" in f and "metadata/part_names" in f:
+            data["part_ids"]   = f["metadata/part_ids"][:]
+            data["part_names"] = np.array([
                 n.decode("utf-8").strip("\x00") if isinstance(n, bytes) else str(n)
                 for n in f["metadata/part_names"][:]
-            ]),
-        }
+            ])
+        else:
+            # New format has no compact unique-part-list arrays — derive them
+            # from the per-node id/name (used for visualization grouping only).
+            _, first_idx = np.unique(data["node_part_id"], return_index=True)
+            order = np.sort(first_idx)
+            data["part_ids"]   = data["node_part_id"][order]
+            data["part_names"] = data["node_part_name"][order]
+
         if node_type_field is not None:
             nt_key = f"metadata/{node_type_field}"
             if nt_key not in f:
-                raise KeyError(f"{h5_path}: missing node_type field '{nt_key}'")
+                raise KeyError(
+                    f"{h5_path}: missing node_type field '{nt_key}'. "
+                    f"Available metadata fields: {sorted(f['metadata'].keys())}. "
+                    f"For dataset/ds/build_dataset.py output, set "
+                    f"data.node_type_field: region_id in the experiment config."
+                )
             data["node_type"] = f[nt_key][:].astype(np.int64)  # (N,)
+
+        # Region label (dataset/ds/build_dataset.py only) — used to restrict
+        # RMSE to veh_contact, since the global average over all N nodes is
+        # diluted by the ~90% of nodes (far barrier, far vehicle) that barely
+        # move and is insensitive to how well the model captures the actual
+        # collision dynamics. None for legacy-format h5s without region_label.
+        if "metadata/region_label" in f:
+            region_label = np.array([
+                n.decode("utf-8").strip("\x00") if isinstance(n, bytes) else str(n)
+                for n in f["metadata/region_label"][:]
+            ])
+            data["region_label"]      = region_label
+            data["veh_contact_mask"]  = (region_label == "veh_contact")
+        else:
+            data["region_label"]     = None
+            data["veh_contact_mask"] = None
 
     T, N, _ = data["positions"].shape
     P       = len(data["part_ids"])
-    print(f"[Data] {T} frames, {N} nodes, {P} parts")
+    n_eroded_final = int((~data["node_alive"][-1]).sum())
+    n_vc = int(data["veh_contact_mask"].sum()) if data["veh_contact_mask"] is not None else 0
+    print(f"[Data] {T} frames, {N} nodes, {P} parts"
+          + (f", {n_eroded_final} eroded by final frame" if n_eroded_final else "")
+          + (f", {n_vc} veh_contact nodes" if n_vc else ""))
     return data
 
 
@@ -316,8 +392,18 @@ def run_onestep(model, raw_data, normed, norm_stats, device,
     N        = normed_v.shape[1]
     pred_pos_list, gt_pos_list, rmse_pos_steps = [], [], []
     rmse_vel_steps, rmse_acc_steps = [], []
+    rmse_pos_vc_steps = []   # pos RMSE restricted to veh_contact nodes
     pred_acc_list, gt_acc_list = [], []
     pred_acc_norm_list, gt_acc_norm_list = [], []
+
+    # veh_contact-only RMSE: the all-node average is diluted by the ~90% of
+    # nodes (far barrier, far vehicle) that barely move, so it's insensitive
+    # to how well the model captures the actual collision dynamics.
+    vc_mask = raw_data.get("veh_contact_mask")
+    if vc_mask is None:
+        print("[One-step] WARNING: no region_label in this h5 — "
+              "veh_contact RMSE unavailable, falling back to all-node RMSE")
+        vc_mask = np.ones(N, dtype=bool)
 
     # Method A: broadcast cond once, reuse every step (D3). Empty tensor when n_cond=0.
     if cond_t is None:
@@ -334,6 +420,11 @@ def run_onestep(model, raw_data, normed, norm_stats, device,
 
         x_in = torch.cat([x_vel_flat, x_sdf, cond_b], dim=-1)           # (1, N, T_in*4 + n_cond)
 
+        # Erosion mask: zero out input features for nodes already eroded at
+        # the last input frame, before the model sees them (mirrors training).
+        alive_t = torch.from_numpy(raw_data["node_alive"][t - 1].astype(np.float32))
+        x_in = x_in * alive_t.to(device).view(1, -1, 1)
+
         a_pred_norm = model(x_in, node_type).squeeze(0)  # (N, 3)
 
         # 上一帧 GT 速度 / 位置 (物理量) — one-step 模式始终用 GT
@@ -344,6 +435,7 @@ def run_onestep(model, raw_data, normed, norm_stats, device,
 
         x_gt = raw_data["positions"][t]
         rmse = float(np.sqrt(np.mean((x_new - x_gt) ** 2)))
+        rmse_vc = float(np.sqrt(np.mean((x_new[vc_mask] - x_gt[vc_mask]) ** 2)))
 
         v_gt = raw_data["velocity"][t]
         a_gt = raw_data["acceleration"][t]
@@ -357,9 +449,12 @@ def run_onestep(model, raw_data, normed, norm_stats, device,
         pred_pos_list.append(x_new)
         gt_pos_list.append(x_gt)
         rmse_pos_steps.append(rmse)
+        rmse_pos_vc_steps.append(rmse_vc)
 
         if (t - INPUT_FRAMES + 1) % 50 == 0:
-            print(f"  step {t-INPUT_FRAMES+1}/{T_eval-INPUT_FRAMES} | acc_rmse={rmse_acc_steps[-1]:.4f} mm/dt²")
+            print(f"  step {t-INPUT_FRAMES+1}/{T_eval-INPUT_FRAMES} | "
+                  f"acc_rmse={rmse_acc_steps[-1]:.4f} mm/dt² | "
+                  f"pos_rmse_veh_contact={rmse_vc:.2f} mm")
 
     pred_acc_all = np.stack(pred_acc_list)   # (T_steps, N, 3)
     gt_acc_all   = np.stack(gt_acc_list)
@@ -377,10 +472,15 @@ def run_onestep(model, raw_data, normed, norm_stats, device,
         print(f"[One-step] RMSE physical    = {rmse_physical:.4f} mm/dt²")
         print(f"[One-step] Amplification    = {rmse_physical / rmse_asinh:.1f}×")
 
+    rmse_pos_vc = np.array(rmse_pos_vc_steps)
+    print(f"[One-step] Pos RMSE (all nodes)   = {np.mean(rmse_pos_steps):.2f} mm")
+    print(f"[One-step] Pos RMSE (veh_contact) = {rmse_pos_vc.mean():.2f} mm")
+
     return {
         "pred_frames": _pack_pos_only(pred_pos_list),
         "gt_frames":   _pack_pos_only(gt_pos_list),
         "rmse_pos":    np.array(rmse_pos_steps),
+        "rmse_pos_veh_contact": rmse_pos_vc,
         "rmse_vel":    np.array(rmse_vel_steps),
         "rmse_acc":    rmse_acc,
         "mode":        "onestep",
@@ -395,6 +495,7 @@ def run_autoregressive(model, raw_data, normed, norm_stats, device,
 
     pred_pos_list, gt_pos_list, rmse_pos_steps = [], [], []
     rmse_vel_steps, rmse_acc_steps = [], []
+    rmse_pos_vc_steps = []   # pos RMSE restricted to veh_contact nodes
     pred_acc_list, gt_acc_list = [], []
     pred_acc_norm_list, gt_acc_norm_list = [], []
 
@@ -406,6 +507,13 @@ def run_autoregressive(model, raw_data, normed, norm_stats, device,
     # 物理速度 / 位置当前状态
     v_phys = raw_data["velocity"][INPUT_FRAMES - 1].copy()         # (N, 3)
     x_phys = raw_data["positions"][INPUT_FRAMES - 1].copy()        # (N, 3)
+
+    # veh_contact-only RMSE: see run_onestep for rationale.
+    vc_mask = raw_data.get("veh_contact_mask")
+    if vc_mask is None:
+        print("[Autoregressive] WARNING: no region_label in this h5 — "
+              "veh_contact RMSE unavailable, falling back to all-node RMSE")
+        vc_mask = np.ones(N, dtype=bool)
 
     # Method A: broadcast cond once, reuse every step (D3). Empty tensor when n_cond=0.
     if cond_t is None:
@@ -422,6 +530,12 @@ def run_autoregressive(model, raw_data, normed, norm_stats, device,
 
         x_in = torch.cat([x_vel_flat, x_sdf, cond_b], dim=-1)                     # (1, N, T_in*4 + n_cond)
 
+        # Erosion mask: zero out input features for nodes already eroded at
+        # the last input frame, before the model sees them (mirrors training).
+        # Uses the GT erosion timeline since the model doesn't predict erosion.
+        alive_t = torch.from_numpy(raw_data["node_alive"][t - 1].astype(np.float32))
+        x_in = x_in * alive_t.to(device).view(1, -1, 1)
+
         a_pred_norm = model(x_in, node_type).squeeze(0)  # (N, 3)
 
         a_phys_new, v_phys_new, x_phys_new = integrate_accel(
@@ -429,6 +543,7 @@ def run_autoregressive(model, raw_data, normed, norm_stats, device,
 
         x_gt = raw_data["positions"][t]
         rmse = float(np.sqrt(np.mean((x_phys_new - x_gt) ** 2)))
+        rmse_vc = float(np.sqrt(np.mean((x_phys_new[vc_mask] - x_gt[vc_mask]) ** 2)))
 
         v_gt = raw_data["velocity"][t]
         a_gt = raw_data["acceleration"][t]
@@ -442,6 +557,7 @@ def run_autoregressive(model, raw_data, normed, norm_stats, device,
         pred_pos_list.append(x_phys_new)
         gt_pos_list.append(x_gt)
         rmse_pos_steps.append(rmse)
+        rmse_pos_vc_steps.append(rmse_vc)
 
         # ── 更新状态 ──
         v_phys = v_phys_new
@@ -455,7 +571,9 @@ def run_autoregressive(model, raw_data, normed, norm_stats, device,
             [x_window_phys[1:], x_phys_new[None]], axis=0)                  # (5, N, 3)
 
         if (t - INPUT_FRAMES + 1) % 50 == 0:
-            print(f"  step {t-INPUT_FRAMES+1}/{T_eval-INPUT_FRAMES} | acc_rmse={rmse_acc_steps[-1]:.4f} mm/dt²")
+            print(f"  step {t-INPUT_FRAMES+1}/{T_eval-INPUT_FRAMES} | "
+                  f"acc_rmse={rmse_acc_steps[-1]:.4f} mm/dt² | "
+                  f"pos_rmse_veh_contact={rmse_vc:.2f} mm")
 
     pred_acc_all = np.stack(pred_acc_list)   # (T_steps, N, 3)
     gt_acc_all   = np.stack(gt_acc_list)
@@ -473,10 +591,15 @@ def run_autoregressive(model, raw_data, normed, norm_stats, device,
         print(f"[Autoregressive] RMSE physical    = {rmse_physical:.4f} mm/dt²")
         print(f"[Autoregressive] Amplification    = {rmse_physical / rmse_asinh:.1f}×")
 
+    rmse_pos_vc = np.array(rmse_pos_vc_steps)
+    print(f"[Autoregressive] Pos RMSE (all nodes)   = {np.mean(rmse_pos_steps):.2f} mm")
+    print(f"[Autoregressive] Pos RMSE (veh_contact) = {rmse_pos_vc.mean():.2f} mm")
+
     return {
         "pred_frames": _pack_pos_only(pred_pos_list),
         "gt_frames":   _pack_pos_only(gt_pos_list),
         "rmse_pos":    np.array(rmse_pos_steps),
+        "rmse_pos_veh_contact": rmse_pos_vc,
         "rmse_vel":    np.array(rmse_vel_steps),
         "rmse_acc":    rmse_acc,
         "mode":        "autoregressive",
@@ -507,12 +630,22 @@ def compute_baseline(raw_data: dict, dt: float, input_frames: int) -> dict:
     T = pos.shape[0]
     IF = input_frames
 
+    # veh_contact-only RMSE: see run_onestep for rationale. Falls back to all
+    # nodes for legacy h5s without region_label, same as the model-side metric.
+    vc_mask = raw_data.get("veh_contact_mask")
+    if vc_mask is None:
+        vc_mask = np.ones(pos.shape[1], dtype=bool)
+
     def rms(x):  # RMS over nodes & dims for one frame
         return np.sqrt(np.mean(x ** 2))
+
+    def rms_vc(x):  # RMS restricted to veh_contact nodes
+        return np.sqrt(np.mean(x[vc_mask] ** 2))
 
     out = {k: [] for k in [
         "rmse_pos_onestep", "rmse_vel_onestep", "rmse_acc_onestep",
         "rmse_pos_rollout", "rmse_vel_rollout", "rmse_acc_rollout",
+        "rmse_pos_onestep_veh_contact", "rmse_pos_rollout_veh_contact",
     ]}
 
     # rollout: acc=0 → 速度冻结、位置匀速外推
@@ -531,12 +664,14 @@ def compute_baseline(raw_data: dict, dt: float, input_frames: int) -> dict:
         x_pred_os = pos[t - 1] + v_pred_os * dt
         out["rmse_vel_onestep"].append(rms(v_pred_os - vel[t]))
         out["rmse_pos_onestep"].append(rms(x_pred_os - pos[t]))
+        out["rmse_pos_onestep_veh_contact"].append(rms_vc(x_pred_os - pos[t]))
 
         # ---- rollout：从最后输入帧自我递推 (constant-velocity) ----
         steps = t - (IF - 1)
         x_pred_rl = x0 + v0 * dt * steps                # 匀速外推
         out["rmse_vel_rollout"].append(rms(v0 - vel[t]))     # v 冻结
         out["rmse_pos_rollout"].append(rms(x_pred_rl - pos[t]))
+        out["rmse_pos_rollout_veh_contact"].append(rms_vc(x_pred_rl - pos[t]))
 
     return {k: np.array(v) for k, v in out.items()}
 
@@ -589,12 +724,97 @@ def plot_rmse_vs_timestep(onestep: dict | None, autoreg: dict | None, out_dir: P
                 continue
             rmse  = result[rkey] * scale
             steps = np.arange(1, len(rmse) + 1)
-            ax.plot(steps, rmse, color="#1f77b4", linestyle="-", linewidth=1.5)
+            ax.plot(steps, rmse, color="#1f77b4", linestyle="-", linewidth=1.5,
+                    label="all nodes" if rkey == "rmse_pos" else None)
+            # Position row: overlay the veh_contact-only RMSE — the all-node
+            # curve above is diluted by far-field nodes that barely move.
+            if rkey == "rmse_pos" and "rmse_pos_veh_contact" in result:
+                rmse_vc = result["rmse_pos_veh_contact"] * scale
+                ax.plot(steps, rmse_vc, color="#d62728", linestyle="-", linewidth=1.5,
+                        label="veh_contact")
+                ax.legend(fontsize=8)
 
     out_path = out_dir / "rmse_vs_timestep.png"
     fig.savefig(str(out_path), dpi=200, bbox_inches="tight")
     plt.close(fig)
     print(f"[Plot] RMSE plot saved → {out_path}")
+
+
+def plot_os_ar_veh_contact_rmse(
+    onestep: dict | None,
+    autoreg: dict | None,
+    out_path: "str | Path",
+) -> None:
+    """Plot one-step vs autoregressive veh_contact pos RMSE on a dual-axis plot.
+
+    One-step error is always far smaller than autoregressive (rollout) error
+    — one-step is reset to ground truth every frame, autoregressive
+    accumulates drift — so sharing a y-axis flattens the one-step curve to
+    near-zero. Left axis = OS scale, right axis = AR scale, so both curves
+    are readable on their own terms.
+
+    Falls back to the all-node rmse_pos if rmse_pos_veh_contact isn't in a
+    result (legacy pkl from before that field existed, or a legacy-format h5
+    without region_label).
+    """
+    if not _VIS:
+        print("Warning: matplotlib/Pillow not available — skipping plot")
+        return
+    if onestep is None and autoreg is None:
+        print("[Plot] Nothing to plot — both onestep and autoreg are None")
+        return
+
+    def _series(result):
+        if result is None:
+            return None
+        key = "rmse_pos_veh_contact" if "rmse_pos_veh_contact" in result else "rmse_pos"
+        if key == "rmse_pos":
+            print("[Plot] WARNING: rmse_pos_veh_contact not in this pkl — "
+                  "falling back to all-node rmse_pos")
+        return result[key], key
+
+    plt.rcParams.update(_RCPARAMS)
+    fig, ax_os = plt.subplots(figsize=(9, 5), constrained_layout=True)
+
+    handles, labels = [], []
+
+    os_series = _series(onestep)
+    if os_series is not None:
+        rmse_os, key_os = os_series
+        steps_os = np.arange(1, len(rmse_os) + 1)
+        line_os, = ax_os.plot(steps_os, rmse_os, color="#1f77b4", linewidth=1.6,
+                              label=f"one-step ({key_os})")
+        ax_os.set_ylabel("OS pos RMSE (mm)", color="#1f77b4")
+        ax_os.tick_params(axis="y", labelcolor="#1f77b4")
+        handles.append(line_os)
+        labels.append(line_os.get_label())
+    else:
+        ax_os.set_ylabel("OS pos RMSE (mm)")
+
+    ax_os.set_xlabel("Timestep")
+    ax_os.grid(True, alpha=0.3, linestyle=":")
+
+    ar_series = _series(autoreg)
+    if ar_series is not None:
+        rmse_ar, key_ar = ar_series
+        steps_ar = np.arange(1, len(rmse_ar) + 1)
+        ax_ar = ax_os.twinx()
+        line_ar, = ax_ar.plot(steps_ar, rmse_ar, color="#d62728", linewidth=1.6,
+                              label=f"autoregressive ({key_ar})")
+        ax_ar.set_ylabel("AR pos RMSE (mm)", color="#d62728")
+        ax_ar.tick_params(axis="y", labelcolor="#d62728")
+        handles.append(line_ar)
+        labels.append(line_ar.get_label())
+
+    ax_os.legend(handles, labels, loc="upper left", fontsize=9)
+    fig.suptitle("One-step vs Autoregressive — veh_contact pos RMSE", fontsize=13,
+                fontfamily="DejaVu Serif")
+
+    out_path = Path(out_path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(str(out_path), dpi=200, bbox_inches="tight")
+    plt.close(fig)
+    print(f"[Plot] OS/AR dual-axis RMSE plot saved → {out_path}")
 
 
 def plot_multi_rmse(
@@ -821,7 +1041,10 @@ def render_vis(
 
     pred_frames = result["pred_frames"]
     gt_frames   = result["gt_frames"]
-    rmse_pos    = result["rmse_pos"]
+    # veh_contact-only RMSE for the on-frame title — the all-node average is
+    # diluted by far-field nodes that barely move and reads as ~0.0mm at this
+    # precision for most steps; falls back to all-node if unavailable.
+    rmse_pos    = result.get("rmse_pos_veh_contact", result["rmse_pos"])
     mode        = result["mode"]
     T           = min(len(pred_frames), max_frames)
 
@@ -922,7 +1145,15 @@ def render_vis(
     # 取消了原有的 fig.axes[0].legend() 避免画面遮挡
     N_nodes = gt_pos.shape[1]
     if filter_eroded:
-        erosion_valid_gt   = compute_erosion_mask(gt_pos)
+        # Prefer the real h5 erosion mask (dataset/ds/build_dataset.py's
+        # node_alive) for GT when available — only fall back to the
+        # position-jump heuristic for legacy h5s that lack it. Predictions
+        # never have ground-truth erosion status, so they always use the
+        # heuristic.
+        if raw_data.get("has_node_alive"):
+            erosion_valid_gt = raw_data["node_alive"][INPUT_FRAMES: INPUT_FRAMES + len(gt_pos)]
+        else:
+            erosion_valid_gt = compute_erosion_mask(gt_pos)
         erosion_valid_pred = compute_erosion_mask(pred_pos)
     else:
         erosion_valid_gt   = np.ones((len(gt_pos),   N_nodes), dtype=bool)
@@ -938,7 +1169,7 @@ def render_vis(
         Path(save_png_dir).mkdir(parents=True, exist_ok=True)
 
     for t in range(T):
-        title_pred_xz.set_text(f"PRED [{mode}] (X-Z Plane)\nstep={t+1} | pos_rmse={rmse_pos[t]:.1f}mm")
+        title_pred_xz.set_text(f"PRED [{mode}] (X-Z Plane)\nstep={t+1} | pos_rmse_veh_contact={rmse_pos[t]:.2e}mm")
         title_gt_xz.set_text(f"GT (X-Z Plane)\nstep={t+1}")
 
         for row in range(2):
@@ -1061,7 +1292,11 @@ def render_gt_only(
     axs[1].set_title("GT (X-Y Plane)", color="black", fontsize=FONTSIZE, pad=3)
 
     if filter_eroded:
-        erosion_valid = compute_erosion_mask(gt_pos)
+        # Prefer the real h5 erosion mask when available (see render_vis).
+        if raw_data.get("has_node_alive"):
+            erosion_valid = raw_data["node_alive"][:T]
+        else:
+            erosion_valid = compute_erosion_mask(gt_pos)
     else:
         erosion_valid = np.ones(gt_pos.shape[:2], dtype=bool)
 
@@ -1116,35 +1351,44 @@ def print_summary(onestep: dict | None, autoreg: dict | None, baseline: dict):
         print(f"  autoreg  : {autoreg['rmse_acc'][-10:]}")
         print(f"  equal    : {np.array_equal(onestep['rmse_acc'][-10:], autoreg['rmse_acc'][-10:])}")
 
-    print("\n" + "=" * 72)
+    print("\n" + "=" * 90)
     print("ROLLOUT SUMMARY")
-    print("=" * 72)
-    print(f"{'Mode':<20} {'pos_rmse(mm)':>14} {'vel_rmse(mm/dt)':>16} {'acc_rmse(mm/dt²)':>17}")
-    print("-" * 72)
+    # pos_rmse(mm) is the all-node average — diluted by the ~90% of nodes (far
+    # barrier, far vehicle) that barely move, so it's not very sensitive to
+    # model quality. pos_rmse_veh_contact(mm) is the metric that actually
+    # tracks how well the collision dynamics are captured.
+    print("=" * 90)
+    print(f"{'Mode':<20} {'pos_rmse(mm)':>14} {'pos_rmse_veh_contact(mm)':>26} "
+          f"{'vel_rmse(mm/dt)':>16} {'acc_rmse(mm/dt²)':>17}")
+    print("-" * 90)
 
     print(f"{'onestep baseline':<20} "
           f"{baseline['rmse_pos_onestep'].mean():>14.3e} "
+          f"{baseline['rmse_pos_onestep_veh_contact'].mean():>26.3e} "
           f"{baseline['rmse_vel_onestep'].mean():>16.3f} "
           f"{baseline['rmse_acc_onestep'].mean():>17.3f}")
 
     if onestep is not None:
         print(f"{'one-step':<20} "
               f"{onestep['rmse_pos'].mean():>14.3e} "
+              f"{onestep['rmse_pos_veh_contact'].mean():>26.3e} "
               f"{onestep['rmse_vel'].mean():>16.3f} "
               f"{onestep['rmse_acc'].mean():>17.3f}")
 
     print(f"{'rollout baseline':<20} "
           f"{baseline['rmse_pos_rollout'].mean():>14.3e} "
+          f"{baseline['rmse_pos_rollout_veh_contact'].mean():>26.3e} "
           f"{baseline['rmse_vel_rollout'].mean():>16.3f} "
           f"{baseline['rmse_acc_rollout'].mean():>17.3f}")
 
     if autoreg is not None:
         print(f"{'autoregressive':<20} "
               f"{autoreg['rmse_pos'].mean():>14.3e} "
+              f"{autoreg['rmse_pos_veh_contact'].mean():>26.3e} "
               f"{autoreg['rmse_vel'].mean():>16.3f} "
               f"{autoreg['rmse_acc'].mean():>17.3f}")
 
-    print("=" * 72)
+    print("=" * 90)
 
 
 # ── WandB upload ──────────────────────────────────────────────────────────────
@@ -1288,7 +1532,7 @@ def main():
         h5_path  = args.raw_h5[0]
         tee      = _Tee() if args.wandb_project else None
         raw_data = load_raw_h5(h5_path)
-        h5_stem  = Path(h5_path).parent.name
+        h5_stem  = traj_name_from_h5(h5_path)
         out_dir  = Path(args.output_dir or PROJECT_ROOT / "outputs" / "rollouts" / h5_stem)
         out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -1410,7 +1654,7 @@ def main():
     if wandb_run:
         table = wandb.Table(columns=[
             "test_set", "traj_id", "mode",
-            "pos_rmse_mm", "vel_rmse_mm_dt", "acc_rmse_mm_dt2",
+            "pos_rmse_mm", "pos_rmse_veh_contact_mm", "vel_rmse_mm_dt", "acc_rmse_mm_dt2",
             "weight_kg", "speed_kmh", "angle_deg", "concrete_type",
         ])
 
@@ -1418,6 +1662,10 @@ def main():
 
     mse_by_ts: dict[str, list[float]] = {}
     all_pos_rmse: list[float] = []
+    # veh_contact-only: the metric that actually tracks collision-dynamics
+    # quality (the all-node average above is diluted by far-field nodes).
+    mse_vc_by_ts: dict[str, list[float]] = {}
+    all_pos_rmse_vc: list[float] = []
 
     # Track last results for --plot (single-test-set use)
     last_onestep = last_autoreg = last_baseline = None
@@ -1426,7 +1674,7 @@ def main():
 
     # ── Per-test-set loop ─────────────────────────────────────────────────
     for h5_path in args.raw_h5:
-        ts_name = Path(h5_path).parent.name
+        ts_name = traj_name_from_h5(h5_path)
         multi   = len(args.raw_h5) > 1
         print(f"\n[Rollout] === Test set: {ts_name} ===")
 
@@ -1517,33 +1765,40 @@ def main():
         # ── Add rows to W&B Table ─────────────────────────────────────────
         if table is not None:
             if onestep is not None:
-                pos_rmse_os = float(onestep["rmse_pos"].mean())
+                pos_rmse_os    = float(onestep["rmse_pos"].mean())
+                pos_rmse_os_vc = float(onestep["rmse_pos_veh_contact"].mean())
                 table.add_data(
                     ts_name, ts_name, "os",
-                    pos_rmse_os,
+                    pos_rmse_os, pos_rmse_os_vc,
                     float(onestep["rmse_vel"].mean()),
                     float(onestep["rmse_acc"].mean()),
                     weight_kg, speed_kmh, angle_deg, "N",
                 )
                 mse_by_ts.setdefault(ts_name, []).append(pos_rmse_os)
                 all_pos_rmse.append(pos_rmse_os)
+                mse_vc_by_ts.setdefault(ts_name, []).append(pos_rmse_os_vc)
+                all_pos_rmse_vc.append(pos_rmse_os_vc)
 
             if autoreg is not None:
-                pos_rmse_ar = float(autoreg["rmse_pos"].mean())
+                pos_rmse_ar    = float(autoreg["rmse_pos"].mean())
+                pos_rmse_ar_vc = float(autoreg["rmse_pos_veh_contact"].mean())
                 table.add_data(
                     ts_name, ts_name, "ar",
-                    pos_rmse_ar,
+                    pos_rmse_ar, pos_rmse_ar_vc,
                     float(autoreg["rmse_vel"].mean()),
                     float(autoreg["rmse_acc"].mean()),
                     weight_kg, speed_kmh, angle_deg, "N",
                 )
                 mse_by_ts.setdefault(ts_name, []).append(pos_rmse_ar)
                 all_pos_rmse.append(pos_rmse_ar)
+                mse_vc_by_ts.setdefault(ts_name, []).append(pos_rmse_ar_vc)
+                all_pos_rmse_vc.append(pos_rmse_ar_vc)
 
             # Zero-acceleration baseline rows (no GIF)
             table.add_data(
                 ts_name, ts_name, "zero_os",
                 float(baseline["rmse_pos_onestep"].mean()),
+                float(baseline["rmse_pos_onestep_veh_contact"].mean()),
                 float(baseline["rmse_vel_onestep"].mean()),
                 float(baseline["rmse_acc_onestep"].mean()),
                 weight_kg, speed_kmh, angle_deg, "N",
@@ -1551,6 +1806,7 @@ def main():
             table.add_data(
                 ts_name, ts_name, "zero_ar",
                 float(baseline["rmse_pos_rollout"].mean()),
+                float(baseline["rmse_pos_rollout_veh_contact"].mean()),
                 float(baseline["rmse_vel_rollout"].mean()),
                 float(baseline["rmse_acc_rollout"].mean()),
                 weight_kg, speed_kmh, angle_deg, "N",
@@ -1569,12 +1825,21 @@ def main():
             wandb_run.summary[f"mean_mse/{ts_name}"] = float(np.mean(rmse_vals))
         if all_pos_rmse:
             wandb_run.summary["mean_mse_overall"] = float(np.mean(all_pos_rmse))
+        # veh_contact-only — the sensitive metric; the all-node one above is
+        # diluted by far-field nodes that barely move.
+        for ts_name, rmse_vals in mse_vc_by_ts.items():
+            wandb_run.summary[f"mean_mse_veh_contact/{ts_name}"] = float(np.mean(rmse_vals))
+        if all_pos_rmse_vc:
+            wandb_run.summary["mean_mse_veh_contact_overall"] = float(np.mean(all_pos_rmse_vc))
         wandb_run.finish()
         print("[W&B] Rollout run finished")
 
     # ── RMSE plot (single test set only) ──────────────────────────────────
     if args.plot and len(args.raw_h5) == 1:
         plot_rmse_vs_timestep(last_onestep, last_autoreg, out_dir)
+        plot_os_ar_veh_contact_rmse(
+            last_onestep, last_autoreg, out_dir / "os_ar_veh_contact_rmse.png"
+        )
 
     # ── Multi-experiment comparison plot ──────────────────────────────────
     if args.compare_dirs:

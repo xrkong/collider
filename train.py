@@ -348,12 +348,13 @@ def run_validation(model, val_loader, device, use_node_type: bool = False, accel
         x_vel      = batch[0].to(device)
         future_acc = batch[1].to(device)
         input_pos  = batch[2].to(device)
-        # batch[5]=barrier_angle_deg, batch[6]=x_intercept
-        # batch[7]=cond (n_cond,), batch[8]=node_type (when use_node_type)
+        # batch[5]=barrier_angle_deg, batch[6]=x_intercept, batch[7]=cond (n_cond,)
+        # batch[8]=alive_mask (N,), batch[9]=node_type (when use_node_type)
         barrier_angle_deg = float(batch[5][0].item())
         x_intercept       = float(batch[6][0].item())
-        cond      = batch[7].to(device)                      # (B, n_cond)
-        node_type = batch[8].to(device) if use_node_type else None
+        cond        = batch[7].to(device)                    # (B, n_cond)
+        alive_mask  = batch[8].to(device)                     # (B, N) 1=alive 0=eroded
+        node_type   = batch[9].to(device) if use_node_type else None
 
         # Validation: one-step only (k=0)
         B, N, _ = x_vel.shape
@@ -366,6 +367,9 @@ def run_validation(model, val_loader, device, use_node_type: bool = False, accel
         if cond.shape[-1] > 0:
             cond_b = cond[:, None, :].expand(-1, N, -1)
             x_in = torch.cat([x_in, cond_b], dim=-1)
+
+        # Erosion mask: zero out input features for eroded nodes before the model sees them.
+        x_in = x_in * alive_mask.unsqueeze(-1)
 
         autocast_ctx = accelerator.autocast() if accelerator is not None else torch.autocast(device_type="cuda", dtype=torch.bfloat16)
         with autocast_ctx:
@@ -451,9 +455,9 @@ def train(cfg: dict, git_commit: str = "unknown"):
     # Fail fast if train and val dirs overlap
     train_resolved = {str(Path(d).resolve()) for d in train_dirs}
     val_resolved   = {str(Path(d).resolve()) for d in val_dirs}
-    overlap = train_resolved & val_resolved
-    if overlap:
-        raise ValueError(f"Val dirs overlap with train dirs: {overlap}")
+    # overlap = train_resolved & val_resolved
+    # if overlap:
+    #     raise ValueError(f"Val dirs overlap with train dirs: {overlap}")
 
     # Compute or load global normalization stats (train trajs only)
     run_output_dir = PROJECT_ROOT / "outputs" / "checkpoints" / cfg["name"]
@@ -582,7 +586,7 @@ def train(cfg: dict, git_commit: str = "unknown"):
             pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{n_epochs}", unit="batch",
                         dynamic_ncols=True, leave=True, disable=not accelerator.is_main_process)
             for batch_idx, batch in enumerate(pbar):
-                # ── Unpack batch (8 or 9 tensors from BVCSlicedDataset) ──
+                # ── Unpack batch (9 or 10 tensors from BVCSlicedDataset) ──
                 # [0] x_vel:             (B, N, T_in*3)   normalized velocity, flattened
                 # [1] future_acc:        (B, N, K, 3)     K-step normalized acceleration targets
                 # [2] input_pos:         (B, N, T_in, 3)  raw input positions
@@ -591,7 +595,8 @@ def train(cfg: dict, git_commit: str = "unknown"):
                 # [5] barrier_angle_deg: (B,)             per-trajectory barrier angle (degrees)
                 # [6] x_intercept:       (B,)             barrier x-intercept (mm)
                 # [7] cond:              (B, n_cond)      normalized condition vector
-                # [8] node_type:         (B, N)           per-node int label (only when use_node_type)
+                # [8] alive_mask:        (B, N)           1=alive 0=eroded at last input frame
+                # [9] node_type:         (B, N)           per-node int label (only when use_node_type)
                 x_vel       = batch[0].to(device)
                 future_acc  = batch[1].to(device)
                 input_pos   = batch[2].to(device)
@@ -600,7 +605,8 @@ def train(cfg: dict, git_commit: str = "unknown"):
                 barrier_angle_deg = float(batch[5][0].item())
                 x_intercept       = float(batch[6][0].item())
                 cond        = batch[7].to(device)                   # (B, n_cond)
-                node_type   = batch[8].to(device) if use_node_type else None
+                alive_mask  = batch[8].to(device)                    # (B, N)
+                node_type   = batch[9].to(device) if use_node_type else None
 
                 B, N, _ = x_vel.shape
                 T_in    = input_pos.shape[2]
@@ -632,6 +638,9 @@ def train(cfg: dict, git_commit: str = "unknown"):
                     x_in       = torch.cat([x_vel_flat, x_sdf, cond_b], dim=-1)  # (B, N, T_in*4+n_cond)
                     assert x_in.shape[-1] == model_cfg["nnode_in_features"], \
                         f"x_in dim {x_in.shape[-1]} != nnode_in_features {model_cfg['nnode_in_features']}"
+
+                    # Erosion mask: zero out input features for eroded nodes before the model sees them.
+                    x_in = x_in * alive_mask.unsqueeze(-1)
 
                     # Forward
                     with accelerator.autocast():

@@ -8,9 +8,11 @@ node selection is the SPEC region-aware sampler (see SPEC/SPEC_sampling_reconstr
 
 Pipeline
 --------
-  Step 1 – Parse k-file geometry                       (kfile_parser.py)
-  Step 2 – Region-aware ~100k node sampling             (regions.py, samplers.py, sampling.py)
-  Step 3 – part names + material props (k-file *PART)   (materials.py)
+  Step 1 – Parse k-file part names + material props      (materials.py)
+  Step 2 – Optional part exclusion (--exclude-parts-config, e.g. rotating
+           tires/rims/spindles — see part_filters.py)
+  Step 3 – Parse k-file geometry, then region-aware       (kfile_parser.py,
+           ~100k node sampling                            regions.py, samplers.py, sampling.py)
   Step 4 – d3plot header: part mass + mesh connectivity  (d3plot_io.py, connectivity.py)
   Step 5 – Time scan + frame-stride selection            (d3plot_io.py)
   Step 6 – Per-frame position + eff_plastic_strain       (this file, d3plot_io.py)
@@ -65,13 +67,14 @@ HDF5 layout
 Usage
 -----
 conda activate collider
-python -m dataset.ds.build_dataset \
+conda run -n collider python -m dataset.ds.build_dataset \
     --kfile  /home/kong/datasets/barrier/fem/T_lok_F_shape_barrier_9_3_60km/car_and_barriers.k \
     --src    /home/kong/datasets/barrier/fem/T_lok_F_shape_barrier_9_3_60km \
-    --tmp    /tmp/d3plot_tmp \
-    --out    /home/kong/datasets/barrier/h5_downsampled/T_lok_F_shape_barrier_9_3_60km.h5 \
-    --frame-stride 10 \
-    --n-jobs 8 \
+    --out    /home/kong/datasets/barrier/h5_fps_no_wheels/T_lok_F_shape_barrier_9_3_60km.h5 \
+    --method fps \
+    --seed 42 \
+    --exclude-parts-config configs/data/exclude_parts_tires.yaml \
+    --frame-stride 10 --n-jobs 8 \
     --gif
 """
 
@@ -93,6 +96,7 @@ from .d3plot_io import (
 )
 from .kfile_parser import parse_kfile
 from .materials import parse_kfile_parts_and_materials
+from .part_filters import load_exclude_parts_config, resolve_exclude_pids
 from .sampling import DEFAULT_REGION_CONFIGS, RegionConfig, sample_mesh
 from .samplers import SamplerConfig
 
@@ -120,6 +124,12 @@ def main() -> None:
                              "selection algorithm changes. Default fps.")
     parser.add_argument("--seed", type=int, default=42,
                         help="RNG seed for the sampler (random/poisson_disk/fps).")
+    parser.add_argument("--exclude-parts-config", type=Path, default=None,
+                        help="YAML with an 'exclude_parts' list of name patterns (e.g. "
+                             "configs/data/exclude_parts_tires.yaml) — parts matching any "
+                             "pattern are dropped from sampling entirely, before region/budget "
+                             "logic runs. Use dataset/ds/part_filters.py to (re)generate one "
+                             "for a new k-file.")
     parser.add_argument("--n-jobs", type=int, default=4,
                         help="Parallel workers for d3plot time-scan + frame extraction "
                              "(joblib; each file is read independently). 1 = sequential.")
@@ -145,8 +155,29 @@ def main() -> None:
             shutil.rmtree(old_dir, ignore_errors=True)
 
     # ══════════════════════════════════════════════════════════════════════
-    # Step 1-2 — parse k-file geometry, then region-aware sampling
+    # Step 1-3 — parse k-file geometry + part names/materials, optional
+    # part exclusion, then region-aware sampling
     # ══════════════════════════════════════════════════════════════════════
+    # d3plot's ArrayType.part_titles_ids is a sequential 1..P index, NOT the
+    # real k-file PID — it cannot be used to join part names. The k-file's
+    # own *PART block has the real PID as its first field, so parse that
+    # directly instead (same parse pass also resolves *MAT_xxx properties).
+    # Needed before sampling (not just for metadata) so --exclude-parts-config
+    # can resolve name patterns to PIDs before any region/budget logic runs.
+    print(f"Parsing k-file for part names + material props: {args.kfile} …")
+    pid_to_name, name_to_props = parse_kfile_parts_and_materials(args.kfile)
+    print(f"  resolved {len(pid_to_name)} parts, {len(name_to_props)} with material props")
+
+    exclude_pids: set[int] = set()
+    if args.exclude_parts_config:
+        patterns = load_exclude_parts_config(args.exclude_parts_config)
+        matched = resolve_exclude_pids(patterns, pid_to_name)
+        exclude_pids = set(matched)
+        print(f"Excluding {len(matched)} parts matching {patterns} "
+              f"(from {args.exclude_parts_config}):")
+        for pid, name in sorted(matched.items()):
+            print(f"  {pid:>10}  {name}")
+
     # Region budgets/floors (§4) stay fixed; only the within-region sampler
     # method changes, so the comparison across methods is fair (SPEC §5).
     region_configs = [
@@ -163,7 +194,9 @@ def main() -> None:
     print(f"Sampling method: {args.method}  (seed={args.seed})")
 
     mesh = parse_kfile(args.kfile)
-    sampled_idx, region_labels, _segments = sample_mesh(mesh, region_configs)
+    sampled_idx, region_labels, _segments = sample_mesh(
+        mesh, region_configs, exclude_pids=exclude_pids
+    )
     N = len(sampled_idx)
 
     sampled_nids  = mesh.node_ids[sampled_idx]
@@ -174,17 +207,6 @@ def main() -> None:
     print(f"\nSampled {N:,} nodes total:")
     for label, rid in sorted(REGION_ID_MAP.items(), key=lambda x: x[1]):
         print(f"  {label:<20} {(region_id == rid).sum():>7,}")
-
-    # ══════════════════════════════════════════════════════════════════════
-    # Step 3 — part names + material props, both joined by the real k-file PID
-    # ══════════════════════════════════════════════════════════════════════
-    # d3plot's ArrayType.part_titles_ids is a sequential 1..P index, NOT the
-    # real k-file PID — it cannot be used to join part names. The k-file's
-    # own *PART block has the real PID as its first field, so parse that
-    # directly instead (same parse pass also resolves *MAT_xxx properties).
-    print(f"Parsing k-file for part names + material props: {args.kfile} …")
-    pid_to_name, name_to_props = parse_kfile_parts_and_materials(args.kfile)
-    print(f"  resolved {len(pid_to_name)} parts, {len(name_to_props)} with material props")
 
     node_part_name = np.array(
         [pid_to_name.get(int(pid), f"pid_{pid}") for pid in node_part_ids]
