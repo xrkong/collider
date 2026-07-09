@@ -10,3 +10,5 @@ configs/jobs/logs/
 artifacts/
 .claude/
 out/
+
+logs/

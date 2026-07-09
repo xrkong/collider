@@ -32,6 +32,13 @@ apptainer build --fakeroot collider.sif collider.def
 ```
 
 
+```
+# Open a shell inside the container
+apptainer shell --nv --bind /home/xangruik/collider:/workspace /staging/proj_iim1/xrkong/container/collider.sif
+```
+
+
+
 ### Install PyTorch (Preferably with GPU & CUDA)  
 Check your GPU and CUDA compatibility before installing. The following command installs PyTorch 2.5.0 with CUDA 11.8:  
 ```bash

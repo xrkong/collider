@@ -8,7 +8,8 @@ From: ubuntu:22.04
 %help
     Apptainer image for the "collider" conda environment (barrier vehicle
     collider simulator). Ships Python 3.11, the pinned packages from
-    requirements.txt, and PyTorch 2.5.0 built for CUDA 11.8.
+    requirements.txt, and PyTorch 2.11.0 built for CUDA 12.8 (required for
+    Blackwell/B200 GPUs, sm_100 — cu118 wheels do not include sm_100 kernels).
 
     Build:
         apptainer build collider.sif collider.def
@@ -54,12 +55,14 @@ From: ubuntu:22.04
 
     pip install --no-cache-dir -r /opt/collider/requirements.txt
 
-    # cu118 wheels bundle their own CUDA runtime (cublas/cudnn/nccl/...),
-    # so no system CUDA toolkit is needed in the base image (see README.md).
-    # The host's driver is exposed at runtime via `apptainer ... --nv`.
+    # cu128 wheels bundle their own CUDA runtime (cublas/cudnn/nccl/...),
+    # so no system CUDA toolkit is needed in the base image. The host's
+    # driver is exposed at runtime via `apptainer ... --nv`.
+    # cu128+ is required for Blackwell/B200 GPUs (sm_100); cu118 lacks
+    # those kernels and silently reports cuda.is_available() == False.
     pip install --no-cache-dir \
-        torch==2.5.0 torchvision==0.20.0 torchaudio==2.5.0 \
-        --index-url https://download.pytorch.org/whl/cu118
+        torch==2.11.0 torchvision==0.26.0 torchaudio==2.11.0 \
+        --index-url https://download.pytorch.org/whl/cu128
 
     conda clean -afy
     pip cache purge
