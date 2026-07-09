@@ -26,6 +26,10 @@ path_to_your_data \
 path_to_your_remote_server
 ```
 
+Build Apptainer image from definition file for HPC usage.  
+```
+apptainer build --fakeroot collider.sif collider.def
+```
 
 
 ### Install PyTorch (Preferably with GPU & CUDA)  

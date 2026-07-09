@@ -8,3 +8,5 @@ wandb/
 outputs/
 configs/jobs/logs/
 artifacts/
+
+.claude/
