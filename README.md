@@ -75,7 +75,7 @@ python dataset/d3plot_to_h5.py \
 
 ### Training
 ```
-python train.py --experiment configs/experiments/exp_10.yaml --skip-git-check
+python train.py --experiment configs/experiments/lc001.yaml --skip-git-check
 ```
 
 ### Barrier plate projection on xy plate 

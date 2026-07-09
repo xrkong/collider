@@ -67,4 +67,5 @@ wandb==0.26.1
 wheel==0.47.0
 wrapt==2.1.2
 accelerate
-lasso-python==2.0.4
+lasso-python
+pyvista==0.48.4

@@ -127,13 +127,36 @@ def load_norm_stats(metadata_path: str | Path) -> Optional[NormStats]:
 _DEFAULT_NORM_FIELDS = ["positions", "velocity", "acceleration"]
 
 
+def _read_or_derive_field(fh: "h5py.File", field: str) -> np.ndarray:
+    """Read states/{field} directly if present, else derive from positions.
+
+    velocity/acceleration are derived by forward difference (dt=1 frame),
+    exactly matching BVCSlicedDataset's own np.diff(positions) convention —
+    required so global stats match the values actually normalized at train
+    time. The new H5 format (dataset/ds/build_dataset.py) only has positions;
+    the legacy format stores velocity/acceleration directly and they're used
+    as-is when present (their values are tail-padded but compute_global_stats
+    only needs aggregate mean/std, so the small padding tail is negligible).
+    """
+    h5_key = f"states/{field}"
+    if h5_key in fh:
+        return np.asarray(fh[h5_key][...])
+    if field in ("velocity", "acceleration"):
+        pos = np.asarray(fh["states/positions"][...]).astype(np.float64)
+        vel = np.diff(pos, axis=0)
+        return vel if field == "velocity" else np.diff(vel, axis=0)
+    raise KeyError(f"missing dataset '{h5_key}' and no derivation rule for field '{field}'")
+
+
 def compute_global_stats(traj_h5_paths: list[str], fields: list[str]) -> dict:
     """One-pass Welford mean/std over (frames × nodes × dims) per field.
 
     Args:
-        traj_h5_paths: list of output.h5 paths
+        traj_h5_paths: list of h5 paths
         fields: list of field names matching states/ group keys
                 e.g. ["positions", "velocity", "acceleration"]
+                velocity/acceleration are derived from positions when the h5
+                doesn't store them directly (see _read_or_derive_field).
 
     Returns:
         {field: {"mean": float, "std": float}}
@@ -142,10 +165,7 @@ def compute_global_stats(traj_h5_paths: list[str], fields: list[str]) -> dict:
     for p in traj_h5_paths:
         with h5py.File(p, "r") as fh:
             for field in fields:
-                h5_key = f"states/{field}"
-                if h5_key not in fh:
-                    raise KeyError(f"{p}: missing dataset '{h5_key}'")
-                x = np.asarray(fh[h5_key][...]).reshape(-1).astype(np.float64)
+                x = _read_or_derive_field(fh, field).reshape(-1).astype(np.float64)
                 n_b = x.size
                 if n_b == 0:
                     continue
@@ -198,15 +218,41 @@ def load_or_compute_global_stats(
 # ── Trajectory dir resolver ───────────────────────────────────────────────────
 
 def _resolve_traj_dir(d: str | Path) -> dict:
-    """Resolve a trajectory dir to {h5, metadata} paths. Fails loudly."""
+    """Resolve a trajectory entry to {h5, metadata} paths. Fails loudly.
+
+    Accepts two conventions:
+      - legacy: a directory containing output.h5 (+ optional metadata.json)
+      - new (dataset/ds/build_dataset.py output): a direct path to a .h5 file,
+        e.g. h5_fps/T_lok_F_shape_barrier_9_3_60km.h5 — no metadata.json sibling.
+
+    metadata.json is always optional: callers (BVCSlicedDataset, NormStats
+    fallback, parse_conditions) already treat a missing/None metadata path as
+    "derive conditions from the trajectory name instead."
+    """
     d = Path(d)
-    if not d.is_dir():
-        raise FileNotFoundError(f"Trajectory dir not found: {d}")
-    h5, meta = d / "output.h5", d / "metadata.json"
-    missing = [p.name for p in (h5, meta) if not p.is_file()]
-    if missing:
-        raise FileNotFoundError(f"{d} missing required files: {missing}")
-    return {"h5": str(h5), "metadata": str(meta)}
+    if d.is_file() and d.suffix == ".h5":
+        h5 = d
+    elif d.is_dir():
+        h5 = d / "output.h5"
+        if not h5.is_file():
+            raise FileNotFoundError(f"{d}: no output.h5 found in directory")
+    else:
+        raise FileNotFoundError(f"Trajectory entry not found: {d}")
+    meta = h5.parent / "metadata.json"
+    return {"h5": str(h5), "metadata": str(meta) if meta.is_file() else None}
+
+
+def traj_name_from_h5(h5_path: str | Path) -> str:
+    """Trajectory name for condition-parsing/logging.
+
+    Legacy convention (<dir>/output.h5): the parent dir name carries the
+    trajectory identity (e.g. ".../T_lok_F_shape_barrier_9_3_60km/output.h5").
+    New convention (a directly-named .h5 file): the filename stem carries it
+    instead (e.g. "h5_fps/T_lok_F_shape_barrier_9_3_60km.h5" — the parent dir
+    here is just the sampling-method folder, not the trajectory).
+    """
+    p = Path(h5_path)
+    return p.parent.name if p.name == "output.h5" else p.stem
 
 
 # ── Abstract base ─────────────────────────────────────────────────────────────
@@ -257,17 +303,36 @@ class BVCSlicedDataset(BaseDataset):
     """Full-trajectory dataset with sliced-window sampling for push-forward training.
 
     Supports multiple trajectories. Sliding windows never cross traj boundaries.
+    Velocity/acceleration are always derived from states/positions by forward
+    difference (dt = 1 frame) — the only h5 state field actually required is
+    positions; states/velocity, states/acceleration, states/node_alive are
+    optional and consumed if present.
+
     Each __getitem__ returns a window starting at index t:
         - frames [t, t + input_frames):                    velocity input (normalized)
         - frames [t + input_frames, t + input_frames + K): K acceleration targets (normalized)
         - frames [t, t + input_frames):                    raw positions for SDF
         - frames [t + input_frames, t + input_frames + K): raw positions for push-forward SDF
         - frame  t + input_frames - 1:                     raw velocity (for integration)
+                                                             AND erosion alive mask
+
+    Returned tuple (8 base elements + 1 optional):
+        [0] x_vel       (N, T_in*3)  normalized velocity, flattened
+        [1] future_acc  (N, K, 3)    normalized acceleration targets
+        [2] input_pos   (N, T_in, 3) raw positions (for SDF)
+        [3] future_pos  (N, K, 3)    raw future positions (for push-forward SDF)
+        [4] v_last_phys (N, 3)       physical velocity at last input frame
+        [5] barrier_angle_deg        scalar
+        [6] x_intercept              scalar
+        [7] cond        (n_cond,)    normalized condition vector
+        [8] alive_mask  (N,)         1.0=alive, 0.0=eroded at the last input frame
+                                      (all-ones when the h5 has no node_alive data)
+        [9] node_type   (N,)         only present when cfg["data"]["node_type"]=True
 
     Args:
         cfg requires:
-            - cfg["data"]["paths"]:          list[str], h5 file paths
-            - cfg["data"]["metadata_paths"]: list[str], metadata.json paths
+            - cfg["data"]["paths"]:          list[str], h5 file paths (or trajectory dirs)
+            - cfg["data"]["metadata_paths"]: list[str | None], metadata.json paths (optional per-entry)
             - cfg["data"]["input_frames"]:   int, default 5
             - cfg["data"]["normalize"]:      bool, default True
             - cfg["train"]["push_forward_k"]: int, default 1
@@ -276,9 +341,8 @@ class BVCSlicedDataset(BaseDataset):
                CRITICAL: val dataset must receive train stats, not its own metadata stats.
     """
 
-    INPUT_KEY  = "states/velocity"
-    POS_KEY    = "states/positions"
-    TARGET_KEY = "states/acceleration"
+    POS_KEY   = "states/positions"
+    ALIVE_KEY = "states/node_alive"   # optional — erosion mask, see dataset/ds/build_dataset.py
 
     def __init__(self, cfg: dict, *, stats: dict | None = None):
         super().__init__(cfg)
@@ -343,25 +407,32 @@ class BVCSlicedDataset(BaseDataset):
 
         for idx, p in enumerate(self.h5_paths):
             with h5py.File(p, "r") as f:
-                vel  = f[self.INPUT_KEY][:].astype(np.float32)    # (T, N, 3)
-                acc  = f[self.TARGET_KEY][:].astype(np.float32)   # (T, N, 3)
                 pos  = f[self.POS_KEY][:].astype(np.float32)      # (T, N, 3)
+                alive = (
+                    f[self.ALIVE_KEY][:].astype(np.float32)       # (T, N) — 1=alive, 0=eroded
+                    if self.ALIVE_KEY in f else None               # absent in legacy-format h5
+                )
                 if self.use_node_type:
                     nt_key = f"metadata/{self.node_type_field}"
                     if nt_key not in f:
-                        raise KeyError(f"{p}: missing node_type field '{nt_key}'")
+                        raise KeyError(
+                            f"{p}: missing node_type field '{nt_key}'. "
+                            f"Available metadata fields: {sorted(f['metadata'].keys())}. "
+                            f"For dataset/ds/build_dataset.py output, set "
+                            f"data.node_type_field: region_id in the experiment config."
+                        )
                     node_type_arr = f[nt_key][:].astype(np.int64)  # (N,) static
 
-            T = vel.shape[0]
+            T = pos.shape[0]
             if T < self.window_len:
                 raise ValueError(
                     f"Trajectory {p} has only {T} frames, need >= {self.window_len} "
                     f"(input_frames={self.input_frames} + K={self.K})"
                 )
 
-            vel_norm = self._normalize("velocity",     vel)
-            acc_norm = self._normalize("acceleration", acc)
-
+            # Kinematics are always derived from positions (forward difference,
+            # dt = 1 frame) — never read from states/velocity or
+            # states/acceleration, which the new H5 format doesn't have anyway.
             vel_derived     = np.diff(pos, axis=0)          # (T-1, N, 3)
             acc_derived_raw = np.diff(vel_derived, axis=0)  # (T-2, N, 3)
             vel_derived_norm = self._normalize("velocity",     vel_derived)
@@ -370,10 +441,10 @@ class BVCSlicedDataset(BaseDataset):
             n_windows = max(0, T - self.window_len)
             per_traj_windows.append(n_windows)
 
-            dir_name = p.parent.name
+            dir_name = traj_name_from_h5(p)
             meta_label = ""
             raw_metadata: dict | None = None
-            if idx < len(metadata_paths):
+            if idx < len(metadata_paths) and metadata_paths[idx]:
                 try:
                     with open(metadata_paths[idx]) as mf:
                         raw_metadata = json.load(mf)
@@ -397,9 +468,6 @@ class BVCSlicedDataset(BaseDataset):
                 bp = {"barrier_angle_deg": -25.4, "x_intercept": 2056.579}
 
             traj_entry = {
-                "vel_norm":          vel_norm,
-                "vel_phys":          vel,
-                "acc_norm":          acc_norm,
                 "pos_phys":          pos,
                 "T":                 T,
                 "path":              str(p),
@@ -407,6 +475,7 @@ class BVCSlicedDataset(BaseDataset):
                 "vel_derived_phys":  vel_derived,
                 "acc_derived_norm":  acc_derived_norm,
                 "T_derived":         T - 2,
+                "alive":             alive,      # (T, N) float32 1/0, or None if not in this h5
                 "barrier_angle_deg": bp["barrier_angle_deg"],
                 "x_intercept":       bp["x_intercept"],
                 "cond":              cond_vec,    # np.float32 (n_cond,) — constant per traj
@@ -477,6 +546,14 @@ class BVCSlicedDataset(BaseDataset):
         future_pos = future_pos.transpose(1, 0, 2)                 # (N, K, 3)
         input_pos  = input_pos.transpose(1, 0, 2)                  # (N, T_in, 3)
 
+        # Erosion mask: alive status at the last input frame (the "current"
+        # state the model conditions on). 1.0 = alive, 0.0 = eroded. All-ones
+        # when this h5 has no node_alive data (legacy format / no erosion).
+        if traj["alive"] is not None:
+            alive_mask = traj["alive"][start + T_in - 1]            # (N,) float32
+        else:
+            alive_mask = np.ones(N, dtype=np.float32)
+
         base = (
             torch.from_numpy(np.ascontiguousarray(x_vel)),                       # [0] (N, T_in*3)
             torch.from_numpy(np.ascontiguousarray(future_acc)),                  # [1] (N, K, 3)
@@ -486,10 +563,11 @@ class BVCSlicedDataset(BaseDataset):
             torch.tensor(traj["barrier_angle_deg"], dtype=torch.float32),        # [5] scalar
             torch.tensor(traj["x_intercept"],       dtype=torch.float32),        # [6] scalar
             torch.from_numpy(np.ascontiguousarray(traj["cond"])),                # [7] (n_cond,)
+            torch.from_numpy(np.ascontiguousarray(alive_mask)),                  # [8] (N,) 1=alive 0=eroded
         )
         if self.use_node_type:
             nt = traj["node_type"]                                                # (N,) int64
-            return base + (torch.from_numpy(np.ascontiguousarray(nt)),)          # [8] (N,) long
+            return base + (torch.from_numpy(np.ascontiguousarray(nt)),)          # [9] (N,) long
         return base
 
 

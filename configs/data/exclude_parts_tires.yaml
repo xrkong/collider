@@ -1,0 +1,40 @@
+# Parts excluded from sampling — continuously rotating tire/rim/spindle
+# components. See dataset/ds/part_filters.py docstring for rationale.
+# Auto-generated from /home/kong/datasets/barrier/fem/T_lok_F_shape_barrier_9_3_60km/car_and_barriers.k — REVIEW before relying on this.
+#
+# 30 parts matched out of 934 total:
+#      2000073  335_fr_tirecrank
+#      2000177  570_mc_spindle
+#      2000179  571_mc_spindle2
+#      2000407  573_mc_spindleR
+#      2000409  572_mc_spindle2R
+#      2000439  534_ob_riminnerfrontRight
+#      2000440  535_ob_rimouterfrontright
+#      2000441  536_ob_tiresidefrontright
+#      2000442  537_ob_tiremidfrontright
+#      2000443  538_ob_riminnerfrontleft
+#      2000444  539_ob_rimouterfrontleft
+#      2000445  540_ob_tiresidefrontleft
+#      2000446  541_ob_tiremidfrontleft
+#      2000447  542-ob_riminnerrearleft
+#      2000448  543_ob_rimouterrearleft
+#      2000449  544_ob_tiresiderearleft
+#      2000450  545_ob_tiremidrearleft
+#      2000451  546_ob_tiremidrearright
+#      2000452  547_ob_tiresiderearright
+#      2000453  548_ob_rimouterrearright
+#      2000454  549_ob_riminnerrearright
+#      2000678  542-ob_riminnerrearleftrigid
+#      2000679  549_ob_riminnerrearrightrigid
+#      2000812  tire_lateral_beams
+#      2000813  tire_circumferential_beams
+#      2000821  960_ob_tiremidspare
+#      2000822  961_ob_tiresidespare
+#      2000823  962_ob_rimouterspare
+#      2000824  963_ob_riminnerspare
+#      2000825  964_ob_riminnerspare
+
+exclude_parts:
+  - 'tire'
+  - '_rim'
+  - 'spindle'
