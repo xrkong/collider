@@ -1,7 +1,0 @@
-{
-  "epoch": 150,
-  "step": 13500,
-  "val_loss": 0.376252653532558,
-  "git_commit": "unknown",
-  "experiment": "dg007"
-}

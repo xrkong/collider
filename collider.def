@@ -1,0 +1,71 @@
+Bootstrap: docker
+From: nvidia/cuda:11.8.0-cudnn8-runtime-ubuntu22.04
+
+%labels
+    Application collider
+    Author xiangrui.kong.uwa@gmail.com
+
+%help
+    Apptainer image for the "collider" conda environment (barrier vehicle
+    collider simulator). Ships Python 3.11, the pinned packages from
+    requirements.txt, and PyTorch 2.5.0 built for CUDA 11.8.
+
+    Build:
+        apptainer build collider.sif collider.def
+
+    Run (GPU node, must pass --nv to expose the host driver):
+        apptainer exec --nv collider.sif python train.py \
+            --experiment configs/experiments/dg024.yaml --skip-git-check
+
+        apptainer exec --nv collider.sif accelerate launch \
+            --num_processes=${NUM_GPUS} --mixed_precision=bf16 \
+            train.py --experiment configs/experiments/dg024.yaml --skip-git-check
+
+    Shell:
+        apptainer shell --nv collider.sif
+
+%files
+    requirements.txt /opt/collider/requirements.txt
+
+%post
+    set -euo pipefail
+    export DEBIAN_FRONTEND=noninteractive
+
+    apt-get update
+    apt-get install -y --no-install-recommends \
+        wget ca-certificates git build-essential
+    rm -rf /var/lib/apt/lists/*
+
+    # --- Miniforge (conda) ---
+    MINIFORGE_INSTALLER=Miniforge3-$(uname)-$(uname -m).sh
+    wget -q "https://github.com/conda-forge/miniforge/releases/latest/download/${MINIFORGE_INSTALLER}" -O /tmp/miniforge.sh
+    bash /tmp/miniforge.sh -b -p /opt/conda
+    rm /tmp/miniforge.sh
+
+    export PATH=/opt/conda/bin:${PATH}
+    source /opt/conda/etc/profile.d/conda.sh
+
+    # --- collider environment ---
+    conda create -y -n collider python=3.11
+    conda activate collider
+
+    pip install --no-cache-dir -r /opt/collider/requirements.txt
+
+    # PyTorch built for CUDA 11.8, matching the base image (see README.md)
+    pip install --no-cache-dir \
+        torch==2.5.0 torchvision==0.20.0 torchaudio==2.5.0 \
+        --index-url https://download.pytorch.org/whl/cu118
+
+    conda clean -afy
+    pip cache purge
+
+%environment
+    export PATH=/opt/conda/envs/collider/bin:/opt/conda/bin:${PATH}
+    export CONDA_DEFAULT_ENV=collider
+
+%runscript
+    exec "$@"
+
+%test
+    export PATH=/opt/conda/envs/collider/bin:${PATH}
+    python -c "import torch; print('torch', torch.__version__, 'cuda available:', torch.cuda.is_available())"

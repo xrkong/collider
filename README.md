@@ -1,4 +1,4 @@
-# collider
+# Collider
 Barrier vehicle collider simulator using machine learning methods. 
 
 ## LS-DYNA Data processing and Build dataset 
@@ -6,11 +6,27 @@ jump to [dataset](./dataset/README.md) for details.
 
 ## Training 
 ### Set Up Python Environment and install dependencies
+
+[Official Conda Installation Link](https://docs.conda.io/projects/conda/en/latest/user-guide/install/index.html)
+You may also need ```tmux``` to run the training in the background.
+
 Ensure you have Python 3.11 installed (tested version). Create a new Conda environment:  
 ```bash
 conda create --name collider --file environment.yml
 conda activate collider
+
+# Or run this.
+pip install -r requirements.txt
 ```
+
+```bash
+rsync -avP --partial \
+-e "ssh -i <your-ssh-key>" \
+path_to_your_data \
+path_to_your_remote_server
+```
+
+
 
 ### Install PyTorch (Preferably with GPU & CUDA)  
 Check your GPU and CUDA compatibility before installing. The following command installs PyTorch 2.5.0 with CUDA 11.8:  

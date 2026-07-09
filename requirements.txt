@@ -46,9 +46,9 @@ pyparsing==3.3.2
 python-dateutil==2.9.0.post0
 PyYAML==6.0.3
 requests==2.33.1
-rich==15.0.0
+rich==13.9.4
 safetensors==0.7.0
-scikit-learn==1.8.0
+scikit-learn
 scipy==1.17.1
 sentry-sdk==2.59.0
 setuptools==81.0.0
@@ -67,4 +67,4 @@ wandb==0.26.1
 wheel==0.47.0
 wrapt==2.1.2
 accelerate
-lasso-python
+lasso-python==2.0.4
