@@ -52,7 +52,7 @@ sys.path.insert(0, str(PROJECT_ROOT))
 
 import models  # noqa: F401
 from models.registry import build_model
-from dataset import NormStats, traj_name_from_h5
+from src.dataset import NormStats, traj_name_from_h5
 from src.conditions import CondConfig, parse_conditions, normalize_conditions
 
 try:

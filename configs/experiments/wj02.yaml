@@ -1,4 +1,4 @@
-name: "wj01"
+name: "wj02"
 description: "overfit 60km trajectory on Weitj"
 model:
   name: "transolverplus_net"
@@ -19,7 +19,7 @@ overrides:
 
   train.lr: 0.001
   train.min_lr: 0.00001
-  train.batch_size: 4
+  train.batch_size: 8
   train.accum_steps: 2
   train.n_epochs: 200
   train.push_forward_k: 1

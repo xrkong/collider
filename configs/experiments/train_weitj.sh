@@ -11,11 +11,11 @@
 #SBATCH --output=logs/%x-%j.out
 #SBATCH --error=logs/%x-%j.err
 
-# Usage: sbatch configs/experiments/run_slurm.sh configs/experiments/dg024.yaml
+# Usage: sbatch configs/experiments/train_weitj.sh configs/experiments/wj01.yaml
 
 set -euo pipefail
 
-EXPERIMENT=${1:?"Usage: sbatch run_slurm.sh <path/to/experiment.yaml>"}
+EXPERIMENT=${1:?"Usage: sbatch train_weitj.sh <path/to/experiment.yaml>"}
 SIF=/staging/proj_iim1/xrkong/container/collider.sif
 REPO=/home/xangruik/collider
 
@@ -33,7 +33,7 @@ nvidia-smi -L
 NUM_GPUS=${SLURM_GPUS_ON_NODE:-$(nvidia-smi --query-gpu=name --format=csv,noheader | wc -l)}
 echo "Launching with ${NUM_GPUS} GPU(s) on experiment ${EXPERIMENT}"
 
-apptainer exec --nv "${SIF}" \
+apptainer exec --nv --bind /raid "${SIF}" \
     accelerate launch \
         --num_processes="${NUM_GPUS}" \
         --mixed_precision=bf16 \

@@ -37,6 +37,11 @@ apptainer build --fakeroot collider.sif collider.def
 apptainer shell --nv --bind /home/xangruik/collider:/workspace /staging/proj_iim1/xrkong/container/collider.sif
 ```
 
+Dont forget line you wandb login in the container, otherwise you cannot upload your model to wandb.
+```
+apptainer exec /staging/proj_iim1/xrkong/container/collider.sif wandb login <YOUR_API_KEY>
+```
+
 ### Connection
 If you want to connect to Weitj HPC, you need to use Curtin-VPN through CISCO AnyConnect. 
 
@@ -58,9 +63,9 @@ For other versions, refer to [PyG installation guide](https://pytorch-geometric.
 
 ### Prepare your dataset from DYNA-style files.
 
-If you want to set dt as the minimum time unit, run this.
+Downsample d3plot files to h5 dataset for training. 
 ```bash
-python -m dataset.ds.build_dataset \
+python -m dataset.build_dataset \
     --kfile  /raid/proj_iim1/xrkong/fem/T_lok_F_shape_barrier_9_3_60km/car_and_barriers.k \
     --src    /raid/proj_iim1/xrkong/fem/T_lok_F_shape_barrier_9_3_60km \
     --out    /raid/proj_iim1/xrkong/h5_fps_no_wheel/T_lok_F_shape_barrier_9_3_60km.h5 \
@@ -69,6 +74,33 @@ python -m dataset.ds.build_dataset \
     --exclude-parts-config configs/data/exclude_parts_tires.yaml \
     --frame-stride 10 --n-jobs 8 \
     --gif
+
+# Increase freame rate to 2ms (500Hz) for training, and use fps to downsample the dataset.
+python -m dataset.build_dataset \
+    --kfile  /raid/proj_iim1/xrkong/fem/T_lok_F_shape_barrier_9_3_60km/car_and_barriers.k \
+    --src    /raid/proj_iim1/xrkong/fem/T_lok_F_shape_barrier_9_3_60km \
+    --out    /raid/proj_iim1/xrkong/h5_fps_2ms_no_wheel/T_lok_F_shape_barrier_9_3_60km.h5 \
+    --method fps \
+    --seed 42 \
+    --exclude-parts-config configs/data/exclude_parts_tires.yaml \
+    --frame-stride 0 --n-jobs 8 \
+    --gif
+```
+
+If you use Apptriner, run this.
+```bash
+cd /home/xangruik/collider
+apptainer exec --bind /raid /staging/proj_iim1/xrkong/container/collider.sif \
+    python -m dataset.build_dataset \
+    --kfile  /raid/proj_iim1/xrkong/fem/T_lok_F_shape_barrier_9_3_60km/car_and_barriers.k \
+    --src    /raid/proj_iim1/xrkong/fem/T_lok_F_shape_barrier_9_3_60km \
+    --out    /raid/proj_iim1/xrkong/h5_fps_no_wheel/T_lok_F_shape_barrier_9_3_60km.h5 \
+    --method fps \
+    --seed 42 \
+    --exclude-parts-config configs/data/exclude_parts_tires.yaml \
+    --frame-stride 10 --n-jobs 8 \
+    --gif
+
 ```
 
 
