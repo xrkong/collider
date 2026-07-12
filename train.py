@@ -23,7 +23,7 @@ REPO_ROOT = PROJECT_ROOT
 import models  # triggers auto-import of all registered models
 from models.registry import build_model
 from src.conditions import CondConfig
-from src.dataset import NormStats, build_dataloader, load_or_compute_global_stats, _DEFAULT_NORM_FIELDS
+from dataset import NormStats, build_dataloader, load_or_compute_global_stats, _DEFAULT_NORM_FIELDS
 from src.utils.metrics import MetricTracker
 
 # ── Barrier plate parameters (README: "Barrier plate projection on xy plate") ─

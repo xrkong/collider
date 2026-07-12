@@ -37,6 +37,8 @@ apptainer build --fakeroot collider.sif collider.def
 apptainer shell --nv --bind /home/xangruik/collider:/workspace /staging/proj_iim1/xrkong/container/collider.sif
 ```
 
+### Connection
+If you want to connect to Weitj HPC, you need to use Curtin-VPN through CISCO AnyConnect. 
 
 
 ### Install PyTorch (Preferably with GPU & CUDA)  
@@ -58,27 +60,17 @@ For other versions, refer to [PyG installation guide](https://pytorch-geometric.
 
 If you want to set dt as the minimum time unit, run this.
 ```bash
-python dataset/d3plot_to_h5_dt.py \
-    --src /home/kong/datasets/barrier/fem/T_lok_F_shape_barrier_9_3_100km \
-    --tmp /home/kong/datasets/barrier/tmp \
-    --out /home/kong/datasets/barrier/h5/T_lok_F_shape_barrier_9_3_100km_50_5_dt/output.h5 \
-    --required-config configs/data/required_parts.config \
-    --node-stride 50 \
-    --frame-stride 5 \
-    --frame-limit 100
+python -m dataset.ds.build_dataset \
+    --kfile  /raid/proj_iim1/xrkong/fem/T_lok_F_shape_barrier_9_3_60km/car_and_barriers.k \
+    --src    /raid/proj_iim1/xrkong/fem/T_lok_F_shape_barrier_9_3_60km \
+    --out    /raid/proj_iim1/xrkong/h5_fps_no_wheel/T_lok_F_shape_barrier_9_3_60km.h5 \
+    --method fps \
+    --seed 42 \
+    --exclude-parts-config configs/data/exclude_parts_tires.yaml \
+    --frame-stride 10 --n-jobs 8 \
+    --gif
 ```
 
-If you want to use real time unit, run this.
-```bash
-python dataset/d3plot_to_h5.py \
-    --src /home/kong/datasets/barrier/fem/T_lok_F_shape_barrier_9_3_100km \
-    --tmp /home/kong/datasets/barrier/tmp \
-    --out /home/kong/datasets/barrier/h5/T_lok_F_shape_barrier_9_3_100km_50_1_01/output.h5 \
-    --required-config configs/data/required_parts.config \
-    --node-stride 50 \
-    --frame-stride 1 \
-    --frame-limit 100
-```
 
 ### Training
 ```

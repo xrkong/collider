@@ -62,12 +62,12 @@ HDF5 layout
   shell_cells/solid_cells/beam_cells are sparse: PyVista visualization should
   overlay a point cloud (e.g. colored by eff_plastic_strain) for full
   coverage, with the cells drawn on top wherever they exist. See
-  dataset/ds/visualize_pyvista.py.
+  dataset/visualize_pyvista.py.
 
 Usage
 -----
 conda activate collider
-conda run -n collider python -m dataset.ds.build_dataset \
+conda run -n collider python -m dataset.build_dataset \
     --kfile  /home/kong/datasets/barrier/fem/T_lok_F_shape_barrier_9_3_60km/car_and_barriers.k \
     --src    /home/kong/datasets/barrier/fem/T_lok_F_shape_barrier_9_3_60km \
     --out    /home/kong/datasets/barrier/h5_fps_no_wheels/T_lok_F_shape_barrier_9_3_60km.h5 \
@@ -128,7 +128,7 @@ def main() -> None:
                         help="YAML with an 'exclude_parts' list of name patterns (e.g. "
                              "configs/data/exclude_parts_tires.yaml) — parts matching any "
                              "pattern are dropped from sampling entirely, before region/budget "
-                             "logic runs. Use dataset/ds/part_filters.py to (re)generate one "
+                             "logic runs. Use dataset/part_filters.py to (re)generate one "
                              "for a new k-file.")
     parser.add_argument("--n-jobs", type=int, default=4,
                         help="Parallel workers for d3plot time-scan + frame extraction "

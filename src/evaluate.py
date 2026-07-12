@@ -38,7 +38,7 @@ sys.path.insert(0, str(PROJECT_ROOT))
 
 import models  # noqa: F401 — fills registry
 from models.registry import build_model
-from src.dataset import NormStats, build_dataloader
+from dataset import NormStats, build_dataloader
 
 try:
     import wandb
