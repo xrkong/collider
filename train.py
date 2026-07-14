@@ -79,7 +79,7 @@ except ImportError:
     _WANDB_AVAILABLE = False
 
 try:
-    from safetensors.torch import save_file as _st_save
+    from safetensors.torch import save_file as _st_save, load_file as _st_load
     _SAFETENSORS = True
 except ImportError:
     _SAFETENSORS = False
@@ -201,6 +201,45 @@ def _save_checkpoint(model: torch.nn.Module, path: Path, metadata: dict | None =
                 json.dump(metadata, f, indent=2)
     else:
         torch.save(model.state_dict(), str(path.with_suffix(".pt")))
+
+
+def load_pretrained_weights(
+    model: torch.nn.Module,
+    resume_checkpoint: str | None,
+    resume_artifact: str | None,
+):
+    """Load pretrained weights into `model` in place, before accelerator.prepare().
+
+    Exactly one of resume_checkpoint (local .safetensors/.pt path) or
+    resume_artifact (W&B artifact ref, e.g. "checkpoint-wj01:best") must be set.
+    Only the weights are taken from the source checkpoint — optimizer, scheduler,
+    and epoch budget all come fresh from the current experiment's cfg (a new
+    yaml with its own train.n_epochs / train.lr / train.min_lr is the way to
+    fine-tune with a different schedule, not extra code here).
+    """
+    if resume_artifact:
+        if not _WANDB_AVAILABLE:
+            raise ImportError("wandb is required to resume from a W&B artifact")
+        artifact    = wandb.Api().artifact(resume_artifact, type="model")
+        art_dir     = Path(artifact.download())
+        candidates  = list(art_dir.glob("*.safetensors")) + list(art_dir.glob("*.pt"))
+        if not candidates:
+            raise FileNotFoundError(f"No weights file in artifact at {art_dir}")
+        weights_path = candidates[0]
+        print(f"[Resume] Downloaded W&B artifact '{resume_artifact}' → {weights_path}")
+    elif resume_checkpoint:
+        weights_path = Path(resume_checkpoint)
+        if not weights_path.exists():
+            raise FileNotFoundError(f"Checkpoint not found: {weights_path}")
+    else:
+        raise ValueError("load_pretrained_weights: set resume_checkpoint or resume_artifact")
+
+    if weights_path.suffix == ".safetensors" and _SAFETENSORS:
+        state = _st_load(str(weights_path))
+    else:
+        state = torch.load(str(weights_path), map_location="cpu", weights_only=True)
+    model.load_state_dict(state)
+    print(f"[Resume] Loaded weights from {weights_path}")
 
 
 # ── W&B Artifact upload ───────────────────────────────────────────────────────
@@ -388,7 +427,12 @@ def run_validation(model, val_loader, device, use_node_type: bool = False, accel
     return {"loss": total / max(n_batches, 1)}
 
 # ── Main training loop ────────────────────────────────────────────────────────
-def train(cfg: dict, git_commit: str = "unknown"):
+def train(
+    cfg: dict,
+    git_commit: str = "unknown",
+    resume_checkpoint: str | None = None,
+    resume_artifact: str | None = None,
+):
     """TransolverNet training loop (velocity → acceleration, relative L2).
 
     Data flow:
@@ -433,6 +477,9 @@ def train(cfg: dict, git_commit: str = "unknown"):
     model = build_model(model_cfg["name"], cfg)
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"[Train] Model '{model_cfg['name']}' — {n_params:,} trainable params")
+
+    if resume_checkpoint or resume_artifact:
+        load_pretrained_weights(model, resume_checkpoint, resume_artifact)
 
     # ── Optimizer & scheduler ─────────────────────────────────────────────
     optimizer = torch.optim.AdamW(
@@ -769,6 +816,13 @@ def main():
                         help="Path to configs/experiments/*.yaml")
     parser.add_argument("--skip-git-check", action="store_true",
                         help="Skip git dirty check (debugging only)")
+    resume = parser.add_mutually_exclusive_group()
+    resume.add_argument("--resume-checkpoint", default=None,
+                        help="Local .safetensors/.pt file to initialize weights from "
+                             "(e.g. outputs/checkpoints/wj01/checkpoint-best.safetensors)")
+    resume.add_argument("--resume-artifact", default=None,
+                        help="W&B model artifact to initialize weights from, "
+                             "e.g. 'checkpoint-wj01:best'")
     args = parser.parse_args()
 
     git_commit = "unknown"
@@ -780,7 +834,9 @@ def main():
     print(f"[Config] Loaded experiment: {cfg['name']}")
 
     try:
-        train(cfg, git_commit)
+        train(cfg, git_commit,
+              resume_checkpoint=args.resume_checkpoint,
+              resume_artifact=args.resume_artifact)
     finally:
         if _WANDB_AVAILABLE and wandb.run is not None:
             wandb.finish()

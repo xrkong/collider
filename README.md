@@ -100,13 +100,32 @@ apptainer exec --bind /raid /staging/proj_iim1/xrkong/container/collider.sif \
     --exclude-parts-config configs/data/exclude_parts_tires.yaml \
     --frame-stride 10 --n-jobs 8 \
     --gif
-
 ```
 
 
 ### Training
-```
+```bash
+# Train on local conda environment
 python train.py --experiment configs/experiments/lc001.yaml --skip-git-check
+
+# Train on Apptainer from a W&B artifact
+apptainer exec --nv --bind /raid collider.sif accelerate launch train.py \
+    --experiment configs/experiments/wj04.yaml \
+    --resume-artifact "checkpoint-wj01:best"
+
+# Train on Apptainer from a local checkpoint (no W&B needed)
+apptainer exec --nv --bind /raid collider.sif accelerate launch train.py \
+    --experiment configs/experiments/wj01_2.yaml \
+    --resume-checkpoint outputs/checkpoints/wj01/checkpoint-best.safetensors
+
+# if you use slurm 
+# from a local checkpoint
+sbatch configs/experiments/resume_train_weitj.sh configs/experiments/wj01_2.yaml \
+    outputs/checkpoints/wj01/checkpoint-best.safetensors
+
+# from a W&B artifact
+sbatch configs/experiments/resume_train_weitj.sh configs/experiments/wj04.yaml \
+    "checkpoint-wj01:best"
 ```
 
 ### Barrier plate projection on xy plate 
@@ -124,7 +143,7 @@ weight part id: 2000353
 ### Evaluation and Rollout
 After training, you can evaluate the model on the test set and perform rollouts.
 
-```
+```bash
 python src/evaluate.py \
     --checkpoint outputs/checkpoints/exp_06/checkpoint-best.safetensors \
     --experiment configs/experiments/exp_06.yaml \
@@ -140,6 +159,12 @@ python src/rollout.py \
         --mode both \
         --gif --gif-fps 10 \
         --gif-name dg002_80kph
+
+sbatch configs/experiments/rollout_weitj.sh wj04            
+# just wj04
+sbatch configs/experiments/rollout_weitj.sh wj01 wj02 wj03 wj04   
+# all four together, one comparison plot
+
 ```
 
 
