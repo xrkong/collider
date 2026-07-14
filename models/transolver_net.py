@@ -1,9 +1,3 @@
-# 迁移自: sgnn/transolver/multi_scale_gnn.py
-# 改动内容:
-#   - 导入路径改为 models.blocks.transolver
-#   - MultiScaleGNN 添加 @register("multi_scale_gnn")
-#   - 原有逻辑保留在 MultiScaleGNN 和 TemporalMultiScaleGNN 中，未修改
-
 import torch
 import torch.nn as nn
 
@@ -47,18 +41,18 @@ class TransolverNet(nn.Module):
         super().__init__()
         m = cfg.get("model", cfg) if isinstance(cfg, dict) else cfg.get("model", cfg)
 
-        nnode_in  = m["nnode_in_features"]
-        nnode_out = m["nnode_out_features"]
-        latent    = m["hidden_dim"]
-        layers    = m["layers"]
-        heads     = m.get("num_heads", 8)
-        dropout   = m.get("dropout", 0.0)
-        mlp_ratio = m.get("mlp_ratio", 1)
-        block_act = m.get("block_act", "gelu")
-        slice_num = m.get("slice_num", 64)
+        self.nnode_in  = m["nnode_in_features"]
+        self.nnode_out = m["nnode_out_features"]
+        self.latent    = m["hidden_dim"]
+        self.layers    = m["layers"]
+        self.heads     = m.get("num_heads", 8)
+        self.dropout   = m.get("dropout", 0.0)
+        self.mlp_ratio = m.get("mlp_ratio", 1)
+        self.block_act = m.get("block_act", "gelu")
+        self.slice_num = m.get("slice_num", 64)
 
-        self._init_network(nnode_in, nnode_out, latent, layers, 
-                           heads, dropout, mlp_ratio, block_act, slice_num)
+        self._init_network(self.nnode_in, self.nnode_out, self.latent, self.layers,
+                           self.heads, self.dropout, self.mlp_ratio, self.block_act, self.slice_num)
 
     def _init_network(self, nnode_in, nnode_out, latent_dim, layers,
                       num_heads, dropout, mlp_ratio, block_act, slice_num):

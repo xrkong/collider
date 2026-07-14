@@ -45,6 +45,11 @@ data:
   # ── Node-type embedding switch ────────────────────────────────────────
   node_type: false           # main switch; false = current behaviour
   node_type_field: node_part_label  # h5 metadata/ field name for per-node int label
+
+  # ── Per-region normalization switch (opt-in; false = current global-scalar behaviour) ──
+  per_region_norm: false
+  region_norm_field: region_id
+  region_norm_min_nodes: 1 # ignore regions with fewer nodes than this threshold. AI requested.
   # pin_memory: true
   # collision_threshold: 100.0
   # normalize_dist: false

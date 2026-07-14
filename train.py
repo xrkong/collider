@@ -509,10 +509,16 @@ def train(
     # Compute or load global normalization stats (train trajs only)
     run_output_dir = PROJECT_ROOT / "outputs" / "checkpoints" / cfg["name"]
     norm_fields = data_cfg.get("norm_fields", _DEFAULT_NORM_FIELDS)
+    per_region_norm       = bool(data_cfg.get("per_region_norm", False))
+    region_norm_field     = data_cfg.get("region_norm_field", "region_id")
+    region_norm_min_nodes = int(data_cfg.get("region_norm_min_nodes", 5))
     train_stats = load_or_compute_global_stats(
-        train_dirs  = train_dirs,
-        cache_path  = run_output_dir / "global_stats.json",
-        fields      = norm_fields,
+        train_dirs       = train_dirs,
+        cache_path       = run_output_dir / "global_stats.json",
+        fields           = norm_fields,
+        region           = per_region_norm,
+        region_field     = region_norm_field,
+        min_region_nodes = region_norm_min_nodes,
     )
 
     # Build per-trajectory barrier param dicts for the dataset
@@ -634,6 +640,7 @@ def train(
                         dynamic_ncols=True, leave=True, disable=not accelerator.is_main_process)
             for batch_idx, batch in enumerate(pbar):
                 # ── Unpack batch (9 or 10 tensors from BVCSlicedDataset) ──
+                # T_in is the number of input timesteps. 
                 # [0] x_vel:             (B, N, T_in*3)   normalized velocity, flattened
                 # [1] future_acc:        (B, N, K, 3)     K-step normalized acceleration targets
                 # [2] input_pos:         (B, N, T_in, 3)  raw input positions
@@ -659,7 +666,7 @@ def train(
                 T_in    = input_pos.shape[2]
 
                 # Reshape x_vel back to (B, N, T_in, 3) for window manipulation
-                v_window_norm = x_vel.view(B, N, T_in, 3)        # (B, N, T_in, 3)
+                v_window_norm = x_vel.view(B, N, T_in, 3)          # (B, N, T_in, 3)
                 pos_window    = input_pos                          # (B, N, T_in, 3)
                 v_phys_curr   = v_last_phys                        # (B, N, 3)
 

@@ -198,7 +198,8 @@ def _derive_padded_kinematics(pos: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     return vel.astype(np.float32), acc.astype(np.float32)
 
 
-def load_raw_h5(h5_path: str, node_type_field: str | None = None) -> dict:
+def load_raw_h5(h5_path: str, node_type_field: str | None = None,
+                 region_norm_field: str | None = None) -> dict:
     """Load full trajectory and part metadata from raw h5.
 
     Returns dict with:
@@ -267,6 +268,16 @@ def load_raw_h5(h5_path: str, node_type_field: str | None = None) -> dict:
                     f"data.node_type_field: region_id in the experiment config."
                 )
             data["node_type"] = f[nt_key][:].astype(np.int64)  # (N,)
+
+        if region_norm_field is not None:
+            rid_key = f"metadata/{region_norm_field}"
+            if rid_key not in f:
+                raise KeyError(
+                    f"{h5_path}: missing region field '{rid_key}' required for "
+                    f"per-region normalization. Available metadata fields: "
+                    f"{sorted(f['metadata'].keys())}."
+                )
+            data["region_id"] = f[rid_key][:].astype(np.int64)  # (N,)
 
         # Region label (dataset/ds/build_dataset.py only) — used to restrict
         # RMSE to veh_contact, since the global average over all N nodes is
@@ -1648,6 +1659,14 @@ def main():
         else weights_path.parent / "global_stats.json"
     )
     norm_stats = NormStats.from_global_stats(stats_path, acc_scale=cfg["data"].get("acc_scale"))
+    # Trust the loaded stats file over cfg for whether per-region normalization
+    # was actually used at train time — cfg can drift from what produced the
+    # checkpoint, and denormalizing with the wrong scheme silently corrupts
+    # physical units.
+    if bool(cfg["data"].get("per_region_norm", False)) != norm_stats.is_per_region:
+        print(f"[Rollout] Warning: cfg data.per_region_norm="
+              f"{bool(cfg['data'].get('per_region_norm', False))} but the loaded stats file "
+              f"is_per_region={norm_stats.is_per_region} — using the stats file's mode.")
 
     # ── W&B Table (one per run, all test sets and modes) ──────────────────
     table: "wandb.Table | None" = None
@@ -1692,10 +1711,14 @@ def main():
             speed_kmh = weight_kg = angle_deg = float("nan")
             cond_t = torch.zeros(cond_cfg.n_cond())
 
-        raw_data  = load_raw_h5(h5_path, node_type_field=node_type_field)
+        region_norm_field = norm_stats._region_field if norm_stats.is_per_region else None
+        raw_data  = load_raw_h5(h5_path, node_type_field=node_type_field,
+                                 region_norm_field=region_norm_field)
         node_type = (
             torch.from_numpy(raw_data["node_type"]).to(device) if use_node_type else None
         )
+        if norm_stats.is_per_region:
+            norm_stats.set_region_id(raw_data["region_id"])
         normed   = normalize_raw(raw_data, norm_stats)
         baseline = compute_baseline(raw_data, dt=DT, input_frames=INPUT_FRAMES)
 

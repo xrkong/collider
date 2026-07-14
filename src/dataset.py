@@ -37,6 +37,14 @@ class NormStats:
         self._mean: Dict[str, np.ndarray] = {}
         self._std:  Dict[str, np.ndarray] = {}
 
+        # Per-region normalization is only ever populated via from_global_stats
+        # (metadata.json has no per-region breakdown) — see set_region_id().
+        self.is_per_region: bool = False
+        self._region_mean: Dict[str, np.ndarray] = {}
+        self._region_std:  Dict[str, np.ndarray] = {}
+        self._region_field: Optional[str] = None
+        self._region_id: Optional[np.ndarray] = None
+
         for feat in self.FEATURES:
             if feat not in raw:
                 raise KeyError(f"Feature '{feat}' missing from normalization_stats in {path}")
@@ -55,13 +63,49 @@ class NormStats:
         else:
             print("[NormStats] acceleration uses z-score (no acc_scale provided)")
 
+    def set_region_id(self, region_id: np.ndarray) -> None:
+        """Must be called once per loaded trajectory, before any normalize()/
+        denormalize() call for that trajectory's data, whenever
+        self.is_per_region is True. region_id: (N,) int array in the same
+        node order as the arrays passed to normalize/denormalize."""
+        self._region_id = np.asarray(region_id, dtype=np.int64)
+
+    def _region_broadcast(self, feature: str, arr_ndim: int):
+        """(mean, std) gathered per-node by region, reshaped to broadcast
+        against a (N,C) or (T,N,C) array — or None if region data/region_id
+        isn't set for this feature, in which case callers fall back to the
+        scalar path (this is how loading an old global-only stats file stays
+        bit-for-bit identical to before per-region support existed)."""
+        if feature not in self._region_mean or self._region_id is None:
+            return None
+        mean = self._region_mean[feature][self._region_id]   # (N,)
+        std  = self._region_std[feature][self._region_id]    # (N,)
+        if arr_ndim == 2:
+            return mean[:, None], std[:, None]                # (N,1)
+        if arr_ndim == 3:
+            return mean[None, :, None], std[None, :, None]    # (1,N,1)
+        raise ValueError(f"per-region normalize: unsupported ndim {arr_ndim} for '{feature}'")
+
     def normalize(self, feature: str, arr: np.ndarray) -> np.ndarray:
+        region = self._region_broadcast(feature, arr.ndim)
+        if region is not None:
+            mean, std = region
+            return ((arr - mean) / std).astype(np.float32)
         return ((arr - self._mean[feature]) / self._std[feature]).astype(np.float32)
 
     def denormalize(self, feature: str, arr: np.ndarray) -> np.ndarray:
+        region = self._region_broadcast(feature, arr.ndim)
+        if region is not None:
+            mean, std = region
+            return (arr * std + mean).astype(np.float32)
         return (arr * self._std[feature] + self._mean[feature]).astype(np.float32)
 
     def denormalize_tensor(self, feature: str, t: torch.Tensor) -> torch.Tensor:
+        region = self._region_broadcast(feature, t.dim())
+        if region is not None:
+            mean = torch.tensor(region[0], dtype=t.dtype, device=t.device)
+            std  = torch.tensor(region[1], dtype=t.dtype, device=t.device)
+            return t * std + mean
         mean = torch.tensor(self._mean[feature], dtype=t.dtype, device=t.device)
         std  = torch.tensor(self._std[feature],  dtype=t.dtype, device=t.device)
         return t * std + mean
@@ -93,6 +137,11 @@ class NormStats:
         obj = cls.__new__(cls)
         obj._mean = {}
         obj._std  = {}
+        obj.is_per_region  = False
+        obj._region_mean   = {}
+        obj._region_std    = {}
+        obj._region_field  = None
+        obj._region_id     = None
 
         for feat, s in stats.items():
             obj._mean[feat] = np.array(s["mean"], dtype=np.float32)
@@ -101,13 +150,27 @@ class NormStats:
                 print(f"Warning: near-zero std in '{feat}' — clamped to 1.0")
                 obj._std[feat] = np.float32(1.0)
 
+            if "region_mean" in s:
+                rmean = np.array(s["region_mean"], dtype=np.float32)
+                rstd  = np.array(s["region_std"],  dtype=np.float32)
+                zero_mask = rstd < 1e-8
+                if zero_mask.any():
+                    print(f"Warning: near-zero std in '{feat}' regions "
+                          f"{np.where(zero_mask)[0]} — clamped to 1.0")
+                    rstd[zero_mask] = 1.0
+                obj._region_mean[feat] = rmean
+                obj._region_std[feat]  = rstd
+                obj.is_per_region = True
+                obj._region_field = s.get("region_field") or cached.get("region_field")
+
         obj._acc_scale = float(acc_scale) if acc_scale else None
         if obj._acc_scale is not None:
             print(f"[NormStats] acceleration uses asinh transform, scale={obj._acc_scale:.2e}")
         else:
             print("[NormStats] acceleration uses z-score (global stats)")
 
-        print(f"[NormStats] Loaded global stats from {stats_path}")
+        print(f"[NormStats] Loaded global stats from {stats_path}"
+              + (f" (per-region mode, region_field={obj._region_field})" if obj.is_per_region else ""))
         for feat, s in stats.items():
             print(f"  {feat}: mean={s['mean']:.6f}  std={s['std']:.6f}")
 
@@ -184,30 +247,181 @@ def compute_global_stats(traj_h5_paths: list[str], fields: list[str]) -> dict:
     }
 
 
+def compute_region_stats(
+    traj_h5_paths: list[str],
+    fields: list[str],
+    region_field: str = "region_id",
+    min_region_nodes: int = 5,
+) -> dict:
+    """Per-region + pooled Welford mean/std over (frames × nodes-in-region × dims).
+
+    Splits each field's values by metadata/{region_field} (a per-node int
+    label) before pooling, in addition to the usual pooled/global stats, so
+    callers can normalize per-node using its own region's mean/std instead of
+    one global scalar. Regions with fewer than min_region_nodes nodes fall
+    back to that field's pooled mean/std (too few nodes to trust a
+    per-region estimate).
+
+    Args:
+        traj_h5_paths: list of h5 paths
+        fields: list of field names matching states/ group keys, e.g.
+                ["positions", "velocity", "acceleration"] — velocity/
+                acceleration are derived from positions when the h5 doesn't
+                store them directly (see _read_or_derive_field).
+        region_field: metadata/ dataset name holding the per-node int label
+                (default "region_id", see dataset/constants.py REGION_ID_MAP).
+        min_region_nodes: minimum node count for a region to get its own
+                stats; smaller regions fall back to the pooled stats.
+
+    Returns:
+        {field: {
+            "mean": float, "std": float,                 # pooled — same semantics/values as compute_global_stats
+            "region_mean": [float, ...], "region_std": [float, ...],
+            "region_n_nodes": [int, ...],
+            "region_field": region_field,
+        }}
+    """
+    region_accum: dict = {}   # field -> {region_id: {"n","mean","M2"}}
+    node_counts: dict = {}    # region_id -> n_nodes (max seen across files)
+
+    for p in traj_h5_paths:
+        with h5py.File(p, "r") as fh:
+            rid_key = f"metadata/{region_field}"
+            if rid_key not in fh:
+                raise KeyError(f"{p}: missing region field '{rid_key}'")
+            region_id = np.asarray(fh[rid_key][...]).astype(np.int64)
+            n_regions_here = int(region_id.max()) + 1 if region_id.size else 0
+
+            for r in range(n_regions_here):
+                n = int((region_id == r).sum())
+                if r in node_counts and node_counts[r] != n:
+                    print(f"[RegionStats] Warning: region {r} node count differs across "
+                          f"trajectories ({node_counts[r]} vs {n} in {p}) — using max seen")
+                node_counts[r] = max(node_counts.get(r, 0), n)
+
+            for field in fields:
+                x = _read_or_derive_field(fh, field).astype(np.float64)  # (T', N, C)
+                accum = region_accum.setdefault(field, {})
+                for r in range(n_regions_here):
+                    mask = region_id == r
+                    if not mask.any():
+                        continue
+                    xb = x[:, mask, :].reshape(-1)
+                    n_b = xb.size
+                    if n_b == 0:
+                        continue
+                    mean_b = float(xb.mean())
+                    var_b  = float(xb.var())
+                    s = accum.setdefault(r, {"n": 0, "mean": 0.0, "M2": 0.0})
+                    n_a   = s["n"]
+                    delta = mean_b - s["mean"]
+                    n_new = n_a + n_b
+                    s["mean"] = (n_a * s["mean"] + n_b * mean_b) / n_new
+                    s["M2"]  += var_b * n_b + delta ** 2 * n_a * n_b / n_new
+                    s["n"]    = n_new
+
+    n_regions = (max(node_counts) + 1) if node_counts else 0
+
+    result = {}
+    for field in fields:
+        accum = region_accum.get(field, {})
+
+        # Merge all per-region accumulators into one pooled accumulator —
+        # mathematically identical to compute_global_stats's single-pass pooling.
+        pooled = {"n": 0, "mean": 0.0, "M2": 0.0}
+        for s in accum.values():
+            n_b, mean_b = s["n"], s["mean"]
+            if n_b == 0:
+                continue
+            var_b = s["M2"] / n_b
+            n_a   = pooled["n"]
+            delta = mean_b - pooled["mean"]
+            n_new = n_a + n_b
+            pooled["mean"] = (n_a * pooled["mean"] + n_b * mean_b) / n_new
+            pooled["M2"]  += var_b * n_b + delta ** 2 * n_a * n_b / n_new
+            pooled["n"]    = n_new
+        g_mean = pooled["mean"]
+        g_std  = (pooled["M2"] / max(pooled["n"], 1)) ** 0.5
+        if g_std < 1e-8:
+            print(f"[RegionStats] Warning: near-zero pooled std in '{field}' — clamped to 1.0")
+            g_std = 1.0
+
+        region_mean = [0.0] * n_regions
+        region_std  = [0.0] * n_regions
+        region_n    = [0] * n_regions
+        for r in range(n_regions):
+            n_nodes    = node_counts.get(r, 0)
+            region_n[r] = n_nodes
+            s = accum.get(r)
+            if s is None or s["n"] == 0 or n_nodes < min_region_nodes:
+                if n_nodes and n_nodes < min_region_nodes:
+                    print(f"[RegionStats] Warning: region {r} in '{field}' has only "
+                          f"{n_nodes} node(s) (< min_region_nodes={min_region_nodes}) "
+                          f"— falling back to pooled stats")
+                region_mean[r] = g_mean
+                region_std[r]  = g_std
+                continue
+            r_mean = s["mean"]
+            r_std  = (s["M2"] / max(s["n"], 1)) ** 0.5
+            if r_std < 1e-8:
+                print(f"[RegionStats] Warning: near-zero std in '{field}' region {r} "
+                      f"— clamped to 1.0")
+                r_std = 1.0
+            region_mean[r] = r_mean
+            region_std[r]  = r_std
+
+        result[field] = {
+            "mean": g_mean, "std": g_std,
+            "region_mean": region_mean, "region_std": region_std,
+            "region_n_nodes": region_n,
+            "region_field": region_field,
+        }
+    return result
+
+
 def load_or_compute_global_stats(
     train_dirs: list[str],
     cache_path: Path,
     fields: list[str],
+    region: bool = False,
+    region_field: str = "region_id",
+    min_region_nodes: int = 5,
 ) -> dict:
-    """Load cached global stats or recompute from train dirs.
+    """Load cached global (or per-region) stats or recompute from train dirs.
 
-    Cache key = sorted resolved train_dirs + sorted fields.
-    Recomputes when either changes.
+    Cache key = sorted resolved train_dirs + sorted fields + mode
+    (+ region_field when region=True). Recomputes whenever any of these
+    change, including flipping between global and per-region mode.
     """
-    key = sorted(str(Path(d).resolve()) for d in train_dirs)
+    key  = sorted(str(Path(d).resolve()) for d in train_dirs)
+    mode = "per_region" if region else "global"
     if cache_path.is_file():
         cached = json.loads(cache_path.read_text())
-        if cached.get("key") == key and cached.get("fields") == sorted(fields):
+        cache_ok = (
+            cached.get("key") == key
+            and cached.get("fields") == sorted(fields)
+            and cached.get("mode", "global") == mode
+            and (not region or cached.get("region_field") == region_field)
+        )
+        if cache_ok:
             print(f"[GlobalStats] Loaded cached stats from {cache_path}")
             return cached["stats"]
 
-    print(f"[GlobalStats] Computing global stats over {len(train_dirs)} train traj(s) ...")
     h5_paths = [_resolve_traj_dir(d)["h5"] for d in train_dirs]
-    stats    = compute_global_stats(h5_paths, fields)
+    if region:
+        print(f"[GlobalStats] Computing per-region stats over {len(train_dirs)} "
+              f"train traj(s) (region_field={region_field}) ...")
+        stats = compute_region_stats(h5_paths, fields, region_field=region_field,
+                                      min_region_nodes=min_region_nodes)
+    else:
+        print(f"[GlobalStats] Computing global stats over {len(train_dirs)} train traj(s) ...")
+        stats = compute_global_stats(h5_paths, fields)
 
     cache_path.parent.mkdir(parents=True, exist_ok=True)
     cache_path.write_text(json.dumps(
-        {"key": key, "fields": sorted(fields), "stats": stats}, indent=2
+        {"key": key, "fields": sorted(fields), "mode": mode,
+         "region_field": region_field if region else None, "stats": stats},
+        indent=2,
     ))
     print(f"[GlobalStats] Stats saved to {cache_path}")
     for field, s in stats.items():
@@ -335,8 +549,13 @@ class BVCSlicedDataset(BaseDataset):
             - cfg["data"]["metadata_paths"]: list[str | None], metadata.json paths (optional per-entry)
             - cfg["data"]["input_frames"]:   int, default 5
             - cfg["data"]["normalize"]:      bool, default True
+            - cfg["data"]["per_region_norm"]:   bool, default False — opt-in per-region
+              normalization (one mean/std per metadata/region_norm_field value, instead
+              of one global scalar); see load_or_compute_global_stats(region=True).
+            - cfg["data"]["region_norm_field"]: str, default "region_id"
             - cfg["train"]["push_forward_k"]: int, default 1
-        stats: global normalization stats dict {field: {"mean": float, "std": float}}.
+        stats: global (or per-region, when per_region_norm=True) normalization stats
+               dict {field: {"mean": float, "std": float, ...}}.
                If None and normalize=True, falls back to first traj's metadata.json.
                CRITICAL: val dataset must receive train stats, not its own metadata stats.
     """
@@ -373,6 +592,8 @@ class BVCSlicedDataset(BaseDataset):
         self.K = int(train_cfg.get("push_forward_k", 1))
         self.use_node_type   = bool(data_cfg.get("node_type", False))
         self.node_type_field = data_cfg.get("node_type_field", "node_part_label")
+        self.per_region_norm   = bool(data_cfg.get("per_region_norm", False))
+        self.region_norm_field = data_cfg.get("region_norm_field", "region_id")
         if self.K < 1:
             raise ValueError(f"push_forward_k must be >= 1, got {self.K}")
         self.window_len = self.input_frames + self.K
@@ -423,6 +644,17 @@ class BVCSlicedDataset(BaseDataset):
                         )
                     node_type_arr = f[nt_key][:].astype(np.int64)  # (N,) static
 
+                region_id_arr = None
+                if self.per_region_norm:
+                    rid_key = f"metadata/{self.region_norm_field}"
+                    if rid_key not in f:
+                        raise KeyError(
+                            f"{p}: missing region field '{rid_key}' required for "
+                            f"data.per_region_norm=true. Available metadata fields: "
+                            f"{sorted(f['metadata'].keys())}."
+                        )
+                    region_id_arr = f[rid_key][:].astype(np.int64)  # (N,) static
+
             T = pos.shape[0]
             if T < self.window_len:
                 raise ValueError(
@@ -435,8 +667,8 @@ class BVCSlicedDataset(BaseDataset):
             # states/acceleration, which the new H5 format doesn't have anyway.
             vel_derived     = np.diff(pos, axis=0)          # (T-1, N, 3)
             acc_derived_raw = np.diff(vel_derived, axis=0)  # (T-2, N, 3)
-            vel_derived_norm = self._normalize("velocity",     vel_derived)
-            acc_derived_norm = self._normalize("acceleration", acc_derived_raw)
+            vel_derived_norm = self._normalize("velocity",     vel_derived,     region_id=region_id_arr)
+            acc_derived_norm = self._normalize("acceleration", acc_derived_raw, region_id=region_id_arr)
 
             n_windows = max(0, T - self.window_len)
             per_traj_windows.append(n_windows)
@@ -499,12 +731,29 @@ class BVCSlicedDataset(BaseDataset):
         print(f"[BVCSlicedDataset] input_frames={self.input_frames}, K={self.K}, "
               f"window_len={self.window_len}")
 
-    def _normalize(self, field: str, arr: np.ndarray) -> np.ndarray:
-        """Apply normalization using whichever stats source is active."""
+    def _normalize(self, field: str, arr: np.ndarray, region_id: np.ndarray | None = None) -> np.ndarray:
+        """Apply normalization using whichever stats source is active.
+
+        region_id: (N,) per-node region label, in the same node order as
+        arr's node axis (arr is always (T, N, C) at this call site). Only
+        used when self.per_region_norm and the active stats dict actually
+        carries a per-region breakdown for this field.
+        """
         if self._stats_dict is not None:
             s = self._stats_dict.get(field)
             if s is None:
                 return arr.astype(np.float32)
+            if region_id is not None and "region_mean" in s:
+                mean = np.asarray(s["region_mean"], dtype=np.float64)[region_id]  # (N,)
+                std  = np.asarray(s["region_std"],  dtype=np.float64)[region_id]  # (N,)
+                std  = np.where(std < 1e-8, 1.0, std)
+                mean_b = mean[None, :, None]   # (1, N, 1) broadcasts against (T, N, C)
+                std_b  = std[None, :, None]
+                return ((arr - mean_b) / std_b).astype(np.float32)
+            if region_id is not None and "region_mean" not in s:
+                print(f"[BVCSlicedDataset] Warning: per_region_norm=True but stats['{field}'] "
+                      f"has no region_mean — falling back to global scalar normalization for "
+                      f"this field. Was global_stats.json computed with region=True?")
             return ((arr - s["mean"]) / max(s["std"], 1e-8)).astype(np.float32)
         if self._norm_stats is not None:
             return self._norm_stats.normalize(field, arr)

@@ -12,7 +12,7 @@ You may also need ```tmux``` to run the training in the background.
 
 Ensure you have Python 3.11 installed (tested version). Create a new Conda environment:  
 ```bash
-conda create --name collider --file environment.yml
+conda create --name collider 
 conda activate collider
 
 # Or run this.
