@@ -103,7 +103,7 @@ class TransolverplusNet(nn.Module):
             nt = node_type.long()
             if nt.dim() == 1:
                 nt = nt.unsqueeze(0).expand(x.shape[0], -1)  # (B, N)
-            emb = self.type_embed(nt)                         # (B, N, type_emb_dim)
+            emb = self.type_embed(nt)                        # (B, N, type_emb_dim)
             x = torch.cat([x, emb], dim=-1)
         tokens = self.input_proj(x)
         for block in self.blocks:

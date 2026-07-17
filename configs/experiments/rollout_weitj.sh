@@ -4,8 +4,6 @@
 #SBATCH --job-name=collider-rollout
 #SBATCH --partition=LocalQ
 #SBATCH --gres=gpu:1
-#SBATCH --cpus-per-task=8
-#SBATCH --mem=64G
 #SBATCH --time=04:00:00
 #SBATCH --output=logs/%x-%j.out
 #SBATCH --error=logs/%x-%j.err
@@ -13,6 +11,10 @@
 # Runs src/rollout.py (one-step + autoregressive, GIF + RMSE plots) for each
 # experiment's checkpoint-best.safetensors against its own val trajectory,
 # then overlays all of them on one multi-experiment RMSE comparison plot.
+#
+# Checkpoints aren't kept on local disk — rollout.py pulls checkpoint-<name>:best
+# (and its global_stats.json) straight from the W&B artifact given just
+# --experiment, so no local outputs/checkpoints/<name>/ is required.
 #
 # Usage: sbatch configs/experiments/rollout_weitj.sh [name ...]
 #        (defaults to wj01 wj02 wj03)
@@ -57,7 +59,6 @@ done
 
 for i in "${!NAMES[@]}"; do
   name="${NAMES[$i]}"
-  checkpoint="outputs/checkpoints/${name}/checkpoint-best.safetensors"
   experiment="configs/experiments/${name}.yaml"
 
   echo "=== ${name} ==="
@@ -71,9 +72,17 @@ for i in "${!NAMES[@]}"; do
     extra_args=(--compare-dirs "${COMPARE_DIRS[@]}")
   fi
 
+  # Older checkpoint-<name>:best artifacts (logged before global_stats.json
+  # started being bundled into them, or by a still-running job that loaded
+  # train.py before that change) won't carry norm stats. Fall back to the
+  # local copy left behind by training, if one is still on disk.
+  local_stats="outputs/checkpoints/${name}/global_stats.json"
+  if [ -f "${local_stats}" ]; then
+    extra_args+=(--stats-path "${local_stats}")
+  fi
+
   apptainer exec --nv --bind /raid "${SIF}" \
     python src/rollout.py \
-      --checkpoint "${checkpoint}" \
       --experiment "${experiment}" \
       --raw-h5 "${raw_h5}" \
       --mode both \

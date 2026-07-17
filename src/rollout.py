@@ -394,7 +394,7 @@ def compute_sdf_batch(
 # ── Inference ─────────────────────────────────────────────────────────────────
 @torch.no_grad()
 def run_onestep(model, raw_data, normed, norm_stats, device,
-                node_type=None, cond_t=None) -> dict:
+                node_type=None, cond_t=None, include_position: bool = False) -> dict:
     T      = raw_data["positions"].shape[0]
     T_eval = T - 2          # last 2 frames have padded GT vel/acc (forward diff)
     print(f"[One-step] dt = 1 (per-frame), steps = {T_eval - INPUT_FRAMES}")
@@ -429,7 +429,14 @@ def run_onestep(model, raw_data, normed, norm_stats, device,
             torch.from_numpy(input_pos[..., 0:2])
         ).to(device).unsqueeze(0)                                        # (1, N, T_in)
 
-        x_in = torch.cat([x_vel_flat, x_sdf, cond_b], dim=-1)           # (1, N, T_in*4 + n_cond)
+        x_parts = [x_vel_flat]
+        if include_position:
+            pos_norm   = norm_stats.normalize("positions", input_pos)    # (N, T_in, 3)
+            x_pos_flat = torch.from_numpy(pos_norm.reshape(N, -1)).float().to(device).unsqueeze(0)
+            x_parts.append(x_pos_flat)                                   # (1, N, T_in*3)
+        x_parts.append(x_sdf)
+        x_parts.append(cond_b)
+        x_in = torch.cat(x_parts, dim=-1)           # (1, N, T_in*per_frame_features + n_cond)
 
         # Erosion mask: zero out input features for nodes already eroded at
         # the last input frame, before the model sees them (mirrors training).
@@ -499,7 +506,7 @@ def run_onestep(model, raw_data, normed, norm_stats, device,
 
 @torch.no_grad()
 def run_autoregressive(model, raw_data, normed, norm_stats, device,
-                       node_type=None, cond_t=None) -> dict:
+                       node_type=None, cond_t=None, include_position: bool = False) -> dict:
     T      = raw_data["positions"].shape[0]
     T_eval = T - 2          # last 2 frames have padded GT vel/acc (forward diff)
     print(f"[Autoregressive] dt = 1 (per-frame), steps = {T_eval - INPUT_FRAMES}")
@@ -535,11 +542,19 @@ def run_autoregressive(model, raw_data, normed, norm_stats, device,
         x_vel_flat  = build_velocity_input_from_window(v_window_norm).to(device)  # (1, N, T_in*3)
 
         # SDF uses rolling position window
+        pos_window_phys = x_window_phys.transpose(1, 0, 2)                          # (N, T_in, 3)
         x_sdf = compute_sdf_batch(
-            torch.from_numpy(x_window_phys[..., 0:2].transpose(1, 0, 2)).float()
+            torch.from_numpy(pos_window_phys[..., 0:2]).float()
         ).to(device).unsqueeze(0)                                                   # (1, N, T_in)
 
-        x_in = torch.cat([x_vel_flat, x_sdf, cond_b], dim=-1)                     # (1, N, T_in*4 + n_cond)
+        x_parts = [x_vel_flat]
+        if include_position:
+            pos_norm   = norm_stats.normalize("positions", pos_window_phys)         # (N, T_in, 3)
+            x_pos_flat = torch.from_numpy(pos_norm.reshape(N, -1)).float().to(device).unsqueeze(0)
+            x_parts.append(x_pos_flat)                                              # (1, N, T_in*3)
+        x_parts.append(x_sdf)
+        x_parts.append(cond_b)
+        x_in = torch.cat(x_parts, dim=-1)                     # (1, N, T_in*per_frame_features + n_cond)
 
         # Erosion mask: zero out input features for nodes already eroded at
         # the last input frame, before the model sees them (mirrors training).
@@ -1492,8 +1507,10 @@ def upload_to_wandb(
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────
-# NOTE: rollout depends on train.py having written meta.json and logged the
-# checkpoint-{exp}:best W&B artifact before this script is run.
+# NOTE: rollout depends on train.py having logged the checkpoint-{exp}:best
+# W&B artifact before this script is run. With --experiment given, the
+# checkpoint (and its global_stats.json) are pulled straight from that
+# artifact — no local checkpoint dir or meta.json is required.
 
 def main():
     parser = argparse.ArgumentParser(description="BVC rollout visualization")
@@ -1589,11 +1606,20 @@ def main():
     artifact_ckpt_dir: Path | None = None
     exp_meta: dict | None = None
 
-    if _WANDB and ckpt_dir and not args.no_artifact:
-        try:
-            exp_meta = load_meta(ckpt_dir)
-        except FileNotFoundError as e:
-            print(f"[W&B] {e}")
+    if _WANDB and not args.no_artifact:
+        if ckpt_dir is not None:
+            try:
+                exp_meta = load_meta(ckpt_dir)
+            except FileNotFoundError as e:
+                print(f"[W&B] {e}")
+
+        if exp_meta is None and args.experiment:
+            # No local meta.json (checkpoints/stats aren't kept on disk) —
+            # derive the same group/project/experiment straight from the
+            # yaml so the checkpoint can still be pulled from its artifact.
+            from train import load_config, wandb_meta_from_cfg
+            exp_meta = wandb_meta_from_cfg(load_config(args.experiment))
+            print(f"[W&B] No local meta.json — derived lineage from {args.experiment}")
 
         if exp_meta is not None:
             exp     = exp_meta["experiment"]
@@ -1643,6 +1669,9 @@ def main():
     INPUT_FRAMES = int(cfg["data"].get("input_frames", INPUT_FRAMES))
     print(f"[Rollout] INPUT_FRAMES = {INPUT_FRAMES} (from config)")
 
+    include_position = bool(cfg["data"].get("include_position", False))
+    print(f"[Rollout] include_position = {include_position} (from config)")
+
     cond_cfg = CondConfig(**(cfg.get("condition") or {}))
     print(f"[Rollout] Condition: enabled={list(cond_cfg.enabled)}, n_cond={cond_cfg.n_cond()}")
 
@@ -1655,6 +1684,7 @@ def main():
 
     stats_path = (
         Path(args.stats_path) if args.stats_path
+        else artifact_ckpt_dir / "global_stats.json" if artifact_ckpt_dir
         else ckpt_dir / "global_stats.json" if ckpt_dir
         else weights_path.parent / "global_stats.json"
     )
@@ -1730,7 +1760,8 @@ def main():
 
         if args.mode in ("onestep", "both"):
             onestep = run_onestep(model, raw_data, normed, norm_stats, device,
-                                  node_type=node_type, cond_t=cond_t)
+                                  node_type=node_type, cond_t=cond_t,
+                                  include_position=include_position)
             pkl_path = out_dir / f"{pkl_stem}onestep.pkl"
             with open(pkl_path, "wb") as f:
                 pickle.dump(onestep, f)
@@ -1738,7 +1769,8 @@ def main():
 
         if args.mode in ("autoregressive", "both"):
             autoreg = run_autoregressive(model, raw_data, normed, norm_stats, device,
-                                         node_type=node_type, cond_t=cond_t)
+                                         node_type=node_type, cond_t=cond_t,
+                                         include_position=include_position)
             pkl_path = out_dir / f"{pkl_stem}autoregressive.pkl"
             with open(pkl_path, "wb") as f:
                 pickle.dump(autoreg, f)

@@ -158,15 +158,23 @@ def load_config(experiment_path: str) -> dict:
 
 # ── W&B setup ─────────────────────────────────────────────────────────────────
 
-def _write_meta_json(save_dir: Path, cfg: dict) -> dict:
-    """Write meta.json to checkpoint dir for train→rollout group linkage; return the meta dict."""
+def wandb_meta_from_cfg(cfg: dict) -> dict:
+    """Derive the group/project/experiment triple used for W&B lineage straight
+    from an experiment cfg. Lets rollout.py resolve the same values without a
+    local meta.json when checkpoints aren't kept on disk.
+    """
     wandb_cfg = cfg.get("wandb", {})
     project = wandb_cfg.get("project") or os.environ.get("WANDB_PROJECT", _DEFAULT_PROJECT)
-    meta = {
+    return {
         "group":      cfg["name"],
         "project":    project,
         "experiment": cfg["name"],
     }
+
+
+def _write_meta_json(save_dir: Path, cfg: dict) -> dict:
+    """Write meta.json to checkpoint dir for train→rollout group linkage; return the meta dict."""
+    meta = wandb_meta_from_cfg(cfg)
     (save_dir / "meta.json").write_text(json.dumps(meta, indent=2))
     return meta
 
@@ -207,6 +215,7 @@ def load_pretrained_weights(
     model: torch.nn.Module,
     resume_checkpoint: str | None,
     resume_artifact: str | None,
+    cfg: dict | None = None,
 ):
     """Load pretrained weights into `model` in place, before accelerator.prepare().
 
@@ -220,6 +229,13 @@ def load_pretrained_weights(
     if resume_artifact:
         if not _WANDB_AVAILABLE:
             raise ImportError("wandb is required to resume from a W&B artifact")
+        if "/" not in resume_artifact:
+            # Bare artifact name (no entity/project scope) — the W&B API would
+            # otherwise resolve it against its own default project instead of
+            # the one this experiment actually logs checkpoints to.
+            wandb_cfg = (cfg or {}).get("wandb", {})
+            project = wandb_cfg.get("project") or os.environ.get("WANDB_PROJECT", _DEFAULT_PROJECT)
+            resume_artifact = f"{project}/{resume_artifact}"
         artifact    = wandb.Api().artifact(resume_artifact, type="model")
         art_dir     = Path(artifact.download())
         candidates  = list(art_dir.glob("*.safetensors")) + list(art_dir.glob("*.pt"))
@@ -280,6 +296,11 @@ def _log_best_artifact(
         meta_json = best_path.with_suffix(".json")
         if meta_json.exists():
             artifact.add_file(str(meta_json))
+        # Bundle normalization stats too, so rollout can denormalize using
+        # only the downloaded artifact — no local checkpoint dir required.
+        stats_json = save_dir / "global_stats.json"
+        if stats_json.exists():
+            artifact.add_file(str(stats_json))
         run.log_artifact(artifact, aliases=[f"epoch_{epoch}", "best"])
         print(f"[Artifact] Uploaded checkpoint-{meta['group']}:best (epoch {epoch})")
     except Exception as e:
@@ -380,7 +401,9 @@ def compute_sdf_batch(
 
 # ── Validation loop ───────────────────────────────────────────────────────────
 @torch.no_grad()
-def run_validation(model, val_loader, device, use_node_type: bool = False, accelerator=None) -> dict:
+def run_validation(model, val_loader, device, use_node_type: bool = False, accelerator=None,
+                    include_position: bool = False, pos_mean: float | None = None,
+                    pos_std: float | None = None) -> dict:
     model.eval()
     total, n_batches = 0.0, 0
     for batch in val_loader:
@@ -400,7 +423,12 @@ def run_validation(model, val_loader, device, use_node_type: bool = False, accel
         T_in    = input_pos.shape[2]
 
         x_sdf = compute_sdf_batch(input_pos[..., :2], barrier_angle_deg, x_intercept)
-        x_in  = torch.cat([x_vel, x_sdf], dim=-1)
+        x_parts = [x_vel]
+        if include_position:
+            x_pos = (input_pos - pos_mean) / pos_std           # (B, N, T_in, 3)
+            x_parts.append(x_pos.reshape(B, N, -1))
+        x_parts.append(x_sdf)
+        x_in  = torch.cat(x_parts, dim=-1)
 
         # Method A: broadcast cond to (B, N, n_cond) and concat last (D6)
         if cond.shape[-1] > 0:
@@ -465,7 +493,9 @@ def train(
     cond_cfg = CondConfig(**(cfg.get("condition") or {}))
     n_cond   = cond_cfg.n_cond()
     T_in     = int(data_cfg.get("input_frames", 5))
-    base_features = T_in * 4   # T_in * (3 vel + 1 sdf)
+    include_position   = bool(data_cfg.get("include_position", False))
+    per_frame_features  = 4 + (3 if include_position else 0)  # 3 vel [+ 3 position] + 1 sdf
+    base_features       = T_in * per_frame_features
     assert model_cfg["nnode_in_features"] == base_features + n_cond, (
         f"nnode_in_features={model_cfg['nnode_in_features']} != "
         f"{base_features} + n_cond={n_cond} = {base_features + n_cond}"
@@ -479,7 +509,7 @@ def train(
     print(f"[Train] Model '{model_cfg['name']}' — {n_params:,} trainable params")
 
     if resume_checkpoint or resume_artifact:
-        load_pretrained_weights(model, resume_checkpoint, resume_artifact)
+        load_pretrained_weights(model, resume_checkpoint, resume_artifact, cfg)
 
     # ── Optimizer & scheduler ─────────────────────────────────────────────
     optimizer = torch.optim.AdamW(
@@ -520,6 +550,19 @@ def train(
         region_field     = region_norm_field,
         min_region_nodes = region_norm_min_nodes,
     )
+
+    # Position input feature (opt-in via data.include_position) uses the pooled
+    # global mean/std only — unlike velocity/acceleration it does not get
+    # per-region normalization even when data.per_region_norm=true.
+    pos_mean = pos_std = None
+    if include_position:
+        pos_stats = train_stats.get("positions")
+        if pos_stats is None:
+            raise ValueError(
+                "data.include_position=true requires 'positions' in data.norm_fields"
+            )
+        pos_mean = float(pos_stats["mean"])
+        pos_std  = max(float(pos_stats["std"]), 1e-8)
 
     # Build per-trajectory barrier param dicts for the dataset
     train_barrier = [
@@ -589,15 +632,20 @@ def train(
     print(f"[Train] accum_steps = {accum_steps} | effective batch = {train_cfg['batch_size'] * accum_steps}")
 
     n_epochs        = int(train_cfg["n_epochs"])
+    lr_cycles       = int(train_cfg.get("lr_cycles", 1))
+    total_epochs    = n_epochs * lr_cycles
     steps_per_epoch = len(train_loader)
 
     lr     = float(train_cfg.get("lr", 1e-3))
     min_lr = float(train_cfg.get("min_lr", lr))
 
-    # Cosine decay from lr → min_lr over n_epochs epochs (stepped once per epoch)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+    # Cosine decay from lr → min_lr over n_epochs epochs, restarting (back to lr)
+    # every n_epochs for lr_cycles cycles. lr_cycles=1 (default) is a single
+    # cosine decay over the whole run, unchanged from before.
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
         optimizer,
-        T_max=n_epochs * accelerator.num_processes,
+        T_0=n_epochs * accelerator.num_processes,
+        T_mult=1,
         eta_min=min_lr,
     )
 
@@ -624,19 +672,19 @@ def train(
 
     val_every = int(train_cfg.get("val_every_epochs", 1))
 
-    print(f"[Train] Starting — {n_epochs} epochs | {steps_per_epoch} steps/epoch | "
-          f"batch={train_cfg['batch_size']} | lr={lr}→{min_lr} (cosine) | val_every={val_every}")
+    print(f"[Train] Starting — {total_epochs} epochs ({lr_cycles}× {n_epochs}-epoch cosine cycles) | "
+          f"{steps_per_epoch} steps/epoch | batch={train_cfg['batch_size']} | lr={lr}→{min_lr} | val_every={val_every}")
 
     step = 0
     model.train()
 
     try:
-        for epoch in range(n_epochs):
+        for epoch in range(total_epochs):
             epoch_loss_sum = 0.0
             epoch_batches  = 0
             model.train()
 
-            pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{n_epochs}", unit="batch",
+            pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{total_epochs}", unit="batch",
                         dynamic_ncols=True, leave=True, disable=not accelerator.is_main_process)
             for batch_idx, batch in enumerate(pbar):
                 # ── Unpack batch (9 or 10 tensors from BVCSlicedDataset) ──
@@ -684,16 +732,24 @@ def train(
                     else:
                         v_window_input = v_window_norm
 
-                    # Build model input: flatten T_in dim into channels, concat SDF, concat cond (D6)
+                    # Build model input: flatten T_in dim into channels, concat position
+                    # (opt-in), concat SDF, concat cond (D6)
                     x_vel_flat = v_window_input.reshape(B, N, -1)         # (B, N, T_in*3)
+                    x_in_parts = [x_vel_flat]
+                    if include_position:
+                        x_pos_norm = (pos_window - pos_mean) / pos_std       # (B, N, T_in, 3)
+                        x_in_parts.append(x_pos_norm.reshape(B, N, -1))      # (B, N, T_in*3)
                     x_sdf      = build_sdf_window(                        # (B, N, T_in)
                         pos_window, barrier_angle_deg, x_intercept
                     )
-                    x_in       = torch.cat([x_vel_flat, x_sdf, cond_b], dim=-1)  # (B, N, T_in*4+n_cond)
+                    x_in_parts.append(x_sdf)
+                    x_in_parts.append(cond_b)
+                    x_in       = torch.cat(x_in_parts, dim=-1)  # (B, N, T_in*per_frame_features+n_cond)
                     assert x_in.shape[-1] == model_cfg["nnode_in_features"], \
                         f"x_in dim {x_in.shape[-1]} != nnode_in_features {model_cfg['nnode_in_features']}"
 
                     # Erosion mask: zero out input features for eroded nodes before the model sees them.
+                    # TODO: don't zero mask, just keep the previous position and velocity for eroded nodes, so the model can learn to predict zero acceleration for them.
                     x_in = x_in * alive_mask.unsqueeze(-1)
 
                     # Forward
@@ -760,7 +816,8 @@ def train(
             epoch_log = {"epoch": epoch + 1, "train/epoch_loss": epoch_avg_loss}
 
             if (epoch + 1) % val_every == 0:
-                val_metrics = run_validation(model, val_loader, device, use_node_type, accelerator=accelerator)
+                val_metrics = run_validation(model, val_loader, device, use_node_type, accelerator=accelerator,
+                                              include_position=include_position, pos_mean=pos_mean, pos_std=pos_std)
                 val_loss    = val_metrics["loss"]
 
                 accelerator.wait_for_everyone()
@@ -797,13 +854,13 @@ def train(
                     else:
                         tick = ""
 
-                    print(f"[Val]   Epoch {epoch+1}/{n_epochs} | "
+                    print(f"[Val]   Epoch {epoch+1}/{total_epochs} | "
                           f"train_loss={epoch_avg_loss:.5f} | val_loss={val_loss:.5f} | "
                           f"best={best_val_loss:.5f} {tick}")
 
                 epoch_log.update({f"val/{k}": v for k, v in val_metrics.items()})
 
-            scheduler.step()  # advance LR once per epoch; min_lr reached at epoch n_epochs
+            scheduler.step()  # advance LR once per epoch; restarts to lr every n_epochs
 
             if wandb_run:
                 wandb_run.log(epoch_log, step=step)
