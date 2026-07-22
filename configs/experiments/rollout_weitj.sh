@@ -16,8 +16,18 @@
 # (and its global_stats.json) straight from the W&B artifact given just
 # --experiment, so no local outputs/checkpoints/<name>/ is required.
 #
-# Usage: sbatch configs/experiments/rollout_weitj.sh [name ...]
+# Usage: sbatch configs/experiments/rollout_weitj.sh [experiment ...]
 #        (defaults to wj01 wj02 wj03)
+#
+# Each "experiment" arg is either a bare name (resolved to
+# configs/experiments/<name>.yaml) or a path to a yaml file directly, e.g.:
+#   sbatch configs/experiments/rollout_weitj.sh wj01 wj02
+#   sbatch configs/experiments/rollout_weitj.sh configs/experiments/wj06_0.yaml
+#
+# The checkpoint/output directory name always comes from the yaml's own
+# top-level `name:` field (cfg["name"], same as train.py uses for its W&B
+# artifact and outputs/checkpoints/<name>/), NOT from the filename — a yaml
+# file's stem doesn't have to match the `name:` it declares inside.
 
 set -euo pipefail
 
@@ -33,24 +43,42 @@ mkdir -p logs
 echo "Running on $(hostname), Job ID ${SLURM_JOB_ID:-none}"
 nvidia-smi -L
 
-# Extract data.val_dirs[0] straight from the experiment yaml (via train.py's
-# own load_config + parse_dir_entry — the same parser train.py/rollout.py
-# already use), instead of hand-duplicating each path here. Strips the
-# ":<angle>" suffix (rollout.py re-derives the angle from the h5 name itself).
-get_val_h5() {
+# Extract cfg["name"] and data.val_dirs[0] straight from the experiment yaml
+# (via train.py's own load_config + parse_dir_entry — the same parser
+# train.py/rollout.py already use), instead of hand-duplicating either here.
+# val_h5 has its ":<angle>" suffix stripped (rollout.py re-derives the angle
+# from the h5 name itself).
+get_exp_info() {
   apptainer exec --bind /raid "${SIF}" python -c "
 from train import load_config, parse_dir_entry
-cfg = load_config('configs/experiments/${1}.yaml')
+cfg = load_config('${1}')
 path, _ = parse_dir_entry(cfg['data']['val_dirs'][0])
+print(cfg['name'])
 print(path)
 "
 }
 
 if [ "$#" -eq 0 ]; then
-  NAMES=(wj01 wj02 wj03)
+  ARGS=(wj01 wj02 wj03)
 else
-  NAMES=("$@")
+  ARGS=("$@")
 fi
+
+EXPERIMENTS=()
+for arg in "${ARGS[@]}"; do
+  case "${arg}" in
+    */*|*.yaml|*.yml) EXPERIMENTS+=("${arg}") ;;
+    *)                EXPERIMENTS+=("configs/experiments/${arg}.yaml") ;;
+  esac
+done
+
+NAMES=()
+VAL_H5S=()
+for experiment in "${EXPERIMENTS[@]}"; do
+  info="$(get_exp_info "${experiment}")"
+  NAMES+=("$(echo "${info}" | sed -n 1p)")
+  VAL_H5S+=("$(echo "${info}" | sed -n 2p)")
+done
 
 COMPARE_DIRS=()
 for name in "${NAMES[@]}"; do
@@ -59,10 +87,10 @@ done
 
 for i in "${!NAMES[@]}"; do
   name="${NAMES[$i]}"
-  experiment="configs/experiments/${name}.yaml"
+  experiment="${EXPERIMENTS[$i]}"
 
   echo "=== ${name} ==="
-  raw_h5="$(get_val_h5 "${name}")"
+  raw_h5="${VAL_H5S[$i]}"
   echo "val h5 (from ${experiment}): ${raw_h5}"
 
   extra_args=()
