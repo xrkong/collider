@@ -16,13 +16,12 @@
 # (and its global_stats.json) straight from the W&B artifact given just
 # --experiment, so no local outputs/checkpoints/<name>/ is required.
 #
-# Usage: sbatch configs/experiments/rollout_weitj.sh [experiment ...]
-#        (defaults to wj01 wj02 wj03)
-#
-# Each "experiment" arg is either a bare name (resolved to
-# configs/experiments/<name>.yaml) or a path to a yaml file directly, e.g.:
-#   sbatch configs/experiments/rollout_weitj.sh wj01 wj02
+# Usage: sbatch configs/experiments/rollout_weitj.sh <experiment.yaml> [more.yaml ...]
 #   sbatch configs/experiments/rollout_weitj.sh configs/experiments/wj06_0.yaml
+#   sbatch configs/experiments/rollout_weitj.sh configs/experiments/wj06_0.yaml configs/experiments/wj06_1.yaml
+#
+# Each arg must be an explicit path to a yaml file — no bare-name resolution
+# and no default experiment list; at least one path is required.
 #
 # The checkpoint/output directory name always comes from the yaml's own
 # top-level `name:` field (cfg["name"], same as train.py uses for its W&B
@@ -59,16 +58,18 @@ print(path)
 }
 
 if [ "$#" -eq 0 ]; then
-  ARGS=(wj01 wj02 wj03)
-else
-  ARGS=("$@")
+  echo "Usage: sbatch configs/experiments/rollout_weitj.sh <path/to/experiment.yaml> [more.yaml ...]" >&2
+  exit 1
 fi
 
-EXPERIMENTS=()
-for arg in "${ARGS[@]}"; do
-  case "${arg}" in
-    */*|*.yaml|*.yml) EXPERIMENTS+=("${arg}") ;;
-    *)                EXPERIMENTS+=("configs/experiments/${arg}.yaml") ;;
+EXPERIMENTS=("$@")
+for experiment in "${EXPERIMENTS[@]}"; do
+  case "${experiment}" in
+    */*|*.yaml|*.yml) ;;
+    *)
+      echo "Error: '${experiment}' is not a yaml path (expected e.g. configs/experiments/wj06_0.yaml)." >&2
+      exit 1
+      ;;
   esac
 done
 
@@ -117,6 +118,13 @@ for i in "${!NAMES[@]}"; do
       --gif --plot \
       --output-dir "outputs/rollouts/${name}" \
       "${extra_args[@]}"
+
+  # GC / barrier kinematics plots (ORA_x, ORA_y, ASI, displacement) from the
+  # gc_barrier_onestep.csv / gc_barrier_autoregressive.csv rollout.py just
+  # wrote — see src/gc_barrier.py + src/plot_gc_barrier.py. Only needs
+  # numpy/matplotlib, so no --nv.
+  apptainer exec --bind /raid "${SIF}" \
+    python src/plot_gc_barrier.py "outputs/rollouts/${name}"
 
   echo "=== Done ${name} ==="
 done

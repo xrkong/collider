@@ -54,6 +54,9 @@ import models  # noqa: F401
 from models.registry import build_model
 from src.dataset import NormStats, traj_name_from_h5
 from src.conditions import CondConfig, parse_conditions, normalize_conditions
+from src.gc_barrier import (
+    locate_gc_barrier, export_gt_kinematics_csv, export_pred_gt_kinematics_csv,
+)
 
 try:
     import h5py
@@ -209,6 +212,7 @@ def load_raw_h5(h5_path: str, node_type_field: str | None = None,
         node_alive:   (T, N)     bool      erosion mask; all-True if absent
         times:        (T,)       float64
         node_part_id:   (N,)     int64
+        sampled_node_ids: (N,) int64 or None  k-file node IDs, if present
         node_part_name: (N,)     str
         part_ids:       (P,)     int64     unique part IDs (derived if absent)
         part_names:     (P,)     str
@@ -239,6 +243,10 @@ def load_raw_h5(h5_path: str, node_type_field: str | None = None,
             "has_node_alive": has_node_alive,  # False ⇒ node_alive is a stub (all-True), use compute_erosion_mask instead
             "times":        f["states/times"][:],
             "node_part_id":  f["metadata/node_part_id"][:],
+            "sampled_node_ids": (
+                f["metadata/sampled_node_ids"][:]
+                if "metadata/sampled_node_ids" in f else None
+            ),
             "node_part_name": np.array([
                 n.decode("utf-8").strip("\x00") if isinstance(n, bytes) else str(n)
                 for n in f["metadata/node_part_name"][:]
@@ -394,7 +402,8 @@ def compute_sdf_batch(
 # ── Inference ─────────────────────────────────────────────────────────────────
 @torch.no_grad()
 def run_onestep(model, raw_data, normed, norm_stats, device,
-                node_type=None, cond_t=None, include_position: bool = False) -> dict:
+                node_type=None, cond_t=None, include_position: bool = False,
+                gc_idx: int | None = None, barrier_idx: int | None = None) -> dict:
     T      = raw_data["positions"].shape[0]
     T_eval = T - 2          # last 2 frames have padded GT vel/acc (forward diff)
     print(f"[One-step] dt = 1 (per-frame), steps = {T_eval - INPUT_FRAMES}")
@@ -406,6 +415,14 @@ def run_onestep(model, raw_data, normed, norm_stats, device,
     rmse_pos_vc_steps = []   # pos RMSE restricted to veh_contact nodes
     pred_acc_list, gt_acc_list = [], []
     pred_acc_norm_list, gt_acc_norm_list = [], []
+
+    # Optional per-step tracking of two specific nodes (e.g. vehicle GC /
+    # barrier reference) for CSV export — see src/gc_barrier.py. No-op
+    # (zero extra cost) unless both indices are supplied.
+    track_idx = np.array([gc_idx, barrier_idx]) if (
+        gc_idx is not None and barrier_idx is not None) else None
+    track_pred_pos, track_pred_vel, track_pred_acc = [], [], []
+    track_gt_pos, track_gt_vel, track_gt_acc = [], [], []
 
     # veh_contact-only RMSE: the all-node average is diluted by the ~90% of
     # nodes (far barrier, far vehicle) that barely move, so it's insensitive
@@ -469,6 +486,14 @@ def run_onestep(model, raw_data, normed, norm_stats, device,
         rmse_pos_steps.append(rmse)
         rmse_pos_vc_steps.append(rmse_vc)
 
+        if track_idx is not None:
+            track_pred_pos.append(x_new[track_idx].copy())
+            track_pred_vel.append(v_new[track_idx].copy())
+            track_pred_acc.append(a_phys[track_idx].copy())
+            track_gt_pos.append(x_gt[track_idx].copy())
+            track_gt_vel.append(v_gt[track_idx].copy())
+            track_gt_acc.append(a_gt[track_idx].copy())
+
         if (t - INPUT_FRAMES + 1) % 50 == 0:
             print(f"  step {t-INPUT_FRAMES+1}/{T_eval-INPUT_FRAMES} | "
                   f"acc_rmse={rmse_acc_steps[-1]:.4f} mm/dt² | "
@@ -494,7 +519,7 @@ def run_onestep(model, raw_data, normed, norm_stats, device,
     print(f"[One-step] Pos RMSE (all nodes)   = {np.mean(rmse_pos_steps):.2f} mm")
     print(f"[One-step] Pos RMSE (veh_contact) = {rmse_pos_vc.mean():.2f} mm")
 
-    return {
+    result = {
         "pred_frames": _pack_pos_only(pred_pos_list),
         "gt_frames":   _pack_pos_only(gt_pos_list),
         "rmse_pos":    np.array(rmse_pos_steps),
@@ -503,10 +528,20 @@ def run_onestep(model, raw_data, normed, norm_stats, device,
         "rmse_acc":    rmse_acc,
         "mode":        "onestep",
     }
+    if track_idx is not None:
+        result["track_node_indices"] = track_idx
+        result["track_pred_pos"] = np.stack(track_pred_pos)
+        result["track_pred_vel"] = np.stack(track_pred_vel)
+        result["track_pred_acc"] = np.stack(track_pred_acc)
+        result["track_gt_pos"]   = np.stack(track_gt_pos)
+        result["track_gt_vel"]   = np.stack(track_gt_vel)
+        result["track_gt_acc"]   = np.stack(track_gt_acc)
+    return result
 
 @torch.no_grad()
 def run_autoregressive(model, raw_data, normed, norm_stats, device,
-                       node_type=None, cond_t=None, include_position: bool = False) -> dict:
+                       node_type=None, cond_t=None, include_position: bool = False,
+                       gc_idx: int | None = None, barrier_idx: int | None = None) -> dict:
     T      = raw_data["positions"].shape[0]
     T_eval = T - 2          # last 2 frames have padded GT vel/acc (forward diff)
     print(f"[Autoregressive] dt = 1 (per-frame), steps = {T_eval - INPUT_FRAMES}")
@@ -516,6 +551,14 @@ def run_autoregressive(model, raw_data, normed, norm_stats, device,
     rmse_pos_vc_steps = []   # pos RMSE restricted to veh_contact nodes
     pred_acc_list, gt_acc_list = [], []
     pred_acc_norm_list, gt_acc_norm_list = [], []
+
+    # Optional per-step tracking of two specific nodes (e.g. vehicle GC /
+    # barrier reference) for CSV export — see src/gc_barrier.py. No-op
+    # (zero extra cost) unless both indices are supplied.
+    track_idx = np.array([gc_idx, barrier_idx]) if (
+        gc_idx is not None and barrier_idx is not None) else None
+    track_pred_pos, track_pred_vel, track_pred_acc = [], [], []
+    track_gt_pos, track_gt_vel, track_gt_acc = [], [], []
 
     # ── 初始化 ──
     # 速度窗口 (归一化, 模型输入用)
@@ -585,6 +628,14 @@ def run_autoregressive(model, raw_data, normed, norm_stats, device,
         rmse_pos_steps.append(rmse)
         rmse_pos_vc_steps.append(rmse_vc)
 
+        if track_idx is not None:
+            track_pred_pos.append(x_phys_new[track_idx].copy())
+            track_pred_vel.append(v_phys_new[track_idx].copy())
+            track_pred_acc.append(a_phys_new[track_idx].copy())
+            track_gt_pos.append(x_gt[track_idx].copy())
+            track_gt_vel.append(v_gt[track_idx].copy())
+            track_gt_acc.append(a_gt[track_idx].copy())
+
         # ── 更新状态 ──
         v_phys = v_phys_new
         x_phys = x_phys_new
@@ -621,7 +672,7 @@ def run_autoregressive(model, raw_data, normed, norm_stats, device,
     print(f"[Autoregressive] Pos RMSE (all nodes)   = {np.mean(rmse_pos_steps):.2f} mm")
     print(f"[Autoregressive] Pos RMSE (veh_contact) = {rmse_pos_vc.mean():.2f} mm")
 
-    return {
+    result = {
         "pred_frames": _pack_pos_only(pred_pos_list),
         "gt_frames":   _pack_pos_only(gt_pos_list),
         "rmse_pos":    np.array(rmse_pos_steps),
@@ -630,6 +681,15 @@ def run_autoregressive(model, raw_data, normed, norm_stats, device,
         "rmse_acc":    rmse_acc,
         "mode":        "autoregressive",
     }
+    if track_idx is not None:
+        result["track_node_indices"] = track_idx
+        result["track_pred_pos"] = np.stack(track_pred_pos)
+        result["track_pred_vel"] = np.stack(track_pred_vel)
+        result["track_pred_acc"] = np.stack(track_pred_acc)
+        result["track_gt_pos"]   = np.stack(track_gt_pos)
+        result["track_gt_vel"]   = np.stack(track_gt_vel)
+        result["track_gt_acc"]   = np.stack(track_gt_acc)
+    return result
 
 # ── Last-frame baseline ───────────────────────────────────────────────────────
 
@@ -1564,6 +1624,10 @@ def main():
         out_dir  = Path(args.output_dir or PROJECT_ROOT / "outputs" / "rollouts" / h5_stem)
         out_dir.mkdir(parents=True, exist_ok=True)
 
+        gc_idx, barrier_idx = locate_gc_barrier(raw_data)
+        export_gt_kinematics_csv(raw_data, gc_idx, barrier_idx,
+                                  out_dir / "gc_barrier_kinematics.csv")
+
         if args.gif:
             gif_stem = args.gif_name or "raw_gt"
             gif_path = str(out_dir / f"{gif_stem}.gif")
@@ -1751,6 +1815,7 @@ def main():
             norm_stats.set_region_id(raw_data["region_id"])
         normed   = normalize_raw(raw_data, norm_stats)
         baseline = compute_baseline(raw_data, dt=DT, input_frames=INPUT_FRAMES)
+        gc_idx, barrier_idx = locate_gc_barrier(raw_data)
 
         # ── Inference ─────────────────────────────────────────────────────
         onestep = autoreg = None
@@ -1761,20 +1826,28 @@ def main():
         if args.mode in ("onestep", "both"):
             onestep = run_onestep(model, raw_data, normed, norm_stats, device,
                                   node_type=node_type, cond_t=cond_t,
-                                  include_position=include_position)
+                                  include_position=include_position,
+                                  gc_idx=gc_idx, barrier_idx=barrier_idx)
             pkl_path = out_dir / f"{pkl_stem}onestep.pkl"
             with open(pkl_path, "wb") as f:
                 pickle.dump(onestep, f)
             print(f"[Rollout] PKL saved → {pkl_path}")
+            export_pred_gt_kinematics_csv(
+                onestep, raw_data, gc_idx, barrier_idx, INPUT_FRAMES,
+                out_dir / f"{pkl_stem}gc_barrier_onestep.csv")
 
         if args.mode in ("autoregressive", "both"):
             autoreg = run_autoregressive(model, raw_data, normed, norm_stats, device,
                                          node_type=node_type, cond_t=cond_t,
-                                         include_position=include_position)
+                                         include_position=include_position,
+                                         gc_idx=gc_idx, barrier_idx=barrier_idx)
             pkl_path = out_dir / f"{pkl_stem}autoregressive.pkl"
             with open(pkl_path, "wb") as f:
                 pickle.dump(autoreg, f)
             print(f"[Rollout] PKL saved → {pkl_path}")
+            export_pred_gt_kinematics_csv(
+                autoreg, raw_data, gc_idx, barrier_idx, INPUT_FRAMES,
+                out_dir / f"{pkl_stem}gc_barrier_autoregressive.csv")
 
         print(f"[Rollout] Inference done in {time.time() - t0:.1f}s")
 
