@@ -162,11 +162,18 @@ def wandb_meta_from_cfg(cfg: dict) -> dict:
     """Derive the group/project/experiment triple used for W&B lineage straight
     from an experiment cfg. Lets rollout.py resolve the same values without a
     local meta.json when checkpoints aren't kept on disk.
+
+    "group" is display-only (W&B dashboard grouping) and defaults to cfg["name"]
+    for backward compatibility, but can be overridden via wandb.group so several
+    distinct experiments (distinct cfg["name"], distinct checkpoints/artifacts)
+    can still show up grouped together in the W&B UI. "experiment" (== cfg["name"])
+    stays the sole identity used for checkpoint dirs / artifact names — never
+    collapse it onto "group".
     """
     wandb_cfg = cfg.get("wandb", {})
     project = wandb_cfg.get("project") or os.environ.get("WANDB_PROJECT", _DEFAULT_PROJECT)
     return {
-        "group":      cfg["name"],
+        "group":      wandb_cfg.get("group") or cfg["name"],
         "project":    project,
         "experiment": cfg["name"],
     }
@@ -262,7 +269,6 @@ def load_pretrained_weights(
 
 def _log_best_artifact(
     run,
-    meta: dict,
     save_dir: Path,
     epoch: int,
     step: int,
@@ -276,13 +282,13 @@ def _log_best_artifact(
         return
     try:
         artifact = wandb.Artifact(
-            name=f"checkpoint-{meta['group']}",
+            name=f"checkpoint-{cfg['name']}",
             type="model",
             metadata={
                 "epoch":      epoch,
                 "step":       step,
                 "val_loss":   val_loss,
-                "experiment": meta["group"],
+                "experiment": cfg["name"],
                 "lr":         cfg["train"].get("lr"),
                 "batch_size": cfg["train"].get("batch_size"),
             },
@@ -302,7 +308,7 @@ def _log_best_artifact(
         if stats_json.exists():
             artifact.add_file(str(stats_json))
         run.log_artifact(artifact, aliases=[f"epoch_{epoch}", "best"])
-        print(f"[Artifact] Uploaded checkpoint-{meta['group']}:best (epoch {epoch})")
+        print(f"[Artifact] Uploaded checkpoint-{cfg['name']}:best (epoch {epoch})")
     except Exception as e:
         print(f"[Artifact] Warning: upload failed — {e}")
 
@@ -850,7 +856,7 @@ def train(
                         best_val_loss = val_loss
                         _save_checkpoint(unwrapped, save_dir / "checkpoint-best", meta_payload)
                         tick = "✓ NEW BEST"
-                        _log_best_artifact(wandb_run, exp_meta, save_dir, epoch + 1, step, val_loss, cfg)
+                        _log_best_artifact(wandb_run, save_dir, epoch + 1, step, val_loss, cfg)
                     else:
                         tick = ""
 

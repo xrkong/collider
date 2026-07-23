@@ -1,0 +1,56 @@
+name: "wj07_k3"
+description: "try push forward k = 3"
+model:
+  name: "transolverplus_net"
+  params: "configs/params/transolverplus_net.yaml"
+
+overrides:
+  wandb.group: "wj07" 
+
+  model.hidden_dim: 256
+  model.layers: 32
+  model.num_heads: 8
+  model.slice_num: 256
+
+  # 35 base (5 frames × (3 vel + 3 position + 1 sdf)) + 2 cond (speed, mass) = 37
+  model.nnode_in_features: 37
+  model.nnode_out_features: 3
+  model.num_node_types: 16
+  model.type_emb_dim: 4
+  block_act: gelu
+
+  train.lr: 0.001
+  train.min_lr: 0.00001
+  train.batch_size: 4
+  train.accum_steps: 4
+  train.n_epochs: 1000
+  train.lr_cycles: 2
+  train.push_forward_k: 3
+  train.noise_std: 0.0
+  train.grad_clip: 5.0
+  train.val_every_epochs: 10
+  train.val_batch_size: 1
+
+  data.input_frames: 5
+  data.include_position: true
+  data.acc_scale: 5.0e5
+  data.norm_fields:
+    - "positions"
+    - "velocity"
+    - "acceleration"
+  data.node_type: true
+  data.per_region_norm: true
+  data.node_type_field: region_id
+
+  # condition: inherited from params (enabled: [speed, mass], n_cond=2) 
+  # --resume-artifact "checkpoint-wj01:best"
+
+  data.train_dirs:
+    - "/raid/proj_iim1/xrkong/h5_fps_no_wheel/T_lok_F_shape_barrier_9_3_60km.h5:-25.4"
+
+  data.val_dirs:
+    - "/raid/proj_iim1/xrkong/h5_fps_no_wheel/T_lok_F_shape_barrier_9_3_60km.h5:-25.4"
+
+    
+
+notes: "k=2, 4x4, 126GB; k=3, 4x4, xxxGB"
