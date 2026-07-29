@@ -124,8 +124,17 @@ def parse_kfile(kfile_path: str | Path) -> MeshData:
                     if nid in nid_to_idx and nid not in node_pid:
                         node_pid[nid] = pid
 
+    if not node_id_list:
+        size = kfile_path.stat().st_size if kfile_path.exists() else -1
+        raise ValueError(
+            f"No *NODE data parsed from {kfile_path} (file size: {size} bytes). "
+            f"The k-file is empty or missing its *NODE block — check with whoever "
+            f"provided this dataset rather than re-running; there is nothing here "
+            f"to sample from."
+        )
+
     node_ids = np.array(node_id_list, dtype=np.int64)
-    coords = np.array(coord_list, dtype=np.float64)
+    coords = np.array(coord_list, dtype=np.float64).reshape(-1, 3)
     pid_arr = np.array(
         [node_pid.get(int(nid), 0) for nid in node_ids], dtype=np.int32
     )

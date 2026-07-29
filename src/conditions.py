@@ -34,12 +34,15 @@ def parse_conditions(metadata: dict | None, dir_name: str) -> dict:
     Dir naming convention: T_lok_F_shape_barrier_9_3_{speed}km[_plus{mass}kg]
     Metadata keys are checked first; dir-name regex is the fallback.
     Mass defaults to 0.0 when not encoded in the dir name (no 'plus...kg' suffix).
+    Speed defaults to 100.0 km/h when not encoded in the dir name — some
+    trajectories (e.g. New_Road_Barrier_*) are single-speed runs with no
+    '{speed}km' suffix.
     """
     md = metadata or {}
     out: dict = {}
     # Speed in km/h
     out["speed"] = _get(md, ["speed_kmh", "speed", "v"], dir_name,
-                        r"[_-](\d+)km(?:[_.]|$)")
+                        r"[_-](\d+)km(?:[_.]|$)", required=False, default=100.0)
     # Added mass in kg — absent suffix means 0 kg
     out["mass"] = _get(md, ["mass_kg", "added_mass", "m"], dir_name,
                        r"plus(\d+)kg", required=False, default=0.0)

@@ -17,6 +17,10 @@ Pipeline
   Step 5 – Time scan + frame-stride selection            (d3plot_io.py)
   Step 6 – Per-frame position + eff_plastic_strain       (this file, d3plot_io.py)
   Step 7 – Write one HDF5 (metadata + states)            (this file)
+  Step 8 – Vehicle-GC / barrier kinematics CSV + plots,  (gc_barrier.py)
+           at full native d3plot resolution (no
+           --frame-stride) — side artifact, always run,
+           doesn't touch the HDF5 above
 
 HDF5 layout
 -----------
@@ -64,6 +68,35 @@ HDF5 layout
   coverage, with the cells drawn on top wherever they exist. See
   dataset/visualize_pyvista.py.
 
+Side outputs (under <out_stem>_analysis/ next to --out, always written)
+----------------------------------------------------------------------
+  <out_stem>_analysis/
+    fem/                                ground truth, full native d3plot
+                                         resolution — no --frame-stride,
+                                         no node sampling
+      <out_stem>_gc_barrier.csv         vehicle-GC + barrier reference
+                                         point kinematics, every d3plot state
+      <out_stem>_gc_barrier_plots/      ORA_x, ORA_y, ASI (EN 1317),
+                                         barrier displacement PNGs derived
+                                         from that CSV
+      <out_stem>_rotation.csv           vehicle roll/pitch/yaw (deg),
+                                         Kabsch-fit on the 8-node CG
+                                         cluster (PID 9000100), every
+                                         d3plot state
+      <out_stem>_rotation_plots/        rotation_roll/pitch/yaw.png
+                                         derived from that CSV
+    downsampled/                        same CSV+plots, but read back from
+                                         the sampled/strided HDF5 above —
+                                         "what the model actually sees"
+      <out_stem>_gc_barrier.csv
+      <out_stem>_gc_barrier_plots/
+      <out_stem>_rotation.csv
+      <out_stem>_rotation_plots/
+      <out_stem>.gif                    top-down rollout GIF (--gif),
+                                         rendered from the same HDF5
+
+  See dataset/gc_barrier.py (run_gc_barrier_full_res / run_gc_barrier_downsampled).
+
 Usage
 -----
 conda activate collider
@@ -94,6 +127,7 @@ from .constants import REGION_ID_LEGEND, REGION_ID_MAP
 from .d3plot_io import (
     close_d3, copy_to_tmp, extract_frame_data, find_state_files, scan_times, select_frames,
 )
+from .gc_barrier import run_gc_barrier_downsampled, run_gc_barrier_full_res
 from .kfile_parser import parse_kfile
 from .materials import parse_kfile_parts_and_materials
 from .part_filters import load_exclude_parts_config, resolve_exclude_pids
@@ -138,12 +172,16 @@ def main() -> None:
                              "well — level 4+ is much slower for little extra size benefit here).")
     parser.add_argument("--gif", action="store_true",
                         help="Render an animated top-down GIF of the result once the HDF5 is written "
-                             "(saved next to --out with a .gif extension unless --gif-out is given).")
+                             "(saved under <out_stem>_analysis/ unless --gif-out is given).")
     parser.add_argument("--gif-out", type=Path, default=None,
-                        help="GIF output path (default: --out with .gif extension).")
+                        help="GIF output path (default: <out_stem>_analysis/<out_stem>.gif).")
     parser.add_argument("--gif-fps", type=int, default=10)
     parser.add_argument("--gif-max-frames", type=int, default=80,
                         help="Cap GIF frames (resamples evenly across kept frames if exceeded).")
+    parser.add_argument("--gc-barrier-window-ms", type=float, default=50.0,
+                        help="Moving-average window (ms) applied to ORA_x/ORA_y/ASI in the "
+                             "GC/barrier plots (default 50, per EN 1317). Set to 0 to plot "
+                             "raw, unfiltered per-frame values instead.")
     args = parser.parse_args()
 
     args.tmp.mkdir(parents=True, exist_ok=True)
@@ -392,9 +430,46 @@ def main() -> None:
     print(f"Layout      : /metadata  +  /states/{{times, positions, eff_plastic_strain, node_alive}}")
     print(f"{'-'*60}")
 
+    # ══════════════════════════════════════════════════════════════════════
+    # Step 8 — vehicle-GC / barrier kinematics CSV + plots (ORA_x, ORA_y,
+    # ASI, displacement), plus vehicle rigid-body rotation (roll/pitch/yaw,
+    # Kabsch-fit on the 8-node CG cluster) — independent side artifact of
+    # the main HDF5 above, which stays exactly as before. See
+    # dataset/gc_barrier.py.
+    #
+    # Two groups under <out_stem>_analysis/, next to the .h5 itself:
+    #   fem/          raw FEM/d3plot ground truth, full native resolution
+    #                 (no --frame-stride, no node sampling)
+    #   downsampled/  the same CSV+plots but read back from the sampled/
+    #                 strided HDF5 above — "what the model actually
+    #                 sees" — plus the rollout GIF (also from that HDF5)
+    # ══════════════════════════════════════════════════════════════════════
+    analysis_dir = args.out.parent / f"{args.out.stem}_analysis"
+    fem_analysis_dir = analysis_dir / "fem"
+    downsampled_analysis_dir = analysis_dir / "downsampled"
+    fem_analysis_dir.mkdir(parents=True, exist_ok=True)
+    downsampled_analysis_dir.mkdir(parents=True, exist_ok=True)
+
+    run_gc_barrier_full_res(
+        mesh, state_files, all_entries, args.tmp, args.n_jobs,
+        out_csv=fem_analysis_dir / f"{args.out.stem}_gc_barrier.csv",
+        out_plot_dir=fem_analysis_dir / f"{args.out.stem}_gc_barrier_plots",
+        out_rotation_csv=fem_analysis_dir / f"{args.out.stem}_rotation.csv",
+        out_rotation_plot_dir=fem_analysis_dir / f"{args.out.stem}_rotation_plots",
+        title_suffix=f" — {args.out.stem}", window_ms=args.gc_barrier_window_ms,
+    )
+    run_gc_barrier_downsampled(
+        args.out,
+        out_csv=downsampled_analysis_dir / f"{args.out.stem}_gc_barrier.csv",
+        out_plot_dir=downsampled_analysis_dir / f"{args.out.stem}_gc_barrier_plots",
+        out_rotation_csv=downsampled_analysis_dir / f"{args.out.stem}_rotation.csv",
+        out_rotation_plot_dir=downsampled_analysis_dir / f"{args.out.stem}_rotation_plots",
+        title_suffix=f" — {args.out.stem}", window_ms=args.gc_barrier_window_ms,
+    )
+
     if args.gif:
         from .visualize import make_gif
-        gif_path = args.gif_out or args.out.with_suffix(".gif")
+        gif_path = args.gif_out or (downsampled_analysis_dir / f"{args.out.stem}.gif")
         make_gif(args.out, gif_path, fps=args.gif_fps, max_frames=args.gif_max_frames)
 
 

@@ -14,6 +14,16 @@ sampling.
 Point 2 — barrier reference: the barrier fine-mesh (FINE_PIDS) node
 nearest the vehicle GC's frame-0 position, used as a proxy for barrier
 deflection at the point of impact.
+
+Vehicle rigid-body rotation (roll/pitch/yaw, see src/plot_rotation.py): all
+8 nodes of the PID-9000100 hex (not just one) form a small rigid sensor
+cube attached at the vehicle CG — fitting a rotation matrix between this
+cluster's frame-0 shape and its shape at time t (Kabsch algorithm) isolates
+pure rigid-body rotation, since the cluster is far too small (~15mm) to be
+meaningfully deformed by the crash itself. Axis convention (SAE): X
+longitudinal -> roll, Y lateral -> pitch, Z vertical -> yaw — confirmed
+empirically (gc_vel_x dominates early-frame velocity, i.e. X is the
+direction of travel).
 """
 
 from __future__ import annotations
@@ -83,6 +93,56 @@ def _locate_barrier(raw_data: dict, gc_idx: int) -> int:
     tree = cKDTree(fine_pos0)
     _, nearest = tree.query(gc_pos0)
     return int(fine_idx[nearest])
+
+
+# ── Rigid-body rotation (roll/pitch/yaw) via the vehicle-CG node cluster ─────
+
+def locate_cg_cluster(raw_data: dict) -> np.ndarray:
+    """All node indices belonging to the vehicle-CG rigid hex (PID 9000100) —
+    used for rotation fitting (needs >=3 points), not just the single GC
+    point locate_gc_barrier returns."""
+    node_part_id = raw_data["node_part_id"]
+    idx = np.where(node_part_id == VEHICLE_CG_PID)[0]
+    if len(idx) < 3:
+        raise ValueError(
+            f"Need >=3 nodes to fit a rotation; found {len(idx)} with PID "
+            f"{VEHICLE_CG_PID} (the VEHICLE_CG_Global/Local hex)."
+        )
+    return idx
+
+
+def kabsch_rotation(p: np.ndarray, q: np.ndarray) -> np.ndarray:
+    """Best-fit rotation matrix R (3,3) mapping point cluster `p` onto `q`
+    (both (M,3), same M points, same order, measured at two different
+    times) — minimizes sum_i ||R @ p_i - q_i||^2. Translation-invariant
+    (both clusters are centered internally)."""
+    pc = p - p.mean(axis=0)
+    qc = q - q.mean(axis=0)
+    h = pc.T @ qc
+    u, _, vt = np.linalg.svd(h)
+    d = np.sign(np.linalg.det(vt.T @ u.T))
+    r = vt.T @ np.diag([1.0, 1.0, d]) @ u.T
+    return r
+
+
+def rotation_matrix_to_euler_zyx_deg(r: np.ndarray) -> tuple[float, float, float]:
+    """Decompose R = Rz(yaw) @ Ry(pitch) @ Rx(roll) (SAE roll-pitch-yaw,
+    X=longitudinal/roll, Y=lateral/pitch, Z=vertical/yaw). Returns degrees."""
+    pitch = np.arcsin(np.clip(-r[2, 0], -1.0, 1.0))
+    roll = np.arctan2(r[2, 1], r[2, 2])
+    yaw = np.arctan2(r[1, 0], r[0, 0])
+    return float(np.degrees(roll)), float(np.degrees(pitch)), float(np.degrees(yaw))
+
+
+def compute_rigid_rotation_series(ref_points: np.ndarray, points_over_time: np.ndarray) -> np.ndarray:
+    """ref_points: (M,3) frame-0 cluster shape. points_over_time: (T,M,3).
+    Returns (T,3) [roll, pitch, yaw] in degrees, relative to ref_points."""
+    T = points_over_time.shape[0]
+    angles = np.zeros((T, 3), dtype=np.float64)
+    for t in range(T):
+        r = kabsch_rotation(ref_points, points_over_time[t])
+        angles[t] = rotation_matrix_to_euler_zyx_deg(r)
+    return angles
 
 
 def export_gt_kinematics_csv(raw_data: dict, gc_idx: int, barrier_idx: int,

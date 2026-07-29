@@ -102,6 +102,11 @@ apptainer exec --bind /raid /staging/proj_iim1/xrkong/container/collider.sif \
     --gif
 ```
 
+Analyse your downsampled dataset to check if the downsampling is correct.
+```bash
+apptainer exec --bind /raid /staging/proj_iim1/xrkong/container/collider.sif \
+    python -m dataset.compare_downsample_fem T_lok_F_shape_barrier_9_3_100km --window-ms 0
+```
 
 ### Training
 ```bash

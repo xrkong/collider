@@ -56,6 +56,17 @@ def allocate_per_part(
     Full-retain families (rebar/reinforcement) take all their nodes first;
     the remaining budget is split proportionally (by node count, with a
     min_per_part floor) among the rest and sampled with `cfg.method`.
+
+    Full-retain is a bypass for parts EXPECTED to be small (rebar/
+    reinforcement) — it must never be allowed to blow the region's own
+    n_total budget outright. This matters because PID numbers aren't
+    globally unique across barrier designs: e.g. New_Road_Barrier's
+    "Concrete_fine_mesh" (a 700k+ node bulk part) happens to reuse PID
+    10000004, which T-lok's much smaller reinforcement part also uses —
+    same numeric family (fine_reinf), wildly different physical part. If
+    the full-retain set would exceed n_total, it's demoted to sampled
+    (same proportional/min_per_part treatment as any other part) instead
+    of being kept whole.
     """
     region_idx = np.where(region_mask)[0]
     if len(region_idx) == 0:
@@ -68,17 +79,28 @@ def allocate_per_part(
     pids_in_region = mesh.node_pid[region_idx]
     unique_pids = np.unique(pids_in_region)
 
-    retain_idx: list[np.ndarray] = []
+    retain_parts: list[tuple[int, np.ndarray]] = []
     sample_parts: list[tuple[int, np.ndarray]] = []
     for pid in unique_pids:
         part_family = PID_TO_PART_FAMILY.get(int(pid), "")
         part_global_idx = region_idx[pids_in_region == pid]
         if part_family in FULL_RETAIN_FAMILIES:
-            retain_idx.append(part_global_idx)
+            retain_parts.append((pid, part_global_idx))
         else:
             sample_parts.append((pid, part_global_idx))
 
-    n_retained = sum(len(r) for r in retain_idx)
+    n_retained = sum(len(idx) for _, idx in retain_parts)
+    if n_retained > n_total:
+        logger.warning(
+            "Full-retain families would keep %d nodes, over this region's "
+            "%d-node budget (PIDs %s) — sampling them down instead of "
+            "keeping all.", n_retained, n_total, [pid for pid, _ in retain_parts],
+        )
+        sample_parts = retain_parts + sample_parts
+        retain_parts = []
+        n_retained = 0
+
+    retain_idx = [idx for _, idx in retain_parts]
     budget_remaining = max(0, n_total - n_retained)
     total_sample_nodes = sum(len(p[1]) for p in sample_parts)
 

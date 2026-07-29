@@ -35,13 +35,31 @@ COARSE_STEEL_TUBE_PIDS = [10000017, 10000023]
 FINE_TLOK_PIDS   = [10000006, 10000012]
 COARSE_TLOK_PIDS = [10000018, 10000024]
 
+# New_Road_Barrier design (car_and_new_barrier.k) — a different physical
+# barrier from the T-lok/F-shape one above, with its own PID scheme
+# (10100xxx / 10200xxx / 10300xxx, instead of T-lok's flat 10000001-24).
+# Its 10000001-10000005 (locking bar, reinforcements, rings,
+# Concrete_fine_mesh, locking_plate) already fall inside FINE_PIDS above —
+# coincidence of numeric range, not a real correspondence to the T-lok parts
+# those PIDs name. These are the PIDs that don't:
+NEW_BARRIER_COARSE_CONCRETE_PIDS = [10100015]   # "Concrete_coarse_mesh"
+# No fine/coarse naming exists for these (sandwich-panel skins/cores,
+# wave-beam/Z-column hardware) — bucketed fine rather than silently dropped
+# from every region mask (was landing in none, and yielding 0-node regions
+# downstream).
+NEW_BARRIER_FINE_MISC_PIDS = [
+    10200016, 10200017, 10200018, 10200019, 10200020,   # panel skins/cores
+    10200021, 10200022, 10200023, 10200024,
+    10300034, 10300035, 10300036,                       # wave beam / Z column
+]
+
 FINE_PIDS = set(
     FINE_CONCRETE_PIDS + FINE_REBAR_PIDS + FINE_REINF_PIDS +
-    FINE_STEEL_TUBE_PIDS + FINE_TLOK_PIDS
+    FINE_STEEL_TUBE_PIDS + FINE_TLOK_PIDS + NEW_BARRIER_FINE_MISC_PIDS
 )
 COARSE_PIDS = set(
     COARSE_CONCRETE_PIDS + COARSE_REBAR_PIDS + COARSE_REINF_PIDS +
-    COARSE_STEEL_TUBE_PIDS + COARSE_TLOK_PIDS
+    COARSE_STEEL_TUBE_PIDS + COARSE_TLOK_PIDS + NEW_BARRIER_COARSE_CONCRETE_PIDS
 )
 
 # PID → part-family label, used for §6.3 seam-aware grouping and per-part
@@ -57,6 +75,8 @@ for _pid in COARSE_REBAR_PIDS:       PID_TO_PART_FAMILY[_pid] = "coarse_rebar"
 for _pid in COARSE_REINF_PIDS:       PID_TO_PART_FAMILY[_pid] = "coarse_reinf"
 for _pid in COARSE_STEEL_TUBE_PIDS:  PID_TO_PART_FAMILY[_pid] = "coarse_steel_tube"
 for _pid in COARSE_TLOK_PIDS:        PID_TO_PART_FAMILY[_pid] = "coarse_tlok"
+for _pid in NEW_BARRIER_COARSE_CONCRETE_PIDS: PID_TO_PART_FAMILY[_pid] = "coarse_concrete"
+for _pid in NEW_BARRIER_FINE_MISC_PIDS:       PID_TO_PART_FAMILY[_pid] = "fine_new_barrier_misc"
 del _pid
 
 # Part families that are always fully retained (never sub-sampled), §4.1/§4.2

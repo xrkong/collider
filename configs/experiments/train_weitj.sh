@@ -5,7 +5,7 @@
 #SBATCH --partition=LocalQ
 #SBATCH --gres=gpu:1
 #SBATCH --gpu-bind=closest
-#SBATCH --time=24:00:00
+#SBATCH --time=72:00:00
 #SBATCH --output=logs/%x-%j.out
 #SBATCH --error=logs/%x-%j.err
 
