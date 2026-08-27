@@ -38,12 +38,48 @@ _DEFAULT_BARRIER_DEG: float = -25.4
 _DEFAULT_PROJECT: str = "barrier-vehicle-collision"
 
 
-def parse_dir_entry(entry: str) -> tuple[str, float]:
-    """Parse '<h5_dir>:<barrier_angle_deg>' or plain '<h5_dir>' → (path, deg).
+# Default per-trajectory values for fields a data.train_dirs/val_dirs entry
+# doesn't specify — "T_lok" (GT/baseline barrier) with no added layer/thickness,
+# matching src/conditions.py's material_vocab[0]-is-GT convention.
+_DEFAULT_BARRIER_LABEL: str = "T_lok"
+_DEFAULT_LAYERS: float = 0.0
+_DEFAULT_THICKNESS: float = 0.0
 
-    The degree must match a key in BARRIER_PARAMS.  Omitting it defaults to
-    _DEFAULT_BARRIER_DEG (-25.4°).  Uses rsplit so Unix paths with colons work.
+
+def parse_dir_entry(entry: str | dict) -> dict:
+    """Parse one data.train_dirs/val_dirs entry into a normalized dict:
+    {path, angle, barrier_label, layers, thickness, speed}.
+
+    Two forms are accepted:
+      - A structured mapping (preferred — self-documenting, easy to extend):
+            {path: "...", angle: -25.4, barrier_label: "T_lok", layers: 0, thickness: 0, speed: 100.0}
+        Any of angle/barrier_label/layers/thickness/speed may be omitted;
+        angle/barrier_label/layers/thickness default to _DEFAULT_BARRIER_DEG /
+        _DEFAULT_BARRIER_LABEL / 0 / 0. speed defaults to None, meaning "let
+        src/conditions.py's parse_conditions derive it from the filename /
+        its own default" (unlike the others, there IS an existing filename
+        convention for speed — see conditions.py's SCALAR_ORDER regex).
+      - A legacy plain string '<h5_dir>[:<barrier_angle_deg>]' (still supported
+        so existing experiment yamls keep working unchanged) — barrier_label/
+        layers/thickness always default to the GT baseline for this form,
+        speed is always None (filename-derived), since there's no naming
+        convention to read the others from.
     """
+    if isinstance(entry, dict):
+        path = entry.get("path")
+        if not path:
+            raise ValueError(f"data.train_dirs/val_dirs entry missing 'path': {entry}")
+        return {
+            "path":          str(path).strip(),
+            "angle":         float(entry.get("angle", _DEFAULT_BARRIER_DEG)),
+            "barrier_label": entry.get("barrier_label", _DEFAULT_BARRIER_LABEL),
+            "layers":        float(entry.get("layers", _DEFAULT_LAYERS)),
+            "thickness":     float(entry.get("thickness", _DEFAULT_THICKNESS)),
+            "speed":         float(entry["speed"]) if "speed" in entry else None,
+        }
+
+    # Legacy string form: '<h5_dir>:<barrier_angle_deg>' or plain '<h5_dir>'.
+    # Uses rsplit so Unix paths with colons work.
     if ":" in entry:
         path, deg_str = entry.rsplit(":", 1)
         try:
@@ -53,24 +89,45 @@ def parse_dir_entry(entry: str) -> tuple[str, float]:
                 f"Could not parse barrier degree from '{entry}'. "
                 f"Expected '<path>:<float>', e.g. '/data/foo:-25.4'"
             )
-        return path.strip(), deg
-    return entry.strip(), _DEFAULT_BARRIER_DEG
+        path = path.strip()
+    else:
+        path, deg = entry.strip(), _DEFAULT_BARRIER_DEG
+    return {
+        "path":          path,
+        "angle":         deg,
+        "barrier_label": _DEFAULT_BARRIER_LABEL,
+        "layers":        _DEFAULT_LAYERS,
+        "thickness":     _DEFAULT_THICKNESS,
+        "speed":         None,
+    }
 
 
-def _parse_dirs(raw: list[str]) -> tuple[list[str], list[float]]:
-    """Return (clean_paths, barrier_degs) from a list of '<path>[:<deg>]' entries."""
-    paths, degs = [], []
+def _parse_dirs(raw: list[str | dict]) -> tuple[list[str], list[dict]]:
+    """Return (clean_paths, per_traj_params) from a list of entries (see
+    parse_dir_entry). per_traj_params is index-aligned with clean_paths and
+    ready to hand straight to build_dataloader(..., barrier_params=...):
+    each dict has barrier_angle_deg/x_intercept (for the SDF) plus
+    barrier_label/layers/thickness (for src/conditions.py)."""
+    paths, params = [], []
     for entry in raw:
-        p, deg = parse_dir_entry(entry)
+        d = parse_dir_entry(entry)
+        deg = d["angle"]
         if deg not in BARRIER_PARAMS:
             raise ValueError(
                 f"Barrier angle {deg}° not in BARRIER_PARAMS. "
                 f"Known: {sorted(BARRIER_PARAMS.keys())}. "
                 f"Add it to BARRIER_PARAMS in train.py if it's a new simulation setup."
             )
-        paths.append(p)
-        degs.append(deg)
-    return paths, degs
+        paths.append(d["path"])
+        params.append({
+            "barrier_angle_deg": deg,
+            "x_intercept":       BARRIER_PARAMS[deg]["x_intercept"],
+            "barrier_label":     d["barrier_label"],
+            "layers":            d["layers"],
+            "thickness":         d["thickness"],
+            "speed":             d["speed"],   # None unless explicitly set on the entry
+        })
+    return paths, params
 
 try:
     import wandb
@@ -525,15 +582,19 @@ def train(
     )
 
     # ── Data ──────────────────────────────────────────────────────────────
-    # Parse '<path>[:<barrier_angle_deg>]' entries; degree defaults to -25.4°
-    train_dirs, train_degs = _parse_dirs(data_cfg["train_dirs"])
-    val_dirs,   val_degs   = _parse_dirs(data_cfg["val_dirs"])
+    # Parse data.train_dirs/val_dirs entries — either the legacy
+    # '<path>[:<barrier_angle_deg>]' string, or a structured mapping
+    # ({path, angle, barrier_label, layers, thickness}) — see parse_dir_entry.
+    train_dirs, train_barrier = _parse_dirs(data_cfg["train_dirs"])
+    val_dirs,   val_barrier   = _parse_dirs(data_cfg["val_dirs"])
 
     # Log barrier params for this run
-    unique_degs = sorted(set(train_degs + val_degs))
+    unique_degs = sorted({bp["barrier_angle_deg"] for bp in train_barrier + val_barrier})
     for deg in unique_degs:
         xi = BARRIER_PARAMS[deg]["x_intercept"]
         print(f"[Train] Barrier angle {deg:+.1f}°  x-intercept = {xi:.3f} mm")
+    unique_labels = sorted({bp["barrier_label"] for bp in train_barrier + val_barrier})
+    print(f"[Train] Barrier labels in use: {unique_labels}")
 
     # Fail fast if train and val dirs overlap
     train_resolved = {str(Path(d).resolve()) for d in train_dirs}
@@ -569,16 +630,6 @@ def train(
             )
         pos_mean = float(pos_stats["mean"])
         pos_std  = max(float(pos_stats["std"]), 1e-8)
-
-    # Build per-trajectory barrier param dicts for the dataset
-    train_barrier = [
-        {"barrier_angle_deg": d, "x_intercept": BARRIER_PARAMS[d]["x_intercept"]}
-        for d in train_degs
-    ]
-    val_barrier = [
-        {"barrier_angle_deg": d, "x_intercept": BARRIER_PARAMS[d]["x_intercept"]}
-        for d in val_degs
-    ]
 
     # Both loaders share the same train stats (critical: val must NOT use its own stats)
     train_loader = build_dataloader(
@@ -662,15 +713,22 @@ def train(
     save_dir.mkdir(parents=True, exist_ok=True)
     manifest_path = save_dir / "checkpoint_manifest.json"
     keep_top_k    = int(train_cfg.get("keep_top_k", 3))
+    trainloss_ckpt_path = save_dir / "checkpoint-best-trainloss"
 
     if accelerator.is_main_process:
         exp_meta      = _write_meta_json(save_dir, cfg)
         ckpt_history  = json.loads(manifest_path.read_text()) if manifest_path.exists() else []
         best_val_loss = min((r["val_loss"] for r in ckpt_history), default=float("inf"))
+        trainloss_meta_path = trainloss_ckpt_path.with_suffix(".json")
+        best_train_loss = (
+            json.loads(trainloss_meta_path.read_text())["train_loss"]
+            if trainloss_meta_path.exists() else float("inf")
+        )
     else:
-        exp_meta      = {}
-        ckpt_history  = []
-        best_val_loss = float("inf")
+        exp_meta        = {}
+        ckpt_history    = []
+        best_val_loss   = float("inf")
+        best_train_loss = float("inf")
 
     # ── W&B ──────────────────────────────────────────────────────────────
     # rollout.py reads meta.json from the checkpoint dir to join the same group
@@ -821,6 +879,24 @@ def train(
 
             epoch_log = {"epoch": epoch + 1, "train/epoch_loss": epoch_avg_loss}
 
+            # Lowest-training-loss checkpoint — tracked every epoch (independent
+            # of val_every), since epoch_avg_loss is already available whether
+            # or not this epoch validates. Separate from checkpoint-best, which
+            # tracks val_loss and only updates on validation epochs.
+            accelerator.wait_for_everyone()
+            if accelerator.is_main_process and epoch_avg_loss < best_train_loss:
+                best_train_loss = epoch_avg_loss
+                unwrapped = accelerator.unwrap_model(model)
+                _save_checkpoint(unwrapped, trainloss_ckpt_path, {
+                    "epoch":      epoch + 1,
+                    "step":       step,
+                    "train_loss": epoch_avg_loss,
+                    "git_commit": git_commit,
+                    "experiment": cfg["name"],
+                })
+                print(f"[Train] Epoch {epoch+1}/{total_epochs} | train_loss={epoch_avg_loss:.5f} "
+                      f"✓ NEW BEST TRAIN LOSS → {trainloss_ckpt_path.name}")
+
             if (epoch + 1) % val_every == 0:
                 val_metrics = run_validation(model, val_loader, device, use_node_type, accelerator=accelerator,
                                               include_position=include_position, pos_mean=pos_mean, pos_std=pos_std)
@@ -875,7 +951,8 @@ def train(
         print("[Train] Interrupted by user")
     
     accelerator.wait_for_everyone()
-    accelerator.print(f"[Train] Done — best val_loss: {best_val_loss:.5f}")
+    accelerator.print(f"[Train] Done — best val_loss: {best_val_loss:.5f} | "
+                       f"best train_loss: {best_train_loss:.5f}")
     return best_val_loss
 
 # ── Entry point ───────────────────────────────────────────────────────────────

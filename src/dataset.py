@@ -93,6 +93,17 @@ class NormStats:
             return ((arr - mean) / std).astype(np.float32)
         return ((arr - self._mean[feature]) / self._std[feature]).astype(np.float32)
 
+    def normalize_pooled(self, feature: str, arr: np.ndarray) -> np.ndarray:
+        """Normalize with the pooled (non-per-region) global mean/std,
+        regardless of is_per_region/region_id. For features that
+        deliberately never get per-region treatment even when
+        per_region_norm=true — currently just the include_position input
+        feature (see train.py: 'Position input feature ... uses the pooled
+        global mean/std only ... unlike velocity/acceleration'). Also
+        sidesteps _region_broadcast's (T,N,C)-only broadcast shape, which
+        breaks for rollout.py's node-major (N,T_in,C) position windows."""
+        return ((arr - self._mean[feature]) / self._std[feature]).astype(np.float32)
+
     def denormalize(self, feature: str, arr: np.ndarray) -> np.ndarray:
         region = self._region_broadcast(feature, arr.ndim)
         if region is not None:
@@ -686,18 +697,35 @@ class BVCSlicedDataset(BaseDataset):
                 except Exception:
                     pass
 
-            # Parse and normalize physical conditions for this trajectory
-            cond_raw = parse_conditions(raw_metadata, dir_name)
-            cond_vec = normalize_conditions(cond_raw, self._cond_cfg)
-            print(f"[BVCSlicedDataset] traj[{idx}] {dir_name}{meta_label} "
-                  f"— T={T}, windows={n_windows} | "
-                  f"cond_raw={cond_raw} cond={cond_vec}")
-
             # Barrier SDF params: use per-traj values if provided, else defaults
             if idx < len(self._barrier_params):
                 bp = self._barrier_params[idx]
             else:
                 bp = {"barrier_angle_deg": -25.4, "x_intercept": 2056.579}
+
+            # barrier_label/layers/thickness have no filename convention (see
+            # src/conditions.py's parse_conditions docstring) — they're
+            # authored explicitly per data.train_dirs/val_dirs entry in the
+            # experiment yaml (train.py's parse_dir_entry) and threaded here
+            # via build_dataloader's barrier_params, taking priority over any
+            # dir-name regex guess exactly like a metadata.json would.
+            cond_metadata = dict(raw_metadata or {})
+            cond_metadata.setdefault("angle_deg", bp.get("barrier_angle_deg"))
+            if bp.get("speed") is not None:
+                cond_metadata.setdefault("speed_kmh", bp["speed"])
+            if "barrier_label" in bp:
+                cond_metadata.setdefault("barrier_material", bp["barrier_label"])
+            if "layers" in bp:
+                cond_metadata.setdefault("layer", bp["layers"])
+            if "thickness" in bp:
+                cond_metadata.setdefault("thickness", bp["thickness"])
+
+            # Parse and normalize physical conditions for this trajectory
+            cond_raw = parse_conditions(cond_metadata, dir_name)
+            cond_vec = normalize_conditions(cond_raw, self._cond_cfg)
+            print(f"[BVCSlicedDataset] traj[{idx}] {dir_name}{meta_label} "
+                  f"— T={T}, windows={n_windows} | "
+                  f"cond_raw={cond_raw} cond={cond_vec}")
 
             traj_entry = {
                 "pos_phys":          pos,

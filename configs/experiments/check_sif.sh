@@ -4,7 +4,6 @@
 #SBATCH --partition=LocalQ
 #SBATCH --job-name=collider-cputest
 #SBATCH --gres=gpu:1
-#SBATCH --gpu-bind=closest
 #SBATCH --time=00:10:00
 #SBATCH --output=logs/%x-%j.out
 #SBATCH --error=logs/%x-%j.err

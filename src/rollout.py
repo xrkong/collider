@@ -448,7 +448,7 @@ def run_onestep(model, raw_data, normed, norm_stats, device,
 
         x_parts = [x_vel_flat]
         if include_position:
-            pos_norm   = norm_stats.normalize("positions", input_pos)    # (N, T_in, 3)
+            pos_norm   = norm_stats.normalize_pooled("positions", input_pos)    # (N, T_in, 3)
             x_pos_flat = torch.from_numpy(pos_norm.reshape(N, -1)).float().to(device).unsqueeze(0)
             x_parts.append(x_pos_flat)                                   # (1, N, T_in*3)
         x_parts.append(x_sdf)
@@ -592,7 +592,7 @@ def run_autoregressive(model, raw_data, normed, norm_stats, device,
 
         x_parts = [x_vel_flat]
         if include_position:
-            pos_norm   = norm_stats.normalize("positions", pos_window_phys)         # (N, T_in, 3)
+            pos_norm   = norm_stats.normalize_pooled("positions", pos_window_phys)  # (N, T_in, 3)
             x_pos_flat = torch.from_numpy(pos_norm.reshape(N, -1)).float().to(device).unsqueeze(0)
             x_parts.append(x_pos_flat)                                              # (1, N, T_in*3)
         x_parts.append(x_sdf)
@@ -1584,6 +1584,21 @@ def main():
                         help="Experiment yaml (auto-derived from meta.json when omitted)")
     parser.add_argument("--raw-h5",     required=True, nargs="+",
                         help="One or more h5 trajectory paths (one per test set)")
+    parser.add_argument("--barrier-label", default=None,
+                        help="Barrier design label for src/conditions.py's material_vocab "
+                             "(e.g. T_lok, New_Road_Barrier) — there's no filename convention "
+                             "for this, so it must be supplied explicitly whenever the model's "
+                             "condition config has use_material=true. Applies to every --raw-h5 "
+                             "path in this invocation. Defaults to the GT/baseline label "
+                             "(material_vocab[0]) if omitted.")
+    parser.add_argument("--layers", type=float, default=None,
+                        help="Barrier layer count for src/conditions.py's 'layer' condition "
+                             "(only meaningful when --barrier-label isn't the GT/baseline). "
+                             "Defaults to 0.")
+    parser.add_argument("--thickness", type=float, default=None,
+                        help="Barrier added-layer thickness (mm) for src/conditions.py's "
+                             "'thickness' condition (only meaningful when --barrier-label isn't "
+                             "the GT/baseline). Defaults to 0.")
     parser.add_argument("--mode",
                         choices=["onestep", "autoregressive", "both", "raw_gt"],
                         default="both")
@@ -1791,9 +1806,21 @@ def main():
         multi   = len(args.raw_h5) > 1
         print(f"\n[Rollout] === Test set: {ts_name} ===")
 
-        # Parse conditions from dir name for both the table and model input
+        # Parse conditions from dir name for both the table and model input.
+        # barrier_label/layers/thickness have no filename convention (see
+        # src/conditions.py's parse_conditions docstring), so pass them through
+        # explicitly from the CLI when the model's condition config uses them.
         try:
-            raw_conds = parse_conditions(None, ts_name)
+            cli_metadata: dict = {}
+            if args.barrier_label is not None:
+                cli_metadata["barrier_material"] = args.barrier_label
+            elif cond_cfg.use_material and cond_cfg.material_vocab:
+                cli_metadata["barrier_material"] = cond_cfg.material_vocab[0]  # GT default
+            if args.layers is not None:
+                cli_metadata["layer"] = args.layers
+            if args.thickness is not None:
+                cli_metadata["thickness"] = args.thickness
+            raw_conds = parse_conditions(cli_metadata or None, ts_name)
             speed_kmh = float(raw_conds["speed"])
             weight_kg = float(raw_conds["mass"])
             angle_deg = float(raw_conds["angle"])

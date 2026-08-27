@@ -7,16 +7,29 @@ from dataclasses import dataclass, field
 import numpy as np
 
 # Canonical ordering. Channels appear in this order; disabled ones are skipped.
-SCALAR_ORDER = ("speed", "mass", "angle")
+# "layer"/"thickness" describe a barrier's added material stack (e.g. a rubber
+# layer on top of the base T-lok design) — only meaningful for barrier designs
+# that actually vary them, see the gating note on GATED_BY_MATERIAL below.
+SCALAR_ORDER = ("speed", "mass", "angle", "layer", "thickness")
+
+# layer/thickness are only physically meaningful for barrier designs that
+# actually have a variable material stack — for the GT/baseline design
+# (material_vocab[0] by convention) normalize_conditions() forces them to a
+# fixed neutral 0.0 regardless of their raw value, so the model sees a
+# consistent "not applicable" sentinel rather than whatever default/leftover
+# raw value happened to be supplied for a GT trajectory.
+GATED_BY_MATERIAL = ("layer", "thickness")
 
 
 @dataclass
 class CondConfig:
     enabled: tuple[str, ...] = ("speed", "mass")      # D4 default
     ranges: dict[str, tuple[float, float]] = field(default_factory=lambda: {
-        "speed": (60.0, 100.0),
-        "mass":  (0.0, 1000.0),
-        "angle": (0.0, 30.0),    # magnitude; sign dropped in parse_conditions (D5)
+        "speed":     (60.0, 100.0),
+        "mass":      (0.0, 1000.0),
+        "angle":     (0.0, 30.0),    # magnitude; sign dropped in parse_conditions (D5)
+        "layer":     (0.0, 5.0),     # number of added material layers
+        "thickness": (0.0, 30.0),    # mm, added layer thickness
     })
     material_vocab: tuple[str, ...] = ("F",)
     use_material: bool = False                         # D4: off while single type
@@ -29,7 +42,7 @@ class CondConfig:
 
 
 def parse_conditions(metadata: dict | None, dir_name: str) -> dict:
-    """Return raw physical values: {speed, mass, angle, material}.
+    """Return raw physical values: {speed, mass, angle, layer, thickness, material}.
 
     Dir naming convention: T_lok_F_shape_barrier_9_3_{speed}km[_plus{mass}kg]
     Metadata keys are checked first; dir-name regex is the fallback.
@@ -37,6 +50,12 @@ def parse_conditions(metadata: dict | None, dir_name: str) -> dict:
     Speed defaults to 100.0 km/h when not encoded in the dir name — some
     trajectories (e.g. New_Road_Barrier_*) are single-speed runs with no
     '{speed}km' suffix.
+
+    layer/thickness/material have no dir-name naming convention (no filename
+    in the corpus encodes them) — they're expected to come from `metadata`,
+    populated per-trajectory from the experiment yaml's data.train_dirs/
+    val_dirs entries (see train.py's parse_dir_entry / src/dataset.py's
+    per-trajectory metadata merge), not guessed from the path.
     """
     md = metadata or {}
     out: dict = {}
@@ -50,6 +69,11 @@ def parse_conditions(metadata: dict | None, dir_name: str) -> dict:
     out["angle"] = abs(_get(md, ["angle_deg", "orientation_deg", "angle"], dir_name,
                             r"(?:a|ang|angle)[_-]?(-?\d+(?:\.\d+)?)",
                             required=False, default=25.4))
+    # Added-layer count / thickness — metadata-only in practice (see docstring)
+    out["layer"] = _get(md, ["layer", "layers", "n_layers"], dir_name,
+                        r"(\d+)[_-]?layers?", required=False, default=0.0)
+    out["thickness"] = _get(md, ["thickness", "thickness_mm"], dir_name,
+                            r"thickness[_-]?(\d+(?:\.\d+)?)", required=False, default=0.0)
     out["material"] = md.get("barrier_material", md.get("material", "F"))
     return out
 
@@ -57,12 +81,25 @@ def parse_conditions(metadata: dict | None, dir_name: str) -> dict:
 def normalize_conditions(raw: dict, cfg: CondConfig) -> np.ndarray:
     """Physical dict -> float32 vector in canonical order. Length == cfg.n_cond()."""
     vec: list[float] = []
+    gated_positions: list[int] = []   # indices in `vec` holding GATED_BY_MATERIAL values
     for key in SCALAR_ORDER:
         if key not in cfg.enabled:
             continue
         lo, hi = cfg.ranges[key]
         x = float(raw[key])
         vec.append(2.0 * (x - lo) / (hi - lo) - 1.0)
+        if key in GATED_BY_MATERIAL:
+            gated_positions.append(len(vec) - 1)
+
+    # Barrier-type gating: layer/thickness only mean something for barrier
+    # designs that actually vary them. By convention material_vocab[0] is the
+    # GT/baseline design — force gated channels to a fixed neutral 0.0 for it,
+    # regardless of whatever raw layer/thickness value was supplied.
+    if gated_positions and cfg.use_material and len(cfg.material_vocab) > 0:
+        if raw.get("material") == cfg.material_vocab[0]:
+            for i in gated_positions:
+                vec[i] = 0.0
+
     if cfg.use_material and len(cfg.material_vocab) > 1:
         oh = [0.0] * len(cfg.material_vocab)
         oh[list(cfg.material_vocab).index(raw["material"])] = 1.0

@@ -1,0 +1,120 @@
+name: "wj09_2nd_run"
+description: "try push forward k = 2 "
+model:
+  name: "transolverplus_net"
+  params: "configs/params/transolverplus_net.yaml"
+
+overrides:
+  wandb.group: "wj09"  
+
+  model.hidden_dim: 256
+  model.layers: 32
+  model.num_heads: 8
+  model.slice_num: 256
+
+  # 35 base (5 frames × (3 vel + 3 position + 1 sdf)) + 6 cond
+  # (speed, layer, thickness + 3-way barrier_label one-hot) = 41
+  model.nnode_in_features: 41
+  model.nnode_out_features: 3
+  model.num_node_types: 16
+  model.type_emb_dim: 4
+  block_act: gelu
+
+  train.lr: 0.001
+  train.min_lr: 0.00001
+  train.batch_size: 4
+  train.accum_steps: 4
+  train.n_epochs: 1000
+  train.lr_cycles: 2
+  train.push_forward_k: 2
+  train.noise_std: 0.0
+  train.grad_clip: 5.0
+  train.val_every_epochs: 10
+  train.val_batch_size: 1
+
+  data.input_frames: 5
+  data.include_position: true
+  data.acc_scale: 5.0e5
+  data.norm_fields:
+    - "positions"
+    - "velocity"
+    - "acceleration"
+  data.node_type: true
+  data.per_region_norm: true
+  data.node_type_field: region_id
+
+  # condition: mass dropped, speed kept, layer+thickness added for the new
+  # barrier design's material stack. barrier_label is a one-hot categorical
+  # (material_vocab[0] = "T_lok" is the GT/baseline convention — see
+  # src/conditions.py's GATED_BY_MATERIAL gating: layer/thickness are forced
+  # to a neutral 0.0 for any trajectory whose barrier_label == material_vocab[0],
+  # regardless of the layers/thickness values given below).
+  condition:
+    enabled: [speed, layer, thickness]
+    ranges:
+      speed:     [60.0, 100.0]
+      layer:     [0.0, 5.0]     # TODO: set to your real max layer count
+      thickness: [0.0, 1.0]    # mm — matches the rubber_concrete_15/30 T-lok variants
+    material_vocab: [T_lok, New_No_Beam, New_Beam]   # index 0 = GT, gates layer/thickness off
+    use_material: true
+  # --resume-artifact "checkpoint-wj01:best"
+
+  data.train_dirs:
+    - path: "/raid/proj_iim1/xrkong/h5_fps_no_wheel/New_Road_Barrier_10_14_FD_0_3_0_1_LR_NoThic.h5"
+      barrier_label: New_No_Beam
+      layers: 4        
+      thickness: 1      
+      angle: -25.4
+      speed: 100.0  
+    - path: "/raid/proj_iim1/xrkong/h5_fps_no_wheel/New_Road_Barrier_concrete_W_beam.h5"
+      barrier_label: New_Beam
+      layers: 0          
+      thickness: 0        
+      angle: -25.4
+      speed: 100.0
+    - path: "/raid/proj_iim1/xrkong/h5_fps_no_wheel/New_Road_Barrier_W_beam_two_layer.h5"
+      barrier_label: New_Beam
+      layers: 2
+      thickness: 0
+      angle: -25.4
+      speed: 100.0
+    - path: "/raid/proj_iim1/xrkong/h5_fps_no_wheel/New_Road_Barrier_W_beam_three_layer.h5"
+      barrier_label: New_Beam
+      layers: 3
+      thickness: 0
+      angle: -25.4
+      speed: 100.0
+    - path: "/raid/proj_iim1/xrkong/h5_fps_no_wheel/New_Road_Barrier_concrete_W_beam_four_layer.h5"
+      barrier_label: New_Beam
+      layers: 4
+      thickness: 0
+      angle: -25.4
+      speed: 100.0
+    - path: "/raid/proj_iim1/xrkong/h5_fps_no_wheel/T_lok_F_shape_barrier_9_3_60km.h5"
+      barrier_label: T_lok
+      layers: 0
+      thickness: 0
+      angle: -25.4
+      speed: 60.0
+    - path: "/raid/proj_iim1/xrkong/h5_fps_no_wheel/T_lok_F_shape_barrier_9_3_80km.h5"
+      barrier_label: T_lok
+      layers: 0
+      thickness: 0
+      angle: -25.4
+      speed: 80.0
+    - path: "/raid/proj_iim1/xrkong/h5_fps_no_wheel/T_lok_F_shape_barrier_9_3_rubber_concrete_15_modified_DIF_100km.h5"
+      barrier_label: T_lok
+      layers: 0
+      thickness: 0
+      angle: -25.4
+      speed: 100.0
+
+  data.val_dirs:
+    - path: "/raid/proj_iim1/xrkong/h5_fps_no_wheel/T_lok_F_shape_barrier_9_3_100km.h5"
+      barrier_label: T_lok
+      layers: 0
+      thickness: 0
+      angle: -25.4
+      speed: 100.0
+
+notes: "k=2, 4x4, 126GB;"

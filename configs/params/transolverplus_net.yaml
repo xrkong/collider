@@ -55,13 +55,25 @@ data:
   # normalize_dist: false
 
 condition:
+  # This is the default every old experiment yaml still inherits unchanged
+  # (none of them override `condition:`) — do not change these defaults,
+  # add an experiment-yaml-level `condition:` override instead (see
+  # wj08_100kph.yaml for an example that drops mass and adds layer/thickness
+  # gated by a barrier_label one-hot).
   enabled: [speed, mass]          # D4: only vary-across-trajs scalars; angle/material OFF
   ranges:
-    speed: [60.0, 100.0]          # tested envelope; 60→-1, 80→0, 100→+1
-    mass:  [0.0, 1000.0]          # 0→-1, 400→-0.2, 800→+0.6
-    angle: [0.0, 30.0]            # magnitude; abs() applied before norm
+    speed:     [60.0, 100.0]      # tested envelope; 60→-1, 80→0, 100→+1
+    mass:      [0.0, 1000.0]      # 0→-1, 400→-0.2, 800→+0.6
+    angle:     [0.0, 30.0]        # magnitude; abs() applied before norm
+    layer:     [0.0, 5.0]         # added-layer count (barrier material stack)
+    thickness: [0.0, 30.0]        # mm, added-layer thickness
   material_vocab: [F]
   use_material: false             # single barrier type; flip when a 2nd type joins
+  # When use_material=true, material_vocab[0] is the GT/baseline design by
+  # convention: normalize_conditions() forces the "layer"/"thickness"
+  # channels to a fixed 0.0 for any trajectory whose barrier_label equals
+  # material_vocab[0], regardless of the raw layers/thickness values given
+  # in that trajectory's data.train_dirs/val_dirs entry.
 
 wandb:
   project: barrier-vehicle-collision
