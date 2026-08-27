@@ -16,9 +16,9 @@
 # (and its global_stats.json) straight from the W&B artifact given just
 # --experiment, so no local outputs/checkpoints/<name>/ is required.
 #
-# Usage: sbatch configs/experiments/rollout_weitj.sh <experiment.yaml> [more.yaml ...]
-#   sbatch configs/experiments/rollout_weitj.sh configs/experiments/wj06_0.yaml
-#   sbatch configs/experiments/rollout_weitj.sh configs/experiments/wj06_0.yaml configs/experiments/wj06_1.yaml
+# Usage: sbatch configs/hpc/rollout_weitj.slurm <experiment.yaml> [more.yaml ...]
+#   sbatch configs/hpc/rollout_weitj.slurm configs/experiments/wj06_0.yaml
+#   sbatch configs/hpc/rollout_weitj.slurm configs/experiments/wj06_0.yaml configs/experiments/wj06_1.yaml
 #
 # Each arg must be an explicit path to a yaml file — no bare-name resolution
 # and no default experiment list; at least one path is required.
@@ -27,7 +27,7 @@
 # different entry (e.g. a specific train_dirs trajectory), set DIR_SOURCE
 # (val|train) and/or DIR_INDEX:
 #   sbatch --export=ALL,DIR_SOURCE=train,DIR_INDEX=1 \
-#       configs/experiments/rollout_weitj.sh configs/experiments/wj09_1st_run.yaml
+#       configs/hpc/rollout_weitj.slurm configs/experiments/wj09_1st_run.yaml
 # Non-default selections get their own output dir
 # (outputs/rollouts/<name>_<source><index>) so they never collide with the
 # default val_dirs[0] rollout for the same experiment.
@@ -90,7 +90,7 @@ print(entry['path'])
 }
 
 if [ "$#" -eq 0 ]; then
-  echo "Usage: sbatch configs/experiments/rollout_weitj.sh <path/to/experiment.yaml> [more.yaml ...]" >&2
+  echo "Usage: sbatch configs/hpc/rollout_weitj.slurm <path/to/experiment.yaml> [more.yaml ...]" >&2
   exit 1
 fi
 

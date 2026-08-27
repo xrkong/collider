@@ -118,18 +118,18 @@ apptainer exec --nv --bind /raid collider.sif accelerate launch train.py \
     --experiment configs/experiments/wj04.yaml \
     --resume-artifact "checkpoint-wj01:best"
 
-# Train on Apptainer from a local checkpoint (no W&B needed)
+# Train on Apptainer from a local checkpoint (no W&B needed)    
 apptainer exec --nv --bind /raid collider.sif accelerate launch train.py \
     --experiment configs/experiments/wj01_2.yaml \
     --resume-checkpoint outputs/checkpoints/wj01/checkpoint-best.safetensors
 
 # if you use slurm 
 # from a local checkpoint
-sbatch configs/experiments/resume_train_weitj.sh configs/experiments/wj01_2.yaml \
+sbatch configs/experiments/resume_train_weitj.slurm configs/experiments/wj01_2.yaml \
     outputs/checkpoints/wj01/checkpoint-best.safetensors
 
 # from a W&B artifact
-sbatch configs/experiments/resume_train_weitj.sh configs/experiments/wj04.yaml \
+sbatch configs/experiments/resume_train_weitj.slurm configs/experiments/wj04.yaml \
     "checkpoint-wj01:best"
 ```
 
@@ -165,9 +165,9 @@ python src/rollout.py \
         --gif --gif-fps 10 \
         --gif-name dg002_80kph
 
-sbatch configs/experiments/rollout_weitj.sh wj04            
+sbatch configs/experiments/rollout_weitj.slurm wj04            
 # just wj04
-sbatch configs/experiments/rollout_weitj.sh wj01 wj02 wj03 wj04   
+sbatch configs/experiments/rollout_weitj.slurm wj01 wj02 wj03 wj04   
 # all four together, one comparison plot
 
 ```

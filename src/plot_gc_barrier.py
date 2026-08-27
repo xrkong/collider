@@ -87,19 +87,25 @@ STYLE_GT_MARKER = dict(color="#2a78d6", linestyle="none", marker="o", markersize
                         markeredgewidth=0, label="Ground truth (downsampled)", zorder=3)
 
 
-def find_csvs(rollout_dir: Path, stem: str | None) -> tuple[Path, Path]:
+def find_csvs(rollout_dir: Path, stem: str | None) -> tuple[Path | None, Path]:
+    """Autoregressive CSV is required; one-step is optional (absent for a
+    rollout.py run with --mode autoregressive, e.g. rollout_all_weitj.slurm)."""
     prefix = f"{stem}_" if stem else "*"
     onestep_matches = sorted(rollout_dir.glob(f"{prefix}gc_barrier_onestep.csv"))
     autoreg_matches = sorted(rollout_dir.glob(f"{prefix}gc_barrier_autoregressive.csv"))
-    if len(onestep_matches) != 1 or len(autoreg_matches) != 1:
+    if len(autoreg_matches) != 1:
         raise FileNotFoundError(
-            f"Expected exactly one gc_barrier_onestep.csv and one "
-            f"gc_barrier_autoregressive.csv in {rollout_dir}. Found "
-            f"onestep={[p.name for p in onestep_matches]}, "
-            f"autoregressive={[p.name for p in autoreg_matches]}. "
+            f"Expected exactly one gc_barrier_autoregressive.csv in {rollout_dir}. "
+            f"Found {[p.name for p in autoreg_matches]}. "
             f"Pass --stem to disambiguate a multi-test-set folder."
         )
-    return onestep_matches[0], autoreg_matches[0]
+    if len(onestep_matches) > 1:
+        raise FileNotFoundError(
+            f"Expected at most one gc_barrier_onestep.csv in {rollout_dir}. "
+            f"Found {[p.name for p in onestep_matches]}. "
+            f"Pass --stem to disambiguate a multi-test-set folder."
+        )
+    return (onestep_matches[0] if onestep_matches else None), autoreg_matches[0]
 
 
 def load_csv(path: Path) -> np.ndarray:
@@ -292,15 +298,19 @@ def main():
     plt.rcParams.update(_RCPARAMS)
 
     onestep_path, autoreg_path = find_csvs(args.rollout_dir, args.stem)
-    onestep_data = load_csv(onestep_path)
+    onestep_data = load_csv(onestep_path) if onestep_path is not None else None
     autoreg_data = load_csv(autoreg_path)
 
-    dt_seconds, window_frames = window_frames_for(onestep_data["time"], args.window_ms)
+    # GT lives in both CSVs' gt_* columns (identical range) — fall back to the
+    # autoregressive CSV when one-step wasn't run (--mode autoregressive).
+    gt_source = onestep_data if onestep_data is not None else autoreg_data
+
+    dt_seconds, window_frames = window_frames_for(gt_source["time"], args.window_ms)
     print(f"[Plot] dt = {dt_seconds * 1000:.2f} ms, moving-average window = "
           f"{window_frames} frame(s) (~{window_frames * dt_seconds * 1000:.1f} ms)")
 
-    gt = build_series(onestep_data, "gt", dt_seconds, window_frames)
-    os_ = build_series(onestep_data, "pred", dt_seconds, window_frames)
+    gt = build_series(gt_source, "gt", dt_seconds, window_frames)
+    os_ = build_series(onestep_data, "pred", dt_seconds, window_frames) if onestep_data is not None else None
     ar = build_series(autoreg_data, "pred", dt_seconds, window_frames)
 
     fem = None
@@ -322,11 +332,10 @@ def main():
         curves = []
         if fem is not None:
             curves.append((fem.time, getattr(fem, attr), STYLE_FEM))
-        curves += [
-            (gt.time, getattr(gt, attr), gt_style),
-            (os_.time, getattr(os_, attr), STYLE_OS),
-            (ar.time, getattr(ar, attr), STYLE_AR),
-        ]
+        curves.append((gt.time, getattr(gt, attr), gt_style))
+        if os_ is not None:
+            curves.append((os_.time, getattr(os_, attr), STYLE_OS))
+        curves.append((ar.time, getattr(ar, attr), STYLE_AR))
         return curves
 
     make_plot(
