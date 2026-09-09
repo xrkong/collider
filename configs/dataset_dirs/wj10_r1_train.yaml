@@ -1,0 +1,95 @@
+# Train trajectory list for configs/experiments/wj10_r1.yaml (data.train_dirs).
+# Referenced by path (not inlined) so it can be shared/updated across wj10_*
+# experiments without editing every experiment yaml — see train.py's
+# _resolve_dirs_override.
+- path: "/raid/proj_iim1/xrkong/h5_fps_no_wheel/New_Road_Barrier_10_14_FD_0_3_0_1_LR_NoThic.h5"
+  barrier_label: New_No_Beam
+  layers: 4
+  kirigami_thickness: 0.7
+  inter_layer_plate_thickness: 2.0
+  w_beam_thickness: 0            
+  angle: -25.4
+  speed: 100.0
+- path: "/raid/proj_iim1/xrkong/h5_fps_no_wheel/New_Road_Barrier_concrete_W_beam.h5"
+  barrier_label: New_Beam
+  layers: 0
+  kirigami_thickness: 0.3
+  inter_layer_plate_thickness: 1.5
+  w_beam_thickness: 2.7
+  angle: -25.4
+  speed: 100.0
+- path: "/raid/proj_iim1/xrkong/h5_fps_no_wheel/New_Road_Barrier_W_beam_two_layer.h5"
+  barrier_label: New_Beam
+  layers: 2
+  kirigami_thickness: 0.3
+  inter_layer_plate_thickness: 1.5
+  w_beam_thickness: 2.7
+  angle: -25.4
+  speed: 100.0
+- path: "/raid/proj_iim1/xrkong/h5_fps_no_wheel/New_Road_Barrier_W_beam_three_layer.h5"
+  barrier_label: New_Beam
+  layers: 3
+  kirigami_thickness: 0.3
+  inter_layer_plate_thickness: 1.5
+  w_beam_thickness: 2.7
+  angle: -25.4
+  speed: 100.0
+- path: "/raid/proj_iim1/xrkong/h5_fps_no_wheel/New_Road_Barrier_concrete_W_beam_four_layer.h5"
+  barrier_label: New_Beam
+  layers: 4
+  kirigami_thickness: 0.3
+  inter_layer_plate_thickness: 1.5
+  w_beam_thickness: 2.7
+  angle: -25.4
+  speed: 100.0
+# T_lok rows: no layer/thickness fields needed — T_lok is the GT/baseline
+- path: "/raid/proj_iim1/xrkong/h5_fps_no_wheel/T_lok_F_shape_barrier_9_3_60km.h5"
+  barrier_label: T_lok
+  angle: -25.4
+  speed: 60.0
+- path: "/raid/proj_iim1/xrkong/h5_fps_no_wheel/T_lok_F_shape_barrier_9_3_80km.h5"
+  barrier_label: T_lok
+  angle: -25.4
+  speed: 80.0
+- path: "/raid/proj_iim1/xrkong/h5_fps_no_wheel/T_lok_F_shape_barrier_9_3_rubber_concrete_15_modified_DIF_100km.h5"
+  barrier_label: T_lok
+  angle: -25.4
+  speed: 100.0
+# Sept 04 Uploads
+# barrier_label is New_Beam here (not T_lok) so the layer/thickness fields
+# below are NOT gated to 0 — they're used as real signal. Filenames encode
+# real thickness variants (1.5mm/2mm) but inter_layer_plate_thickness/
+# w_beam_thickness are still placeholder 0s below — fill in the real
+# per-file values before training on these.
+- path: "/raid/proj_iim1/xrkong/h5_fps_no_wheel/New_Road_Barrier_concrete_W_beam_four_layer_03_1_5mm.h5"
+  barrier_label: New_Beam
+  layers: 4
+  kirigami_thickness: 0.3
+  inter_layer_plate_thickness: 1.5
+  w_beam_thickness: 2.7
+  angle: -25.4
+  speed: 100.0
+- path: "/raid/proj_iim1/xrkong/h5_fps_no_wheel/New_Road_Barrier_concrete_W_beam_four_layer_03_2mm.h5"
+  barrier_label: New_Beam
+  layers: 4
+  kirigami_thickness: 0.3
+  inter_layer_plate_thickness: 2.0
+  w_beam_thickness: 2.7
+  angle: -25.4
+  speed: 100.0
+- path: "/raid/proj_iim1/xrkong/h5_fps_no_wheel/New_Road_Barrier_concrete_W_beam_four_layer_06_2mm.h5"
+  barrier_label: New_Beam
+  layers: 4
+  kirigami_thickness: 0.6
+  inter_layer_plate_thickness: 2.0
+  w_beam_thickness: 2.7
+  angle: -25.4
+  speed: 100.0
+- path: "/raid/proj_iim1/xrkong/h5_fps_no_wheel/New_Road_Barrier_concrete_W_beam_four_layer_07_2mm.h5"
+  barrier_label: New_Beam
+  layers: 4
+  kirigami_thickness: 0.7
+  inter_layer_plate_thickness: 2.0
+  w_beam_thickness: 2.7
+  angle: -25.4
+  speed: 100.0

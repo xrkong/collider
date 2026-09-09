@@ -43,25 +43,40 @@ _DEFAULT_PROJECT: str = "barrier-vehicle-collision"
 # matching src/conditions.py's material_vocab[0]-is-GT convention.
 _DEFAULT_BARRIER_LABEL: str = "T_lok"
 _DEFAULT_LAYERS: float = 0.0
-_DEFAULT_THICKNESS: float = 0.0
+_DEFAULT_KIRIGAMI_THICKNESS: float = 0.0
+
+# inter_layer_plate_thickness / w_beam_thickness have no safe zero-default
+# (unlike layers/kirigami_thickness, where 0 is a real "no added stack"
+# value) — they're left unset (None) here and enforced only when the
+# experiment yaml actually enables that condition, in src/dataset.py via
+# src/conditions.py's REQUIRED_WHEN_ENABLED.
+_NEW_OPTIONAL_COND_FIELDS = ("inter_layer_plate_thickness", "w_beam_thickness")
 
 
 def parse_dir_entry(entry: str | dict) -> dict:
     """Parse one data.train_dirs/val_dirs entry into a normalized dict:
-    {path, angle, barrier_label, layers, thickness, speed}.
+    {path, angle, barrier_label, layers, kirigami_thickness,
+    inter_layer_plate_thickness, w_beam_thickness, speed}.
 
     Two forms are accepted:
       - A structured mapping (preferred — self-documenting, easy to extend):
-            {path: "...", angle: -25.4, barrier_label: "T_lok", layers: 0, thickness: 0, speed: 100.0}
-        Any of angle/barrier_label/layers/thickness/speed may be omitted;
-        angle/barrier_label/layers/thickness default to _DEFAULT_BARRIER_DEG /
-        _DEFAULT_BARRIER_LABEL / 0 / 0. speed defaults to None, meaning "let
-        src/conditions.py's parse_conditions derive it from the filename /
-        its own default" (unlike the others, there IS an existing filename
-        convention for speed — see conditions.py's SCALAR_ORDER regex).
+            {path: "...", angle: -25.4, barrier_label: "T_lok", layers: 0,
+             kirigami_thickness: 0, inter_layer_plate_thickness: 1.5,
+             w_beam_thickness: 2.7, speed: 100.0}
+        Any of angle/barrier_label/layers/kirigami_thickness/speed may be
+        omitted; they default to _DEFAULT_BARRIER_DEG / _DEFAULT_BARRIER_LABEL
+        / 0 / 0. speed defaults to None, meaning "let src/conditions.py's
+        parse_conditions derive it from the filename / its own default"
+        (unlike the others, there IS an existing filename convention for
+        speed — see conditions.py's SCALAR_ORDER regex).
+        inter_layer_plate_thickness/w_beam_thickness default to None (not 0!)
+        when omitted — leave them unset in the yaml while unknown; training
+        will error loudly (via src/conditions.py) if left unset once the
+        corresponding condition is enabled.
       - A legacy plain string '<h5_dir>[:<barrier_angle_deg>]' (still supported
         so existing experiment yamls keep working unchanged) — barrier_label/
-        layers/thickness always default to the GT baseline for this form,
+        layers/kirigami_thickness always default to the GT baseline for this
+        form, inter_layer_plate_thickness/w_beam_thickness are always None,
         speed is always None (filename-derived), since there's no naming
         convention to read the others from.
     """
@@ -69,14 +84,17 @@ def parse_dir_entry(entry: str | dict) -> dict:
         path = entry.get("path")
         if not path:
             raise ValueError(f"data.train_dirs/val_dirs entry missing 'path': {entry}")
-        return {
-            "path":          str(path).strip(),
-            "angle":         float(entry.get("angle", _DEFAULT_BARRIER_DEG)),
-            "barrier_label": entry.get("barrier_label", _DEFAULT_BARRIER_LABEL),
-            "layers":        float(entry.get("layers", _DEFAULT_LAYERS)),
-            "thickness":     float(entry.get("thickness", _DEFAULT_THICKNESS)),
-            "speed":         float(entry["speed"]) if "speed" in entry else None,
+        d = {
+            "path":               str(path).strip(),
+            "angle":              float(entry.get("angle", _DEFAULT_BARRIER_DEG)),
+            "barrier_label":      entry.get("barrier_label", _DEFAULT_BARRIER_LABEL),
+            "layers":             float(entry.get("layers", _DEFAULT_LAYERS)),
+            "kirigami_thickness": float(entry.get("kirigami_thickness", _DEFAULT_KIRIGAMI_THICKNESS)),
+            "speed":              float(entry["speed"]) if "speed" in entry else None,
         }
+        for f in _NEW_OPTIONAL_COND_FIELDS:
+            d[f] = float(entry[f]) if entry.get(f) is not None else None
+        return d
 
     # Legacy string form: '<h5_dir>:<barrier_angle_deg>' or plain '<h5_dir>'.
     # Uses rsplit so Unix paths with colons work.
@@ -92,14 +110,17 @@ def parse_dir_entry(entry: str | dict) -> dict:
         path = path.strip()
     else:
         path, deg = entry.strip(), _DEFAULT_BARRIER_DEG
-    return {
-        "path":          path,
-        "angle":         deg,
-        "barrier_label": _DEFAULT_BARRIER_LABEL,
-        "layers":        _DEFAULT_LAYERS,
-        "thickness":     _DEFAULT_THICKNESS,
-        "speed":         None,
+    d = {
+        "path":               path,
+        "angle":              deg,
+        "barrier_label":      _DEFAULT_BARRIER_LABEL,
+        "layers":             _DEFAULT_LAYERS,
+        "kirigami_thickness": _DEFAULT_KIRIGAMI_THICKNESS,
+        "speed":              None,
     }
+    for f in _NEW_OPTIONAL_COND_FIELDS:
+        d[f] = None
+    return d
 
 
 def _parse_dirs(raw: list[str | dict]) -> tuple[list[str], list[dict]]:
@@ -107,7 +128,8 @@ def _parse_dirs(raw: list[str | dict]) -> tuple[list[str], list[dict]]:
     parse_dir_entry). per_traj_params is index-aligned with clean_paths and
     ready to hand straight to build_dataloader(..., barrier_params=...):
     each dict has barrier_angle_deg/x_intercept (for the SDF) plus
-    barrier_label/layers/thickness (for src/conditions.py)."""
+    barrier_label/layers/kirigami_thickness/inter_layer_plate_thickness/
+    w_beam_thickness (for src/conditions.py)."""
     paths, params = [], []
     for entry in raw:
         d = parse_dir_entry(entry)
@@ -120,12 +142,14 @@ def _parse_dirs(raw: list[str | dict]) -> tuple[list[str], list[dict]]:
             )
         paths.append(d["path"])
         params.append({
-            "barrier_angle_deg": deg,
-            "x_intercept":       BARRIER_PARAMS[deg]["x_intercept"],
-            "barrier_label":     d["barrier_label"],
-            "layers":            d["layers"],
-            "thickness":         d["thickness"],
-            "speed":             d["speed"],   # None unless explicitly set on the entry
+            "barrier_angle_deg":           deg,
+            "x_intercept":                 BARRIER_PARAMS[deg]["x_intercept"],
+            "barrier_label":               d["barrier_label"],
+            "layers":                      d["layers"],
+            "kirigami_thickness":          d["kirigami_thickness"],
+            "inter_layer_plate_thickness": d["inter_layer_plate_thickness"],
+            "w_beam_thickness":            d["w_beam_thickness"],
+            "speed":                       d["speed"],   # None unless explicitly set on the entry
         })
     return paths, params
 
@@ -177,12 +201,43 @@ def _deep_set(d: dict, dotted_key: str, value):
     d[parts[-1]] = value
 
 
+# data.train_dirs/val_dirs overrides that use this form point at an external
+# yaml (e.g. configs/train_dirs/wj10.yaml) instead of listing entries inline
+# — lets one dir list be shared/updated across experiments without copying it
+# into every experiment yaml.
+_EXTERNAL_DIRS_KEYS = ("data.train_dirs", "data.val_dirs")
+
+
+def _resolve_dirs_override(dotted_key: str, value):
+    """If `value` is a path string, load it as a train_dirs/val_dirs list.
+    Inline lists (the original, still-supported form) pass through unchanged."""
+    if dotted_key not in _EXTERNAL_DIRS_KEYS or not isinstance(value, str):
+        return value
+    p = Path(value)
+    if not p.is_absolute():
+        p = PROJECT_ROOT / p
+    if not p.is_file():
+        raise FileNotFoundError(
+            f"{dotted_key} points at '{value}' but no such file exists (resolved: {p})"
+        )
+    with open(p) as f:
+        loaded = yaml.safe_load(f)
+    if not isinstance(loaded, list):
+        raise ValueError(
+            f"{p}: expected a top-level YAML list of dir entries for {dotted_key}, "
+            f"got {type(loaded).__name__}"
+        )
+    return loaded
+
+
 def load_config(experiment_path: str) -> dict:
     """Load and merge experiment config.
 
     1. Read experiment yaml.
     2. Read the model params yaml it references.
-    3. Apply overrides on top.
+    3. Apply overrides on top. data.train_dirs/val_dirs may be given inline
+       (a list, as usual) or as a path string to an external yaml holding
+       that list (see _resolve_dirs_override) — either form works.
     4. Inject experiment name and model name.
 
     Args:
@@ -204,6 +259,7 @@ def load_config(experiment_path: str) -> dict:
         cfg: dict = yaml.safe_load(f)
 
     for dotted_key, value in (exp.get("overrides") or {}).items():
+        value = _resolve_dirs_override(dotted_key, value)
         _deep_set(cfg, dotted_key, value)
 
     cfg["name"]        = exp["name"]
@@ -584,7 +640,8 @@ def train(
     # ── Data ──────────────────────────────────────────────────────────────
     # Parse data.train_dirs/val_dirs entries — either the legacy
     # '<path>[:<barrier_angle_deg>]' string, or a structured mapping
-    # ({path, angle, barrier_label, layers, thickness}) — see parse_dir_entry.
+    # ({path, angle, barrier_label, layers, kirigami_thickness,
+    #  inter_layer_plate_thickness, w_beam_thickness}) — see parse_dir_entry.
     train_dirs, train_barrier = _parse_dirs(data_cfg["train_dirs"])
     val_dirs,   val_barrier   = _parse_dirs(data_cfg["val_dirs"])
 

@@ -7,29 +7,42 @@ from dataclasses import dataclass, field
 import numpy as np
 
 # Canonical ordering. Channels appear in this order; disabled ones are skipped.
-# "layer"/"thickness" describe a barrier's added material stack (e.g. a rubber
-# layer on top of the base T-lok design) — only meaningful for barrier designs
-# that actually vary them, see the gating note on GATED_BY_MATERIAL below.
-SCALAR_ORDER = ("speed", "mass", "angle", "layer", "thickness")
+# "layer"/"kirigami_thickness"/"inter_layer_plate_thickness"/"w_beam_thickness"
+# describe a barrier's added material stack (e.g. a rubber layer on top of the
+# base T-lok design) — only meaningful for barrier designs that actually vary
+# them, see the gating note on GATED_BY_MATERIAL below.
+SCALAR_ORDER = ("speed", "mass", "angle", "layer", "kirigami_thickness",
+                 "inter_layer_plate_thickness", "w_beam_thickness")
 
-# layer/thickness are only physically meaningful for barrier designs that
-# actually have a variable material stack — for the GT/baseline design
-# (material_vocab[0] by convention) normalize_conditions() forces them to a
-# fixed neutral 0.0 regardless of their raw value, so the model sees a
-# consistent "not applicable" sentinel rather than whatever default/leftover
-# raw value happened to be supplied for a GT trajectory.
-GATED_BY_MATERIAL = ("layer", "thickness")
+# These are only physically meaningful for barrier designs that actually have
+# a variable material stack — for the GT/baseline design (material_vocab[0]
+# by convention) normalize_conditions() forces them to a fixed neutral 0.0
+# regardless of their raw value, so the model sees a consistent "not
+# applicable" sentinel rather than whatever default/leftover raw value
+# happened to be supplied for a GT trajectory.
+GATED_BY_MATERIAL = ("layer", "kirigami_thickness",
+                      "inter_layer_plate_thickness", "w_beam_thickness")
+
+# Fields with no filename convention and no sensible zero-default — unlike
+# layer/kirigami_thickness (0 = "no added stack" is a real physical value),
+# these must be given explicitly per-trajectory whenever enabled AND the
+# trajectory isn't the GT/baseline design (material_vocab[0]) — baseline rows
+# get gated to 0 regardless of value, so leaving them unset there is safe.
+# See parse_conditions()'s `cfg` param.
+REQUIRED_WHEN_ENABLED = ("inter_layer_plate_thickness", "w_beam_thickness")
 
 
 @dataclass
 class CondConfig:
     enabled: tuple[str, ...] = ("speed", "mass")      # D4 default
     ranges: dict[str, tuple[float, float]] = field(default_factory=lambda: {
-        "speed":     (60.0, 100.0),
-        "mass":      (0.0, 1000.0),
-        "angle":     (0.0, 30.0),    # magnitude; sign dropped in parse_conditions (D5)
-        "layer":     (0.0, 5.0),     # number of added material layers
-        "thickness": (0.0, 30.0),    # mm, added layer thickness
+        "speed":                       (60.0, 100.0),
+        "mass":                        (0.0, 1000.0),
+        "angle":                       (0.0, 30.0),    # magnitude; sign dropped in parse_conditions (D5)
+        "layer":                       (0.0, 4.0),     # number of added material layers (0,2,3,4 observed)
+        "kirigami_thickness":          (0.3, 0.7),     # mm, kirigami cut-layer thickness
+        "inter_layer_plate_thickness": (1.0, 2.0),     # mm
+        "w_beam_thickness":            (2.7, 3.5),     # mm
     })
     material_vocab: tuple[str, ...] = ("F",)
     use_material: bool = False                         # D4: off while single type
@@ -41,8 +54,10 @@ class CondConfig:
         return n
 
 
-def parse_conditions(metadata: dict | None, dir_name: str) -> dict:
-    """Return raw physical values: {speed, mass, angle, layer, thickness, material}.
+def parse_conditions(metadata: dict | None, dir_name: str,
+                      cfg: CondConfig | None = None) -> dict:
+    """Return raw physical values: {speed, mass, angle, layer, kirigami_thickness,
+    inter_layer_plate_thickness, w_beam_thickness, material}.
 
     Dir naming convention: T_lok_F_shape_barrier_9_3_{speed}km[_plus{mass}kg]
     Metadata keys are checked first; dir-name regex is the fallback.
@@ -51,13 +66,22 @@ def parse_conditions(metadata: dict | None, dir_name: str) -> dict:
     trajectories (e.g. New_Road_Barrier_*) are single-speed runs with no
     '{speed}km' suffix.
 
-    layer/thickness/material have no dir-name naming convention (no filename
-    in the corpus encodes them) — they're expected to come from `metadata`,
-    populated per-trajectory from the experiment yaml's data.train_dirs/
-    val_dirs entries (see train.py's parse_dir_entry / src/dataset.py's
-    per-trajectory metadata merge), not guessed from the path.
+    layer/kirigami_thickness/inter_layer_plate_thickness/w_beam_thickness/
+    material have no dir-name naming convention (no filename in the corpus
+    encodes them) — they're expected to come from `metadata`, populated
+    per-trajectory from the experiment yaml's data.train_dirs/val_dirs
+    entries (see train.py's parse_dir_entry / src/dataset.py's per-trajectory
+    metadata merge), not guessed from the path.
+
+    `cfg` (the experiment's CondConfig) drives two things: which fields we
+    even look at (cfg.enabled), and — for REQUIRED_WHEN_ENABLED fields —
+    whether a missing value is an error. Those raise a loud KeyError when
+    enabled but missing UNLESS this trajectory is the GT/baseline design
+    (material == cfg.material_vocab[0]), since normalize_conditions() gates
+    baseline rows to 0 regardless of value, making an unset value safe there.
     """
     md = metadata or {}
+    enabled = cfg.enabled if cfg is not None else ()
     out: dict = {}
     # Speed in km/h
     out["speed"] = _get(md, ["speed_kmh", "speed", "v"], dir_name,
@@ -69,12 +93,29 @@ def parse_conditions(metadata: dict | None, dir_name: str) -> dict:
     out["angle"] = abs(_get(md, ["angle_deg", "orientation_deg", "angle"], dir_name,
                             r"(?:a|ang|angle)[_-]?(-?\d+(?:\.\d+)?)",
                             required=False, default=25.4))
-    # Added-layer count / thickness — metadata-only in practice (see docstring)
+    # Added-layer count / thicknesses — metadata-only in practice (see docstring)
     out["layer"] = _get(md, ["layer", "layers", "n_layers"], dir_name,
                         r"(\d+)[_-]?layers?", required=False, default=0.0)
-    out["thickness"] = _get(md, ["thickness", "thickness_mm"], dir_name,
-                            r"thickness[_-]?(\d+(?:\.\d+)?)", required=False, default=0.0)
+    out["kirigami_thickness"] = _get(
+        md, ["kirigami_thickness", "kirigami_thickness_mm"], dir_name,
+        r"kirigami_thickness[_-]?(\d+(?:\.\d+)?)", required=False, default=0.0)
     out["material"] = md.get("barrier_material", md.get("material", "F"))
+
+    # GT/baseline rows (material == material_vocab[0]) get gated to 0 in
+    # normalize_conditions() no matter what's supplied here, so an unset
+    # value is safe for them — only non-baseline rows must supply one.
+    is_gt_baseline = (
+        cfg is not None and cfg.use_material and cfg.material_vocab
+        and out["material"] == cfg.material_vocab[0]
+    )
+    out["inter_layer_plate_thickness"] = _get(
+        md, ["inter_layer_plate_thickness", "inter_layer_plate_thickness_mm"], dir_name,
+        r"inter_layer_plate_thickness[_-]?(\d+(?:\.\d+)?)",
+        required=("inter_layer_plate_thickness" in enabled) and not is_gt_baseline, default=0.0)
+    out["w_beam_thickness"] = _get(
+        md, ["w_beam_thickness", "w_beam_thickness_mm"], dir_name,
+        r"w_beam_thickness[_-]?(\d+(?:\.\d+)?)",
+        required=("w_beam_thickness" in enabled) and not is_gt_baseline, default=0.0)
     return out
 
 
@@ -91,10 +132,10 @@ def normalize_conditions(raw: dict, cfg: CondConfig) -> np.ndarray:
         if key in GATED_BY_MATERIAL:
             gated_positions.append(len(vec) - 1)
 
-    # Barrier-type gating: layer/thickness only mean something for barrier
-    # designs that actually vary them. By convention material_vocab[0] is the
-    # GT/baseline design — force gated channels to a fixed neutral 0.0 for it,
-    # regardless of whatever raw layer/thickness value was supplied.
+    # Barrier-type gating: GATED_BY_MATERIAL fields only mean something for
+    # barrier designs that actually vary them. By convention material_vocab[0]
+    # is the GT/baseline design — force gated channels to a fixed neutral 0.0
+    # for it, regardless of whatever raw value was supplied.
     if gated_positions and cfg.use_material and len(cfg.material_vocab) > 0:
         if raw.get("material") == cfg.material_vocab[0]:
             for i in gated_positions:

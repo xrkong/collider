@@ -1,0 +1,14 @@
+# Validation trajectory list for configs/experiments/wj10_r1.yaml (data.val_dirs).
+- path: "/raid/proj_iim1/xrkong/h5_fps_no_wheel/T_lok_F_shape_barrier_9_3_100km.h5"
+  barrier_label: T_lok
+  angle: -25.4
+  speed: 100.0
+# Sept 4
+- path: "/raid/proj_iim1/xrkong/h5_fps_no_wheel/New_Road_Barrier_concrete_W_beam_four_layer_05_1_5mm.h5"
+  barrier_label: New_Beam
+  layers: 4
+  kirigami_thickness: 0.5
+  inter_layer_plate_thickness: 1.5
+  w_beam_thickness: 2.7
+  angle: -25.4
+  speed: 100.0

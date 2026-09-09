@@ -1595,10 +1595,20 @@ def main():
                         help="Barrier layer count for src/conditions.py's 'layer' condition "
                              "(only meaningful when --barrier-label isn't the GT/baseline). "
                              "Defaults to 0.")
-    parser.add_argument("--thickness", type=float, default=None,
-                        help="Barrier added-layer thickness (mm) for src/conditions.py's "
-                             "'thickness' condition (only meaningful when --barrier-label isn't "
-                             "the GT/baseline). Defaults to 0.")
+    parser.add_argument("--kirigami-thickness", type=float, default=None,
+                        help="Barrier kirigami cut-layer thickness (mm) for src/conditions.py's "
+                             "'kirigami_thickness' condition (only meaningful when --barrier-label "
+                             "isn't the GT/baseline). Defaults to 0.")
+    parser.add_argument("--inter-layer-plate-thickness", type=float, default=None,
+                        help="Inter-layer plate thickness (mm) for src/conditions.py's "
+                             "'inter_layer_plate_thickness' condition. Required whenever the "
+                             "experiment's condition config enables it — no filename convention "
+                             "or safe default exists for this field.")
+    parser.add_argument("--w-beam-thickness", type=float, default=None,
+                        help="W-beam thickness (mm) for src/conditions.py's 'w_beam_thickness' "
+                             "condition. Required whenever the experiment's condition config "
+                             "enables it — no filename convention or safe default exists for "
+                             "this field.")
     parser.add_argument("--mode",
                         choices=["onestep", "autoregressive", "both", "raw_gt"],
                         default="both")
@@ -1807,7 +1817,8 @@ def main():
         print(f"\n[Rollout] === Test set: {ts_name} ===")
 
         # Parse conditions from dir name for both the table and model input.
-        # barrier_label/layers/thickness have no filename convention (see
+        # barrier_label/layers/kirigami_thickness/inter_layer_plate_thickness/
+        # w_beam_thickness have no filename convention (see
         # src/conditions.py's parse_conditions docstring), so pass them through
         # explicitly from the CLI when the model's condition config uses them.
         try:
@@ -1818,9 +1829,13 @@ def main():
                 cli_metadata["barrier_material"] = cond_cfg.material_vocab[0]  # GT default
             if args.layers is not None:
                 cli_metadata["layer"] = args.layers
-            if args.thickness is not None:
-                cli_metadata["thickness"] = args.thickness
-            raw_conds = parse_conditions(cli_metadata or None, ts_name)
+            if args.kirigami_thickness is not None:
+                cli_metadata["kirigami_thickness"] = args.kirigami_thickness
+            if args.inter_layer_plate_thickness is not None:
+                cli_metadata["inter_layer_plate_thickness"] = args.inter_layer_plate_thickness
+            if args.w_beam_thickness is not None:
+                cli_metadata["w_beam_thickness"] = args.w_beam_thickness
+            raw_conds = parse_conditions(cli_metadata or None, ts_name, cfg=cond_cfg)
             speed_kmh = float(raw_conds["speed"])
             weight_kg = float(raw_conds["mass"])
             angle_deg = float(raw_conds["angle"])

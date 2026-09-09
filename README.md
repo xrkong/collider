@@ -108,6 +108,11 @@ apptainer exec --bind /raid /staging/proj_iim1/xrkong/container/collider.sif \
     python -m dataset.compare_downsample_fem T_lok_F_shape_barrier_9_3_100km --window-ms 0
 ```
 
+If you use slurm, you can run the following command. It won't reconvert the dataset if it already exists. It is only for 500Hz dataset, so you need to change the frame stride and limit according to your needs.
+```bash
+sbatch --export=ALL,FRAME_STRIDE=4,FRAME_LIMIT=50 configs/hpc/build_dataset_weitj.slurm --all
+```
+
 ### Training
 ```bash
 # Train on local conda environment
@@ -214,26 +219,27 @@ pip install -r requirements.txt
 ssh -L 9999:curtin-jupyter.hpc.dug.com:443 dug
 ```
 
-## tasks:
-- [ ] scp 9 selected trajs to dug, including [60,80,100kph]x[0,400,800kg]=9 trajs
-- [ ] conda env setup on dug 
-- [ ] modify train.py for HPC, (use config to specify GPUs)
-- [ ] submit job script to HPC (100 epochs for testing)
-- [ ] rollout results, write reports
-- [ ] submit whole job (500 epochs) to HPC
+# Quick Start on Weitj
 
-## notes:
-- downsample should be done on laptop locally, then scp the downsampled trajs to dug, to save time on data transfer.
-- conda env should be deplied on /data/.../curtin_xiangrui/env... according to the HPC user manual.
-- use jupyterlab to link GPUs, and run train.py, use wandb to monitor the training process.
-- use 1 A100 or two of them? need to dicuss 
-- dug is available until the end of the month, need to finish the whole training process before then
+1. When you get the LS-DYNA simulation cases, upload them to HPC server.
+```bash
+tmux new -s upload
+rsync --info=progress2 -r /Users/xrkong/datasets/barrier/sep4 weitj:/raid/proj_iim1/xrkong/fem_zip
+```
 
+2. Unzip the files on HPC server.
+```bash
+/raid/proj_iim1/xrkong/unzip_all.sh 
+```
 
-## timeline: 
-9-13, setup data, env;  
-14-16 test run;   
-17-21 500 epoch training;  
-22-28 another training if needed;  
-29-30 download results, save checkpoints.  
+3. Build dataset for training. 
+```bash
+sbatch --export=ALL,FRAME_STRIDE=4,FRAME_LIMIT=50 configs/hpc/build_dataset_weitj.slurm --all
+```
 
+4. Create a experiment yaml file for training. You can copy from existing ones and modify the parameters. `configs/experiments/wj10_r1.yaml`
+
+5. Train the model using slurm.
+```bash
+sbatch --gres=gpu:2 configs/hpc/train_weitj.slurm configs/experiments/<experiment_name>.yaml
+```

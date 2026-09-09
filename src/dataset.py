@@ -703,7 +703,8 @@ class BVCSlicedDataset(BaseDataset):
             else:
                 bp = {"barrier_angle_deg": -25.4, "x_intercept": 2056.579}
 
-            # barrier_label/layers/thickness have no filename convention (see
+            # barrier_label/layers/kirigami_thickness/inter_layer_plate_thickness/
+            # w_beam_thickness have no filename convention (see
             # src/conditions.py's parse_conditions docstring) — they're
             # authored explicitly per data.train_dirs/val_dirs entry in the
             # experiment yaml (train.py's parse_dir_entry) and threaded here
@@ -717,11 +718,19 @@ class BVCSlicedDataset(BaseDataset):
                 cond_metadata.setdefault("barrier_material", bp["barrier_label"])
             if "layers" in bp:
                 cond_metadata.setdefault("layer", bp["layers"])
-            if "thickness" in bp:
-                cond_metadata.setdefault("thickness", bp["thickness"])
+            if "kirigami_thickness" in bp:
+                cond_metadata.setdefault("kirigami_thickness", bp["kirigami_thickness"])
+            if bp.get("inter_layer_plate_thickness") is not None:
+                cond_metadata.setdefault("inter_layer_plate_thickness", bp["inter_layer_plate_thickness"])
+            if bp.get("w_beam_thickness") is not None:
+                cond_metadata.setdefault("w_beam_thickness", bp["w_beam_thickness"])
 
-            # Parse and normalize physical conditions for this trajectory
-            cond_raw = parse_conditions(cond_metadata, dir_name)
+            # Parse and normalize physical conditions for this trajectory.
+            # Passing cfg makes inter_layer_plate_thickness/w_beam_thickness
+            # raise loudly (rather than silently default to 0) whenever
+            # they're enabled, left unset on this entry, AND this isn't a
+            # GT/baseline trajectory (which gets gated to 0 regardless).
+            cond_raw = parse_conditions(cond_metadata, dir_name, cfg=self._cond_cfg)
             cond_vec = normalize_conditions(cond_raw, self._cond_cfg)
             print(f"[BVCSlicedDataset] traj[{idx}] {dir_name}{meta_label} "
                   f"— T={T}, windows={n_windows} | "
