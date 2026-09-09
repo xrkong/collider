@@ -1,0 +1,16 @@
+name: "wj10_tc"
+description: "Time-conditioned (TC) Transolver — history-free, non-autoregressive. See PLAN: time-conditioned-transolver."
+model:
+  name: "transolverplus_net"
+  params: "configs/params/transolverplus_tc.yaml"
+
+overrides:
+  wandb.group: "wj10"
+
+  # Reuses the same underlying h5 trajectories as wj10_r1 — only the
+  # feature/target construction differs (train_tc.py / src/dataset_tc.py
+  # instead of train.py / src/dataset.py).
+  data.train_dirs: "configs/dataset_dirs/wj10_r1_train.yaml"
+  data.val_dirs: "configs/dataset_dirs/wj10_r1_val.yaml"
+
+notes: "v1 TC smoke-test config — verify data.time_ref_frames in transolverplus_tc.yaml against actual trajectory length before training."

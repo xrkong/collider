@@ -1,63 +1,69 @@
-name: "wj11_r1"
-description: "n_epochs=500, lr_cycles=2"
+name: "wj11_tc"
+description: "Time-conditioned (TC) Transolver — history-free, non-autoregressive. Train with train_tc.py, not train.py."
 model:
   name: "transolverplus_net"
-  params: "configs/params/transolverplus_net.yaml"
+  params: "configs/params/transolverplus_tc.yaml"
 
 overrides:
-  wandb.group: "wj11"  
+  wandb.group: "wj11"
 
+  # Same production-scale model size as the AR wj11 config this file used to
+  # hold — only the feature/target construction differs (train_tc.py /
+  # src/dataset_tc.py instead of train.py / src/dataset.py). block_act is
+  # already set correctly nested under model: in transolverplus_tc.yaml
+  # (the AR configs' top-level "block_act: gelu" override is a dead key —
+  # _deep_set has no dot to split on, so it lands on cfg["block_act"], never
+  # cfg["model"]["block_act"] — not repeated here).
   model.hidden_dim: 256
   model.layers: 32
   model.num_heads: 8
   model.slice_num: 256
 
-  # 35 base (5 frames × (3 vel + 3 position + 1 sdf)) + 8 cond
-  # (speed, layer, kirigami_thickness, inter_layer_plate_thickness,
-  # w_beam_thickness + 3-way barrier_label one-hot) = 43
-  model.nnode_in_features: 43
-  model.nnode_out_features: 3
+  # 3 (reference_coords) + 8 cond (speed, layer, kirigami_thickness,
+  # inter_layer_plate_thickness, w_beam_thickness + 3-way barrier_label
+  # one-hot) = 11. No kinematic_bc channel in v1 (see PLAN:
+  # time-conditioned-transolver).
+  model.nnode_in_features: 11
+  model.nnode_out_features: 3   # displacement-from-rest only; no aux target in v1
   model.num_node_types: 16
   model.type_emb_dim: 4
-  block_act: gelu
 
   train.lr: 0.001
   train.min_lr: 0.00001
   train.batch_size: 4
-  train.accum_steps: 4
   train.n_epochs: 500
-  train.lr_cycles: 2
-  train.push_forward_k: 2
-  train.noise_std: 0.0
-  train.grad_clip: 5.0
   train.val_every_epochs: 10
   train.val_batch_size: 1
+  # train.grad_clip / train.weight_decay: left at transolverplus_tc.yaml's
+  # defaults (0.1 / 1e-5, the SPEC's recommended TC values) — override here
+  # if you want this run's own values.
+  # No train.accum_steps / lr_cycles / push_forward_k / noise_std — train_tc.py
+  # doesn't implement gradient accumulation, LR restarts, push-forward
+  # unrolling, or noise injection (inert for TC, see PLAN §5).
 
-  data.input_frames: 5
-  data.include_position: true
-  data.acc_scale: 5.0e5
-  data.norm_fields:
-    - "positions"
-    - "velocity"
-    - "acceleration"
   data.node_type: true
-  data.per_region_norm: true
   data.node_type_field: region_id
+  # Fixed scored horizon in frames — MUST match at train and rollout time.
+  # Verified against every h5 in /raid/proj_iim1/xrkong/h5_fps_no_wheel/
+  # (14 files, all T=50, N=100046).
+  data.time_ref_frames: 50
+  # No data.input_frames / include_position / acc_scale / norm_fields /
+  # per_region_norm — TC is history-free (no velocity/acceleration window)
+  # and only ever normalizes "positions" (for reference_coords) and the
+  # displacement target, both computed by train_tc.py itself.
 
-  # condition: mass dropped, speed kept, layer + three thickness dimensions
-  # for the new barrier design's material stack. barrier_label is a one-hot
-  # categorical (material_vocab[0] = "T_lok" is the GT/baseline convention —
-  # see src/conditions.py's GATED_BY_MATERIAL gating: layer/kirigami_thickness/
-  # inter_layer_plate_thickness/w_beam_thickness are forced to a neutral 0.0
-  # for any trajectory whose barrier_label == material_vocab[0], regardless of
-  # the values given below).
+  # condition: unchanged from the AR wj11 config — mass dropped, speed kept,
+  # layer + three thickness dimensions for the new barrier design's material
+  # stack. barrier_label is a one-hot categorical (material_vocab[0] = "T_lok"
+  # is the GT/baseline convention — see src/conditions.py's GATED_BY_MATERIAL
+  # gating: layer/kirigami_thickness/inter_layer_plate_thickness/
+  # w_beam_thickness are forced to a neutral 0.0 for any trajectory whose
+  # barrier_label == material_vocab[0], regardless of the values given below).
   #
   # inter_layer_plate_thickness / w_beam_thickness have no safe zero-default —
   # src/conditions.py raises a loud error at dataset-build time for any
   # train_dirs/val_dirs entry below that's missing one of them while it's
-  # enabled here. Several entries below are left blank on purpose (unknown
-  # values, see inline TODOs) — fill them in before training, or that entry
-  # will fail to load.
+  # enabled here.
   condition:
     enabled: [speed, layer, kirigami_thickness, inter_layer_plate_thickness, w_beam_thickness]
     ranges:
@@ -68,12 +74,10 @@ overrides:
       w_beam_thickness:            [2.7, 3.5]       # mm
     material_vocab: [T_lok, New_No_Beam, New_Beam]   # index 0 = GT, gates the stack fields off
     use_material: true
-  # --resume-artifact "checkpoint-wj01:best"
 
-  # Trajectory lists live under configs/train_dirs/ (not inlined) so they can
-  # be updated/shared across wj10_* experiments in one place — see train.py's
-  # _resolve_dirs_override.
+  # Same underlying h5 trajectories as wj10_r1/wj11_r1's AR runs — only the
+  # feature/target construction differs.
   data.train_dirs: "configs/dataset_dirs/wj10_r1_train.yaml"
   data.val_dirs: "configs/dataset_dirs/wj10_r1_val.yaml"
 
-notes: "k=2, 4x4, 126GB;"
+notes: "Converted from AR (n_epochs=500, lr_cycles=2) to TC — run with: python train_tc.py --experiment configs/experiments/wj11_r1.yaml"

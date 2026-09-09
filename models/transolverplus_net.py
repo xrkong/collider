@@ -4,12 +4,27 @@
 #   - MultiScaleGNN 添加 @register("multi_scale_gnn")
 #   - 原有逻辑保留在 MultiScaleGNN 和 TemporalMultiScaleGNN 中，未修改
 
+import math
+
 import torch
 import torch.nn as nn
 
 from models.registry import register
 from models.blocks.transolver import Transolver_block
 from models.blocks.Transolver_plus import Transolver_plus_block
+
+
+def timestep_embedding(timesteps: torch.Tensor, dim: int, max_period: int = 10000) -> torch.Tensor:
+    """Sinusoidal embedding of a per-example scalar time in [0, 1]. timesteps: (B,) -> (B, dim)."""
+    half = dim // 2
+    freqs = torch.exp(
+        -math.log(max_period) * torch.arange(0, half, dtype=torch.float32, device=timesteps.device) / half
+    )
+    args = timesteps.reshape(-1, 1).float() * freqs.reshape(1, -1)
+    emb = torch.cat([torch.cos(args), torch.sin(args)], dim=-1)
+    if dim % 2:
+        emb = torch.cat([emb, torch.zeros_like(emb[:, :1])], dim=-1)
+    return emb
 
 
 def build_mlp(
@@ -69,6 +84,11 @@ class TransolverplusNet(nn.Module):
         self._init_network(nnode_in + type_emb_dim, nnode_out, latent, layers,
                            heads, dropout, mlp_ratio, block_act, slice_num)
 
+        self.time_conditioned = bool(m.get("time_conditioned", False))
+        self.time_fc = nn.Sequential(
+            nn.Linear(latent, latent), nn.SiLU(), nn.Linear(latent, latent)
+        ) if self.time_conditioned else None
+
     def _init_network(self, nnode_in, nnode_out, latent_dim, layers,
                       num_heads, dropout, mlp_ratio, block_act, slice_num):
         if latent_dim % num_heads != 0:
@@ -93,8 +113,10 @@ class TransolverplusNet(nn.Module):
             )
         # self.output_proj = nn.Linear(latent_dim, nnode_out)
 
-    def forward(self, x: torch.Tensor, node_type: torch.Tensor | None = None) -> torch.Tensor:
-        """Supports [N, C] or [B, N, C]. Pass node_type (N,) or (B,N) when type_embed is active."""
+    def forward(self, x: torch.Tensor, node_type: torch.Tensor | None = None,
+                t: torch.Tensor | None = None) -> torch.Tensor:
+        """Supports [N, C] or [B, N, C]. Pass node_type (N,) or (B,N) when type_embed is active.
+        Pass t (scalar or (B,), normalized query time) when time_conditioned is active."""
         squeeze = x.dim() == 2
         if squeeze:
             x = x.unsqueeze(0)
@@ -106,6 +128,13 @@ class TransolverplusNet(nn.Module):
             emb = self.type_embed(nt)                        # (B, N, type_emb_dim)
             x = torch.cat([x, emb], dim=-1)
         tokens = self.input_proj(x)
+        if self.time_conditioned:
+            assert t is not None, "t must be provided when model.time_conditioned=true"
+            tt = t.to(tokens.dtype)
+            if tt.dim() == 0:
+                tt = tt.unsqueeze(0)
+            time_emb = self.time_fc(timestep_embedding(tt, tokens.shape[-1]))  # (B, H)
+            tokens = tokens + time_emb.unsqueeze(1)  # broadcast over N
         for block in self.blocks:
             tokens = block(tokens)
         # out = self.output_proj(tokens)

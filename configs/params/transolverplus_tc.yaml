@@ -1,0 +1,57 @@
+model:
+  name: transolverplus_net
+  time_conditioned: true   # enables the additive time-embedding path (models/transolverplus_net.py)
+
+  # ── 网络结构 ──────────────────────────────────────────────────────────
+  # nnode_in_features = 3 (reference_coords) + n_cond (see condition: below) —
+  # no kinematic_bc channel in v1 (see PLAN: time-conditioned-transolver).
+  nnode_in_features: 11   # 3 + 8 cond (speed, layer, kirigami_thickness,
+                           # inter_layer_plate_thickness, w_beam_thickness + 3-way barrier_label one-hot)
+  nnode_out_features: 3   # displacement-from-rest only; no aux target in v1
+
+  hidden_dim: 128
+  layers: 8
+  num_heads: 8
+  slice_num: 64
+  mlp_ratio: 1
+  block_act: gelu
+
+  # ── Node-type embedding (must match data.node_type) ──────────────────
+  num_node_types: 16
+  type_emb_dim: 4
+
+train:
+  lr: 0.001
+  min_lr: 0.00001
+  weight_decay: 1.0e-5
+  batch_size: 4
+  n_epochs: 200
+  val_every_epochs: 5
+  grad_clip: 0.1
+  keep_top_k: 3
+
+data:
+  normalize: true
+  num_workers: 0
+  node_type: true
+  node_type_field: region_id
+  # Fixed scored horizon in frames — MUST match at train and rollout time.
+  # Verified against every h5 in /raid/proj_iim1/xrkong/h5_fps_no_wheel/
+  # (14 files, all T=50, N=100046) — update if you point this at a different
+  # dataset with a different trajectory length.
+  time_ref_frames: 50
+
+condition:
+  enabled: [speed, layer, kirigami_thickness, inter_layer_plate_thickness, w_beam_thickness]
+  ranges:
+    speed:                       [60.0, 100.0]
+    layer:                       [0.0, 4.0]
+    kirigami_thickness:          [0.3, 0.7]
+    inter_layer_plate_thickness: [1.0, 2.0]
+    w_beam_thickness:            [2.7, 3.5]
+  material_vocab: [T_lok, New_No_Beam, New_Beam]
+  use_material: true
+
+wandb:
+  project: barrier-vehicle-collision
+  log: true
