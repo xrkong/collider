@@ -80,4 +80,4 @@ overrides:
   data.train_dirs: "configs/dataset_dirs/wj10_r1_train.yaml"
   data.val_dirs: "configs/dataset_dirs/wj10_r1_val.yaml"
 
-notes: "Converted from AR (n_epochs=500, lr_cycles=2) to TC — run with: python train_tc.py --experiment configs/experiments/wj11_r1.yaml"
+notes: "Converted from AR (n_epochs=500, lr_cycles=2) to TC — run with: python train_tc.py --experiment configs/experiments/wj11_tc.yaml"
