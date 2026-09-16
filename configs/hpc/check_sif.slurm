@@ -8,7 +8,7 @@
 #SBATCH --output=logs/%x-%j.out
 #SBATCH --error=logs/%x-%j.err
 
-SIF=/staging/proj_iim1/xrkong/container/collider.sif
+SIF=/raid/proj_iim1/xrkong/container/collider.sif
 
 mkdir -p logs
 unset CUDA_VISIBLE_DEVICES

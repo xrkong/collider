@@ -43,7 +43,7 @@
 
 set -euo pipefail
 
-SIF=/staging/proj_iim1/xrkong/container/collider.sif
+SIF=/raid/proj_iim1/xrkong/container/collider.sif
 REPO=/home/xangruik/collider
 GIF="${GIF:-1}"   # 0 = skip GIF rendering, RMSE-only sweep
 

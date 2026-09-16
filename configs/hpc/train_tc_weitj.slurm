@@ -39,7 +39,7 @@ set -euo pipefail
 
 EXPERIMENT=${1:?"Usage: sbatch train_tc_weitj.slurm <path/to/experiment.yaml> [resume-source]"}
 RESUME=${2:-}
-SIF=/staging/proj_iim1/xrkong/container/collider.sif
+SIF=/raid/proj_iim1/xrkong/container/collider.sif
 REPO=/home/xangruik/collider
 AUTO_ROLLOUT="${AUTO_ROLLOUT:-1}"   # 0 = train only, don't queue the rollout job
 

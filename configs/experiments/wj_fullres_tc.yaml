@@ -1,0 +1,71 @@
+name: "wj_fullres_tc"
+description: "Time-conditioned (TC) Transolver on full-resolution (non-downsampled) FEM mesh data. Same setup as wj11_tc.yaml, only data.train_dirs/val_dirs differ. Train with train_tc.py, not train.py."
+model:
+  name: "transolverplus_net"
+  params: "configs/params/transolverplus_tc.yaml"
+
+overrides:
+  wandb.group: "wj_fullres"
+
+  # Same production-scale model size as wj11_tc.yaml. Transolver(++)'s
+  # physics-attention cost is O(N * slice_num), not O(N^2), so the extra
+  # nodes are a linear (not quadratic) hit — but host RAM is not: both
+  # BVCSlicedDataset and TCFrameDataset load every listed trajectory's full
+  # (T, N, 3) positions array into memory at Dataset.__init__ (no
+  # lazy/chunked read), so switching from ~100k to full-resolution N
+  # multiplies RAM proportionally. Build and dry-run against ONE trajectory
+  # first (small train_dirs/val_dirs list) before pointing this at the full
+  # set below.
+  model.hidden_dim: 256
+  model.layers: 32
+  model.num_heads: 8
+  model.slice_num: 256
+
+  # 3 (reference_coords) + 8 cond (speed, layer, kirigami_thickness,
+  # inter_layer_plate_thickness, w_beam_thickness + 3-way barrier_label
+  # one-hot) = 11. Unchanged from wj11_tc.yaml — node feature layout doesn't
+  # depend on mesh resolution.
+  model.nnode_in_features: 11
+  model.nnode_out_features: 3   # displacement-from-rest only; no aux target in v1
+  model.num_node_types: 16
+  model.type_emb_dim: 4
+
+  train.lr: 0.001
+  train.min_lr: 0.00001
+  train.batch_size: 4          # starting point only — train.auto_batch_size (default true
+                                # in train_tc.py) re-probes the max batch size that fits at
+                                # full resolution, so this is just the ceiling/fallback.
+  train.n_epochs: 500
+  train.val_every_epochs: 10
+  train.val_batch_size: 1
+
+  data.node_type: true
+  data.node_type_field: region_id
+  # Fixed scored horizon in frames — MUST match at train and rollout time.
+  # Inherited from wj11_tc.yaml (built with the same --frame-stride, only
+  # --full-res added — node count doesn't change frame count) but NOT
+  # re-verified against the actual h5_full_res/ files below. Re-check with
+  # `h5dump -a metadata/n_frames <file>.h5` (or equivalent) on the built
+  # files before training — TCFrameDataset asserts this at load time if
+  # it's wrong.
+  data.time_ref_frames: 50
+
+  # condition: unchanged from wj11_tc.yaml.
+  condition:
+    enabled: [speed, layer, kirigami_thickness, inter_layer_plate_thickness, w_beam_thickness]
+    ranges:
+      speed:                       [60.0, 100.0]
+      layer:                       [0.0, 4.0]      # observed values: 0, 2, 3, 4
+      kirigami_thickness:          [0.3, 0.7]       # mm
+      inter_layer_plate_thickness: [1.0, 2.0]       # mm
+      w_beam_thickness:            [2.7, 3.5]       # mm
+    material_vocab: [T_lok, New_No_Beam, New_Beam]   # index 0 = GT, gates the stack fields off
+    use_material: true
+
+  # Full-resolution counterpart of wj10_r1_train/val.yaml — same
+  # trajectories/conditions, built with --full-res into h5_full_res/
+  # instead of h5_fps_no_wheel/. See those files for the build command.
+  data.train_dirs: "configs/dataset_dirs/wj_fullres_train.yaml"
+  data.val_dirs: "configs/dataset_dirs/wj_fullres_val.yaml"
+
+notes: "Full-resolution FEM input, same TC recipe as wj11_tc.yaml — run with: python train_tc.py --experiment configs/experiments/wj_fullres_tc.yaml"

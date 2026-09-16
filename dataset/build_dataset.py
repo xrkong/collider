@@ -155,7 +155,21 @@ def main() -> None:
                         choices=["fps", "random", "stride", "poisson_disk"],
                         help="Node-sampling method applied to every region (SPEC §5). "
                              "Region budgets/floors are unchanged — only the within-region "
-                             "selection algorithm changes. Default fps.")
+                             "selection algorithm changes. Default fps. Ignored when "
+                             "--full-res is set.")
+    parser.add_argument("--full-res", action="store_true",
+                        help="Skip node sampling entirely — keep every node of every region "
+                             "(still honors --exclude-parts-config), i.e. write the raw FEM "
+                             "mesh at its native spatial resolution. --method/--seed are "
+                             "ignored. Temporal resolution is unaffected — still controlled "
+                             "by --frame-stride/--frame-limit.")
+    parser.add_argument("--budget-scale", type=float, default=1.0,
+                        help="Multiply every region's node budget (SPEC §4.4 defaults: "
+                             "barrier_fine=40000, barrier_coarse=20000, veh_contact=10000, "
+                             "veh_near=18000, veh_far=12000; total 100000) by this factor, "
+                             "e.g. 5.0 for a ~500k-node dataset. Each region still clips to "
+                             "its own available node count, same as today. Ignored when "
+                             "--full-res is set (which keeps every node regardless).")
     parser.add_argument("--seed", type=int, default=42,
                         help="RNG seed for the sampler (random/poisson_disk/fps).")
     parser.add_argument("--exclude-parts-config", type=Path, default=None,
@@ -222,18 +236,25 @@ def main() -> None:
         RegionConfig(
             name=rc.name,
             sampler=SamplerConfig(
-                method=args.method, n_points=rc.sampler.n_points, seed=args.seed,
+                method=args.method,
+                n_points=max(1, round(rc.sampler.n_points * args.budget_scale)),
+                seed=args.seed,
             ),
             split_by_part=rc.split_by_part,
             min_per_part=rc.min_per_part,
         )
         for rc in DEFAULT_REGION_CONFIGS
     ]
-    print(f"Sampling method: {args.method}  (seed={args.seed})")
+    if args.full_res:
+        print("Sampling method: full-res (node sampling disabled — keeping every node)")
+    else:
+        total_budget = sum(rc.sampler.n_points for rc in region_configs)
+        print(f"Sampling method: {args.method}  (seed={args.seed}, "
+              f"budget_scale={args.budget_scale} -> ~{total_budget:,} node budget)")
 
     mesh = parse_kfile(args.kfile)
     sampled_idx, region_labels, _segments = sample_mesh(
-        mesh, region_configs, exclude_pids=exclude_pids
+        mesh, region_configs, exclude_pids=exclude_pids, full_res=args.full_res
     )
     N = len(sampled_idx)
 
@@ -356,8 +377,10 @@ def main() -> None:
         mg.attrs["n_nodes"]          = N
         mg.attrs["n_frames"]         = n_frames
         mg.attrs["frame_stride"]     = args.frame_stride
-        mg.attrs["sampling_method"]  = args.method
+        mg.attrs["sampling_method"]  = "none" if args.full_res else args.method
         mg.attrs["sampling_seed"]    = args.seed
+        mg.attrs["full_res"]         = args.full_res
+        mg.attrs["budget_scale"]     = args.budget_scale
         mg.attrs["region_id_legend"] = REGION_ID_LEGEND
         mg.attrs["source_dir"]       = str(args.src.resolve())
         mg.attrs["kfile"]            = str(args.kfile.resolve())

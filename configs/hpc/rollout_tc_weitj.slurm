@@ -24,7 +24,7 @@
 
 set -euo pipefail
 
-SIF=/staging/proj_iim1/xrkong/container/collider.sif
+SIF=/raid/proj_iim1/xrkong/container/collider.sif
 REPO=/home/xangruik/collider
 
 unset CUDA_VISIBLE_DEVICES

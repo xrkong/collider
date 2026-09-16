@@ -23,12 +23,26 @@
 # GC/barrier ORA_x/ORA_y/ASI plots default to a 50ms moving-average filter
 # (EN 1317); set GC_BARRIER_WINDOW_MS=0 for raw, unfiltered plots instead
 # (the CSV itself is always raw regardless of this setting).
+# Set FULL_RES=1 to skip node sampling entirely (raw FEM mesh, every node) —
+# pair with a distinct OUT_DIR (e.g. h5_full_res) so it doesn't clobber the
+# downsampled dataset. Temporal resolution is independent — FRAME_STRIDE
+# still applies on top of FULL_RES.
+# Set BUDGET_SCALE=<factor> to raise the ~100k-node region budget without
+# going all the way to FULL_RES — e.g. BUDGET_SCALE=5 for a ~500k-node
+# dataset (SPEC §4.4 defaults: barrier_fine=40000, barrier_coarse=20000,
+# veh_contact=10000, veh_near=18000, veh_far=12000, scaled proportionally).
+# Ignored if FULL_RES=1. Larger budgets make --method fps (the default)
+# slower — it's O(n * region_size) — so a big BUDGET_SCALE may need more
+# --time in the slurm job or METHOD=stride/random for a faster pass.
 # bash dataset/run_build_dataset.sh T_lok_F_shape_barrier_9_3_rubber_concrete_15_Modified_DIF_60km T_lok_F_shape_barrier_9_3_rubber_concrete_30_Modified_DIF_60km
 
 set -euo pipefail
 
 FEM_DIR=/raid/proj_iim1/xrkong/fem
-OUT_DIR=/raid/proj_iim1/xrkong/h5_fps_no_wheel
+OUT_DIR="${OUT_DIR:-/raid/proj_iim1/xrkong/h5_fps_no_wheel}"
+FULL_RES="${FULL_RES:-0}"
+BUDGET_SCALE="${BUDGET_SCALE:-1}"
+METHOD="${METHOD:-fps}"
 # Scratch space for d3plot state-file copies (build_dataset.py's --tmp).
 # Must NOT be /tmp (build_dataset.py's own default) — that's on a
 # quota-limited filesystem and copying a single d3plot state (can be
@@ -37,7 +51,7 @@ OUT_DIR=/raid/proj_iim1/xrkong/h5_fps_no_wheel
 # build_dataset.py's startup cleanup (it rmtree's stray scan_*/extract_*
 # dirs under --tmp).
 TMP_DIR="${TMP_DIR:-/raid/proj_iim1/xrkong/tmp}"
-SIF=/staging/proj_iim1/xrkong/container/collider.sif
+SIF=/raid/proj_iim1/xrkong/container/collider.sif
 EXCLUDE_PARTS_CONFIG=configs/data/exclude_parts_tires.yaml
 FORCE="${FORCE:-0}"
 FRAME_STRIDE="${FRAME_STRIDE:-10}"
@@ -107,6 +121,9 @@ for name in "${NAMES[@]}"; do
   if [ -n "${FRAME_LIMIT}" ]; then
     extra_args+=(--frame-limit "${FRAME_LIMIT}")
   fi
+  if [ "${FULL_RES}" = "1" ]; then
+    extra_args+=(--full-res)
+  fi
 
   apptainer exec --bind /raid "${SIF}" \
     python -m dataset.build_dataset \
@@ -114,7 +131,8 @@ for name in "${NAMES[@]}"; do
       --src    "${src}" \
       --tmp    "${tmp_dir}" \
       --out    "${out}" \
-      --method fps \
+      --method "${METHOD}" \
+      --budget-scale "${BUDGET_SCALE}" \
       --seed 42 \
       --exclude-parts-config "${EXCLUDE_PARTS_CONFIG}" \
       --frame-stride "${FRAME_STRIDE}" --n-jobs 8 \

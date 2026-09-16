@@ -34,12 +34,12 @@ apptainer build --fakeroot collider.sif collider.def
 
 ```
 # Open a shell inside the container
-apptainer shell --nv --bind /home/xangruik/collider:/workspace /staging/proj_iim1/xrkong/container/collider.sif
+apptainer shell --nv --bind /home/xangruik/collider:/workspace /raid/proj_iim1/xrkong/container/collider.sif
 ```
 
 Dont forget line you wandb login in the container, otherwise you cannot upload your model to wandb.
 ```
-apptainer exec /staging/proj_iim1/xrkong/container/collider.sif wandb login <YOUR_API_KEY>
+apptainer exec /raid/proj_iim1/xrkong/container/collider.sif wandb login <YOUR_API_KEY>
 ```
 
 ### Connection
@@ -90,7 +90,7 @@ python -m dataset.build_dataset \
 If you use Apptriner, run this.
 ```bash
 cd /home/xangruik/collider
-apptainer exec --bind /raid /staging/proj_iim1/xrkong/container/collider.sif \
+apptainer exec --bind /raid /raid/proj_iim1/xrkong/container/collider.sif \
     python -m dataset.build_dataset \
     --kfile  /raid/proj_iim1/xrkong/fem/T_lok_F_shape_barrier_9_3_60km/car_and_barriers.k \
     --src    /raid/proj_iim1/xrkong/fem/T_lok_F_shape_barrier_9_3_60km \
@@ -104,7 +104,7 @@ apptainer exec --bind /raid /staging/proj_iim1/xrkong/container/collider.sif \
 
 Analyse your downsampled dataset to check if the downsampling is correct.
 ```bash
-apptainer exec --bind /raid /staging/proj_iim1/xrkong/container/collider.sif \
+apptainer exec --bind /raid /raid/proj_iim1/xrkong/container/collider.sif \
     python -m dataset.compare_downsample_fem T_lok_F_shape_barrier_9_3_100km --window-ms 0
 ```
 

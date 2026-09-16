@@ -129,6 +129,7 @@ def sample_mesh(
     mesh: MeshData,
     region_configs: list[RegionConfig] | None = None,
     exclude_pids: set[int] | None = None,
+    full_res: bool = False,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Run the full sampling pipeline.
 
@@ -136,9 +137,16 @@ def sample_mesh(
     continuously-rotating tire/rim/spindle parts — see part_filters.py).
     These nodes are never candidates for any region, including force_keep.
 
+    full_res: skip the per-region node budget/sampler entirely and keep
+    every node of every region (still respects exclude_pids/force_keep).
+    Region labels/segments are computed exactly as usual — only the
+    within-region *selection* step is bypassed — so region_id/node-type
+    metadata stays meaningful for a full-resolution HDF5 too.
+
     Returns
     -------
-    sampled_idx   : (~100k,) row indices into mesh arrays
+    sampled_idx   : (~100k,) row indices into mesh arrays (or all mesh
+                    nodes minus excluded PIDs, when full_res=True)
     region_labels : (~100k,) str — region name per sampled node
     segments      : (~100k,) str — part-family label per sampled node
     """
@@ -166,10 +174,13 @@ def sample_mesh(
         if already_chosen:
             combined_mask[np.array(list(already_chosen), dtype=np.int64)] = False
 
-        sampled = allocate_per_part(
-            mesh, combined_mask, rcfg.sampler.n_points, rcfg.sampler,
-            split_by_part=rcfg.split_by_part, min_per_part=rcfg.min_per_part,
-        )
+        if full_res:
+            sampled = np.where(combined_mask)[0]
+        else:
+            sampled = allocate_per_part(
+                mesh, combined_mask, rcfg.sampler.n_points, rcfg.sampler,
+                split_by_part=rcfg.split_by_part, min_per_part=rcfg.min_per_part,
+            )
         if len(sampled) == 0:
             logger.warning("Region %r yielded 0 nodes", rcfg.name)
             continue

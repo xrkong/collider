@@ -1,0 +1,16 @@
+# Validation trajectory list for configs/experiments/wj_fullres_tc.yaml
+# (data.val_dirs). Full-resolution counterpart of wj10_r1_val.yaml — see
+# wj_fullres_train.yaml for how these HDF5s are built.
+- path: "/raid/proj_iim1/xrkong/h5_full_res/T_lok_F_shape_barrier_9_3_100km.h5"
+  barrier_label: T_lok
+  angle: -25.4
+  speed: 100.0
+# Sept 4
+- path: "/raid/proj_iim1/xrkong/h5_full_res/New_Road_Barrier_concrete_W_beam_four_layer_05_1_5mm.h5"
+  barrier_label: New_Beam
+  layers: 4
+  kirigami_thickness: 0.5
+  inter_layer_plate_thickness: 1.5
+  w_beam_thickness: 2.7
+  angle: -25.4
+  speed: 100.0

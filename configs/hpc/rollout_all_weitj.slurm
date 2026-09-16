@@ -47,7 +47,7 @@
 
 set -euo pipefail
 
-SIF=/staging/proj_iim1/xrkong/container/collider.sif
+SIF=/raid/proj_iim1/xrkong/container/collider.sif
 REPO=/home/xangruik/collider
 
 # ~/.profile forces CUDA_VISIBLE_DEVICES=-1 to stop GPU use outside SLURM.
