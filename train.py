@@ -56,7 +56,8 @@ _NEW_OPTIONAL_COND_FIELDS = ("inter_layer_plate_thickness", "w_beam_thickness")
 def parse_dir_entry(entry: str | dict) -> dict:
     """Parse one data.train_dirs/val_dirs entry into a normalized dict:
     {path, angle, barrier_label, layers, kirigami_thickness,
-    inter_layer_plate_thickness, w_beam_thickness, speed}.
+    inter_layer_plate_thickness, w_beam_thickness, speed, live, ref_h5,
+    live_t_start, live_t_end, live_n_jobs}.
 
     Two forms are accepted:
       - A structured mapping (preferred — self-documenting, easy to extend):
@@ -73,12 +74,21 @@ def parse_dir_entry(entry: str | dict) -> dict:
         when omitted — leave them unset in the yaml while unknown; training
         will error loudly (via src/conditions.py) if left unset once the
         corresponding condition is enabled.
+
+        Set live: true to read this trajectory directly from a raw d3plot
+        sequence at `path` (native/fine time resolution) instead of an h5,
+        reusing an existing stage-1 h5's node subset/connectivity/metadata —
+        see dataset/live_source.py and src/dataset.py's _load_traj_live.
+        Requires ref_h5 (the stage-1 h5 for this same case). live_t_start/
+        live_t_end optionally restrict the extracted range (default: the
+        whole span ref_h5's states/times covers); live_n_jobs controls
+        extraction parallelism (default 4).
       - A legacy plain string '<h5_dir>[:<barrier_angle_deg>]' (still supported
         so existing experiment yamls keep working unchanged) — barrier_label/
         layers/kirigami_thickness always default to the GT baseline for this
         form, inter_layer_plate_thickness/w_beam_thickness are always None,
-        speed is always None (filename-derived), since there's no naming
-        convention to read the others from.
+        speed is always None (filename-derived), live is always False, since
+        there's no naming convention to read any of these from.
     """
     if isinstance(entry, dict):
         path = entry.get("path")
@@ -91,7 +101,14 @@ def parse_dir_entry(entry: str | dict) -> dict:
             "layers":             float(entry.get("layers", _DEFAULT_LAYERS)),
             "kirigami_thickness": float(entry.get("kirigami_thickness", _DEFAULT_KIRIGAMI_THICKNESS)),
             "speed":              float(entry["speed"]) if "speed" in entry else None,
+            "live":               bool(entry.get("live", False)),
+            "ref_h5":             str(entry["ref_h5"]) if entry.get("ref_h5") else None,
+            "live_t_start":       float(entry["live_t_start"]) if entry.get("live_t_start") is not None else None,
+            "live_t_end":         float(entry["live_t_end"])   if entry.get("live_t_end")   is not None else None,
+            "live_n_jobs":        int(entry.get("live_n_jobs", 4)),
         }
+        if d["live"] and not d["ref_h5"]:
+            raise ValueError(f"data.train_dirs/val_dirs entry {entry!r}: live=true requires 'ref_h5'")
         for f in _NEW_OPTIONAL_COND_FIELDS:
             d[f] = float(entry[f]) if entry.get(f) is not None else None
         return d
@@ -117,6 +134,11 @@ def parse_dir_entry(entry: str | dict) -> dict:
         "layers":             _DEFAULT_LAYERS,
         "kirigami_thickness": _DEFAULT_KIRIGAMI_THICKNESS,
         "speed":              None,
+        "live":               False,
+        "ref_h5":             None,
+        "live_t_start":       None,
+        "live_t_end":         None,
+        "live_n_jobs":        4,
     }
     for f in _NEW_OPTIONAL_COND_FIELDS:
         d[f] = None
@@ -150,6 +172,11 @@ def _parse_dirs(raw: list[str | dict]) -> tuple[list[str], list[dict]]:
             "inter_layer_plate_thickness": d["inter_layer_plate_thickness"],
             "w_beam_thickness":            d["w_beam_thickness"],
             "speed":                       d["speed"],   # None unless explicitly set on the entry
+            "live":                        d["live"],
+            "ref_h5":                      d["ref_h5"],
+            "live_t_start":                d["live_t_start"],
+            "live_t_end":                  d["live_t_end"],
+            "live_n_jobs":                 d["live_n_jobs"],
         })
     return paths, params
 
@@ -673,6 +700,7 @@ def train(
         region           = per_region_norm,
         region_field     = region_norm_field,
         min_region_nodes = region_norm_min_nodes,
+        barrier_params   = train_barrier,
     )
 
     # Position input feature (opt-in via data.include_position) uses the pooled

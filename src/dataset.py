@@ -222,36 +222,96 @@ def _read_or_derive_field(fh: "h5py.File", field: str) -> np.ndarray:
     raise KeyError(f"missing dataset '{h5_key}' and no derivation rule for field '{field}'")
 
 
-def compute_global_stats(traj_h5_paths: list[str], fields: list[str]) -> dict:
+def _welford_accumulate(s: dict, x: np.ndarray) -> None:
+    """Merge one batch x into running Welford accumulator s (in place)."""
+    n_b = x.size
+    if n_b == 0:
+        return
+    mean_b = float(x.mean())
+    var_b  = float(x.var())
+    n_a    = s["n"]
+    delta  = mean_b - s["mean"]
+    n_new  = n_a + n_b
+    s["mean"] = (n_a * s["mean"] + n_b * mean_b) / n_new
+    s["M2"]  += var_b * n_b + delta ** 2 * n_a * n_b / n_new
+    s["n"]    = n_new
+
+
+def _derive_field_from_positions(pos: np.ndarray, field: str) -> np.ndarray:
+    """velocity/acceleration by forward difference (dt=1 frame), matching
+    both _read_or_derive_field and BVCSlicedDataset's own np.diff convention."""
+    if field == "positions":
+        return pos
+    vel = np.diff(np.asarray(pos, dtype=np.float64), axis=0)
+    if field == "velocity":
+        return vel
+    if field == "acceleration":
+        return np.diff(vel, axis=0)
+    raise KeyError(f"no derivation rule for field '{field}' from live positions")
+
+
+def _read_traj_fields(p: str, fields: list[str], live_spec: dict | None) -> dict:
+    """Read/derive `fields` for one trajectory — from its h5, or (when
+    live_spec is given) live-extracted from its raw d3plot sequence, so
+    normalization stats are computed from the same source the model
+    actually trains on (see dataset/live_source.py). live_spec keys:
+    ref_h5 (required), live_t_start/live_t_end/live_n_jobs (optional) —
+    mirrors _load_traj_live in the trajectory-loading path above.
+    """
+    if live_spec is not None:
+        from dataset.live_source import extract_live_trajectory
+        live = extract_live_trajectory(
+            src_dir=Path(p), ref_h5=Path(live_spec["ref_h5"]),
+            t_start=live_spec.get("live_t_start"), t_end=live_spec.get("live_t_end"),
+            n_jobs=int(live_spec.get("live_n_jobs", 4)),
+        )
+        return {f: _derive_field_from_positions(live.positions, f) for f in fields}
+    with h5py.File(p, "r") as fh:
+        return {f: np.asarray(_read_or_derive_field(fh, f)) for f in fields}
+
+
+def _read_region_id(p: str, region_field: str, live_spec: dict | None) -> np.ndarray:
+    """Per-node region_id array — always from the h5 with real /metadata
+    (ref_h5 for a live entry, p itself otherwise; a raw d3plot dir has no
+    such data)."""
+    ref = live_spec["ref_h5"] if live_spec is not None else p
+    with h5py.File(ref, "r") as fh:
+        rid_key = f"metadata/{region_field}"
+        if rid_key not in fh:
+            raise KeyError(f"{ref}: missing region field '{rid_key}'")
+        return np.asarray(fh[rid_key][...]).astype(np.int64)
+
+
+def compute_global_stats(
+    traj_h5_paths: list[str],
+    fields: list[str],
+    live_specs: list[dict | None] | None = None,
+) -> dict:
     """One-pass Welford mean/std over (frames × nodes × dims) per field.
 
     Args:
-        traj_h5_paths: list of h5 paths
+        traj_h5_paths: list of h5 paths (or, for live entries, raw d3plot
+                case dirs — see live_specs)
         fields: list of field names matching states/ group keys
                 e.g. ["positions", "velocity", "acceleration"]
                 velocity/acceleration are derived from positions when the h5
                 doesn't store them directly (see _read_or_derive_field).
+        live_specs: index-aligned with traj_h5_paths; None per-entry for a
+                normal h5 (unchanged behavior), or a dict with ref_h5 (+
+                optional live_t_start/live_t_end/live_n_jobs) to read that
+                entry live from its raw d3plot sequence instead — see
+                _read_traj_fields.
 
     Returns:
         {field: {"mean": float, "std": float}}
     """
     accum = {f: {"n": 0, "mean": 0.0, "M2": 0.0} for f in fields}
-    for p in traj_h5_paths:
-        with h5py.File(p, "r") as fh:
-            for field in fields:
-                x = _read_or_derive_field(fh, field).reshape(-1).astype(np.float64)
-                n_b = x.size
-                if n_b == 0:
-                    continue
-                mean_b = float(x.mean())
-                var_b  = float(x.var())
-                s      = accum[field]
-                n_a    = s["n"]
-                delta  = mean_b - s["mean"]
-                n_new  = n_a + n_b
-                s["mean"] = (n_a * s["mean"] + n_b * mean_b) / n_new
-                s["M2"]  += var_b * n_b + delta ** 2 * n_a * n_b / n_new
-                s["n"]    = n_new
+    live_specs = live_specs or [None] * len(traj_h5_paths)
+    for p, live_spec in zip(traj_h5_paths, live_specs):
+        field_values = _read_traj_fields(p, fields, live_spec)
+        for field in fields:
+            x = field_values[field].reshape(-1).astype(np.float64)
+            _welford_accumulate(accum[field], x)
     return {
         f: {"mean": s["mean"], "std": (s["M2"] / max(s["n"], 1)) ** 0.5}
         for f, s in accum.items()
@@ -263,6 +323,7 @@ def compute_region_stats(
     fields: list[str],
     region_field: str = "region_id",
     min_region_nodes: int = 5,
+    live_specs: list[dict | None] | None = None,
 ) -> dict:
     """Per-region + pooled Welford mean/std over (frames × nodes-in-region × dims).
 
@@ -274,7 +335,8 @@ def compute_region_stats(
     per-region estimate).
 
     Args:
-        traj_h5_paths: list of h5 paths
+        traj_h5_paths: list of h5 paths (or, for live entries, raw d3plot
+                case dirs — see live_specs)
         fields: list of field names matching states/ group keys, e.g.
                 ["positions", "velocity", "acceleration"] — velocity/
                 acceleration are derived from positions when the h5 doesn't
@@ -283,6 +345,12 @@ def compute_region_stats(
                 (default "region_id", see dataset/constants.py REGION_ID_MAP).
         min_region_nodes: minimum node count for a region to get its own
                 stats; smaller regions fall back to the pooled stats.
+        live_specs: index-aligned with traj_h5_paths; None per-entry for a
+                normal h5 (unchanged behavior), or a dict with ref_h5 (+
+                optional live_t_start/live_t_end/live_n_jobs) to read that
+                entry live from its raw d3plot sequence instead (region_id
+                is still read from ref_h5's /metadata) — see
+                _read_traj_fields/_read_region_id.
 
     Returns:
         {field: {
@@ -294,42 +362,40 @@ def compute_region_stats(
     """
     region_accum: dict = {}   # field -> {region_id: {"n","mean","M2"}}
     node_counts: dict = {}    # region_id -> n_nodes (max seen across files)
+    live_specs = live_specs or [None] * len(traj_h5_paths)
 
-    for p in traj_h5_paths:
-        with h5py.File(p, "r") as fh:
-            rid_key = f"metadata/{region_field}"
-            if rid_key not in fh:
-                raise KeyError(f"{p}: missing region field '{rid_key}'")
-            region_id = np.asarray(fh[rid_key][...]).astype(np.int64)
-            n_regions_here = int(region_id.max()) + 1 if region_id.size else 0
+    for p, live_spec in zip(traj_h5_paths, live_specs):
+        region_id = _read_region_id(p, region_field, live_spec)
+        n_regions_here = int(region_id.max()) + 1 if region_id.size else 0
 
+        for r in range(n_regions_here):
+            n = int((region_id == r).sum())
+            if r in node_counts and node_counts[r] != n:
+                print(f"[RegionStats] Warning: region {r} node count differs across "
+                      f"trajectories ({node_counts[r]} vs {n} in {p}) — using max seen")
+            node_counts[r] = max(node_counts.get(r, 0), n)
+
+        field_values = _read_traj_fields(p, fields, live_spec)
+        for field in fields:
+            x = field_values[field].astype(np.float64)  # (T', N, C)
+            accum = region_accum.setdefault(field, {})
             for r in range(n_regions_here):
-                n = int((region_id == r).sum())
-                if r in node_counts and node_counts[r] != n:
-                    print(f"[RegionStats] Warning: region {r} node count differs across "
-                          f"trajectories ({node_counts[r]} vs {n} in {p}) — using max seen")
-                node_counts[r] = max(node_counts.get(r, 0), n)
-
-            for field in fields:
-                x = _read_or_derive_field(fh, field).astype(np.float64)  # (T', N, C)
-                accum = region_accum.setdefault(field, {})
-                for r in range(n_regions_here):
-                    mask = region_id == r
-                    if not mask.any():
-                        continue
-                    xb = x[:, mask, :].reshape(-1)
-                    n_b = xb.size
-                    if n_b == 0:
-                        continue
-                    mean_b = float(xb.mean())
-                    var_b  = float(xb.var())
-                    s = accum.setdefault(r, {"n": 0, "mean": 0.0, "M2": 0.0})
-                    n_a   = s["n"]
-                    delta = mean_b - s["mean"]
-                    n_new = n_a + n_b
-                    s["mean"] = (n_a * s["mean"] + n_b * mean_b) / n_new
-                    s["M2"]  += var_b * n_b + delta ** 2 * n_a * n_b / n_new
-                    s["n"]    = n_new
+                mask = region_id == r
+                if not mask.any():
+                    continue
+                xb = x[:, mask, :].reshape(-1)
+                n_b = xb.size
+                if n_b == 0:
+                    continue
+                mean_b = float(xb.mean())
+                var_b  = float(xb.var())
+                s = accum.setdefault(r, {"n": 0, "mean": 0.0, "M2": 0.0})
+                n_a   = s["n"]
+                delta = mean_b - s["mean"]
+                n_new = n_a + n_b
+                s["mean"] = (n_a * s["mean"] + n_b * mean_b) / n_new
+                s["M2"]  += var_b * n_b + delta ** 2 * n_a * n_b / n_new
+                s["n"]    = n_new
 
     n_regions = (max(node_counts) + 1) if node_counts else 0
 
@@ -397,14 +463,28 @@ def load_or_compute_global_stats(
     region: bool = False,
     region_field: str = "region_id",
     min_region_nodes: int = 5,
+    barrier_params: list[dict] | None = None,
 ) -> dict:
     """Load cached global (or per-region) stats or recompute from train dirs.
 
-    Cache key = sorted resolved train_dirs + sorted fields + mode
+    Cache key = sorted resolved train_dirs (live entries suffixed with their
+    ref_h5, so the cache invalidates if that changes) + sorted fields + mode
     (+ region_field when region=True). Recomputes whenever any of these
     change, including flipping between global and per-region mode.
+
+    barrier_params: index-aligned with train_dirs (as produced by train.py's
+        _parse_dirs). Only "live"/"ref_h5"/"live_t_start"/"live_t_end"/
+        "live_n_jobs" are used here — a "live" entry is read straight from
+        its raw d3plot sequence via dataset/live_source.py instead of being
+        opened as an h5 (train_dirs[i] is a raw d3plot case dir for those
+        entries, which _resolve_traj_dir would otherwise reject).
     """
-    key  = sorted(str(Path(d).resolve()) for d in train_dirs)
+    bps = barrier_params or [{}] * len(train_dirs)
+    key = sorted(
+        str(Path(d).resolve()) if not bp.get("live")
+        else f"{Path(d).resolve()}::live::{bp.get('ref_h5')}"
+        for d, bp in zip(train_dirs, bps)
+    )
     mode = "per_region" if region else "global"
     if cache_path.is_file():
         cached = json.loads(cache_path.read_text())
@@ -418,15 +498,29 @@ def load_or_compute_global_stats(
             print(f"[GlobalStats] Loaded cached stats from {cache_path}")
             return cached["stats"]
 
-    h5_paths = [_resolve_traj_dir(d)["h5"] for d in train_dirs]
+    h5_paths: list[str] = []
+    live_specs: list[dict | None] = []
+    for d, bp in zip(train_dirs, bps):
+        if bp.get("live"):
+            h5_paths.append(str(d))
+            live_specs.append({
+                "ref_h5":       bp["ref_h5"],
+                "live_t_start": bp.get("live_t_start"),
+                "live_t_end":   bp.get("live_t_end"),
+                "live_n_jobs":  bp.get("live_n_jobs", 4),
+            })
+        else:
+            h5_paths.append(_resolve_traj_dir(d)["h5"])
+            live_specs.append(None)
+
     if region:
         print(f"[GlobalStats] Computing per-region stats over {len(train_dirs)} "
               f"train traj(s) (region_field={region_field}) ...")
         stats = compute_region_stats(h5_paths, fields, region_field=region_field,
-                                      min_region_nodes=min_region_nodes)
+                                      min_region_nodes=min_region_nodes, live_specs=live_specs)
     else:
         print(f"[GlobalStats] Computing global stats over {len(train_dirs)} train traj(s) ...")
-        stats = compute_global_stats(h5_paths, fields)
+        stats = compute_global_stats(h5_paths, fields, live_specs=live_specs)
 
     cache_path.parent.mkdir(parents=True, exist_ok=True)
     cache_path.write_text(json.dumps(
@@ -494,6 +588,110 @@ class BaseDataset(torch.utils.data.Dataset, abc.ABC):
     @abc.abstractmethod
     def __getitem__(self, idx: int):
         pass
+
+
+# ── Pluggable per-trajectory array loading (h5 vs. live d3plot) ───────────────
+
+def _load_traj_h5(
+    p: Path,
+    *,
+    pos_key: str,
+    alive_key: str,
+    use_node_type: bool,
+    node_type_field: str,
+    per_region_norm: bool,
+    region_norm_field: str,
+) -> dict:
+    """Read one trajectory's per-frame positions/alive + static per-node
+    metadata straight from an h5 file's /states and /metadata groups — the
+    original (and still default) BVCSlicedDataset trajectory source."""
+    with h5py.File(p, "r") as f:
+        pos = f[pos_key][:].astype(np.float32)          # (T, N, 3)
+        alive = (
+            f[alive_key][:].astype(np.float32)          # (T, N) — 1=alive, 0=eroded
+            if alive_key in f else None                   # absent in legacy-format h5
+        )
+        node_type_arr = None
+        if use_node_type:
+            nt_key = f"metadata/{node_type_field}"
+            if nt_key not in f:
+                raise KeyError(
+                    f"{p}: missing node_type field '{nt_key}'. "
+                    f"Available metadata fields: {sorted(f['metadata'].keys())}. "
+                    f"For dataset/ds/build_dataset.py output, set "
+                    f"data.node_type_field: region_id in the experiment config."
+                )
+            node_type_arr = f[nt_key][:].astype(np.int64)  # (N,) static
+
+        region_id_arr = None
+        if per_region_norm:
+            rid_key = f"metadata/{region_norm_field}"
+            if rid_key not in f:
+                raise KeyError(
+                    f"{p}: missing region field '{rid_key}' required for "
+                    f"data.per_region_norm=true. Available metadata fields: "
+                    f"{sorted(f['metadata'].keys())}."
+                )
+            region_id_arr = f[rid_key][:].astype(np.int64)  # (N,) static
+    return {"pos": pos, "alive": alive, "node_type": node_type_arr, "region_id": region_id_arr}
+
+
+def _load_traj_live(
+    src_dir: Path,
+    live_spec: dict,
+    *,
+    use_node_type: bool,
+    node_type_field: str,
+    per_region_norm: bool,
+    region_norm_field: str,
+) -> dict:
+    """Read one trajectory's fine (native d3plot dt) positions/alive
+    directly from its raw d3plot sequence (see dataset/live_source.py),
+    reusing the node subset/connectivity already baked into
+    live_spec['ref_h5'] — static per-node metadata (node_type/region_id)
+    always comes from ref_h5, never from src_dir, which has no such data.
+
+    live_spec keys: ref_h5 (required), live_t_start/live_t_end (optional,
+    default whole case), live_n_jobs (optional, default 4) — see
+    train.py's parse_dir_entry for how these are authored in an
+    experiment yaml train_dirs/val_dirs entry.
+    """
+    from dataset.live_source import extract_live_trajectory
+
+    ref_h5 = Path(live_spec["ref_h5"])
+    live = extract_live_trajectory(
+        src_dir=Path(src_dir), ref_h5=ref_h5,
+        t_start=live_spec.get("live_t_start"), t_end=live_spec.get("live_t_end"),
+        n_jobs=int(live_spec.get("live_n_jobs", 4)),
+    )
+
+    node_type_arr = None
+    region_id_arr = None
+    with h5py.File(ref_h5, "r") as f:
+        if use_node_type:
+            nt_key = f"metadata/{node_type_field}"
+            if nt_key not in f:
+                raise KeyError(
+                    f"{ref_h5}: missing node_type field '{nt_key}' (referenced by live "
+                    f"entry {src_dir}). Available metadata fields: "
+                    f"{sorted(f['metadata'].keys())}."
+                )
+            node_type_arr = f[nt_key][:].astype(np.int64)
+        if per_region_norm:
+            rid_key = f"metadata/{region_norm_field}"
+            if rid_key not in f:
+                raise KeyError(
+                    f"{ref_h5}: missing region field '{rid_key}' required for "
+                    f"data.per_region_norm=true (referenced by live entry {src_dir})."
+                )
+            region_id_arr = f[rid_key][:].astype(np.int64)
+
+    return {
+        "pos": live.positions,
+        "alive": live.node_alive.astype(np.float32),
+        "node_type": node_type_arr,
+        "region_id": region_id_arr,
+    }
 
 
 # ── Helpers for collision-feature plumbing ────────────────────────────────────
@@ -638,33 +836,29 @@ class BVCSlicedDataset(BaseDataset):
         per_traj_windows: list[int] = []
 
         for idx, p in enumerate(self.h5_paths):
-            with h5py.File(p, "r") as f:
-                pos  = f[self.POS_KEY][:].astype(np.float32)      # (T, N, 3)
-                alive = (
-                    f[self.ALIVE_KEY][:].astype(np.float32)       # (T, N) — 1=alive, 0=eroded
-                    if self.ALIVE_KEY in f else None               # absent in legacy-format h5
-                )
-                if self.use_node_type:
-                    nt_key = f"metadata/{self.node_type_field}"
-                    if nt_key not in f:
-                        raise KeyError(
-                            f"{p}: missing node_type field '{nt_key}'. "
-                            f"Available metadata fields: {sorted(f['metadata'].keys())}. "
-                            f"For dataset/ds/build_dataset.py output, set "
-                            f"data.node_type_field: region_id in the experiment config."
-                        )
-                    node_type_arr = f[nt_key][:].astype(np.int64)  # (N,) static
+            # Barrier SDF params: use per-traj values if provided, else
+            # defaults. Moved to the top of the loop (was after array
+            # loading) because it also carries the live-source dispatch
+            # flag/spec (live/ref_h5/live_t_start/live_t_end/live_n_jobs)
+            # for this trajectory — see train.py's parse_dir_entry.
+            if idx < len(self._barrier_params):
+                bp = self._barrier_params[idx]
+            else:
+                bp = {"barrier_angle_deg": -25.4, "x_intercept": 2056.579}
 
-                region_id_arr = None
-                if self.per_region_norm:
-                    rid_key = f"metadata/{self.region_norm_field}"
-                    if rid_key not in f:
-                        raise KeyError(
-                            f"{p}: missing region field '{rid_key}' required for "
-                            f"data.per_region_norm=true. Available metadata fields: "
-                            f"{sorted(f['metadata'].keys())}."
-                        )
-                    region_id_arr = f[rid_key][:].astype(np.int64)  # (N,) static
+            load_kwargs = dict(
+                use_node_type=self.use_node_type,
+                node_type_field=self.node_type_field,
+                per_region_norm=self.per_region_norm,
+                region_norm_field=self.region_norm_field,
+            )
+            if bp.get("live"):
+                arrs = _load_traj_live(p, bp, **load_kwargs)
+            else:
+                arrs = _load_traj_h5(p, pos_key=self.POS_KEY, alive_key=self.ALIVE_KEY, **load_kwargs)
+            pos, alive = arrs["pos"], arrs["alive"]
+            node_type_arr = arrs["node_type"]
+            region_id_arr = arrs["region_id"]
 
             T = pos.shape[0]
             if T < self.window_len:
@@ -696,12 +890,6 @@ class BVCSlicedDataset(BaseDataset):
                     meta_label = f"  [{speed.split('/')[-1]}]" if speed else ""
                 except Exception:
                     pass
-
-            # Barrier SDF params: use per-traj values if provided, else defaults
-            if idx < len(self._barrier_params):
-                bp = self._barrier_params[idx]
-            else:
-                bp = {"barrier_angle_deg": -25.4, "x_intercept": 2056.579}
 
             # barrier_label/layers/kirigami_thickness/inter_layer_plate_thickness/
             # w_beam_thickness have no filename convention (see
@@ -897,7 +1085,15 @@ def build_dataloader(
     if not dirs:
         raise ValueError("build_dataloader needs at least one trajectory dir")
 
-    trajectories = [_resolve_traj_dir(d) for d in dirs]
+    # A "live" entry (barrier_params[i]["live"] is truthy) points at a raw
+    # d3plot case dir, not an h5/output.h5 — _resolve_traj_dir would reject
+    # it, so pass it straight through; BVCSlicedDataset's per-trajectory
+    # loop dispatches to _load_traj_live for these instead of h5py.File(p).
+    bps_for_resolve = barrier_params or [{}] * len(dirs)
+    trajectories = [
+        {"h5": str(d), "metadata": None} if bp.get("live") else _resolve_traj_dir(d)
+        for d, bp in zip(dirs, bps_for_resolve)
+    ]
     ds_cfg = {**cfg, "data": {
         **data_cfg,
         "paths":               [t["h5"]       for t in trajectories],

@@ -1,8 +1,42 @@
 # Collider
-Barrier vehicle collider simulator using machine learning methods. 
 
-## LS-DYNA Data processing and Build dataset 
-jump to [dataset](./dataset/README.md) for details.
+Machine-learning surrogate for vehicle-barrier crash simulation. Collider trains neural PDE surrogates (Transolver-based — a time-conditioned model for coarse-interval rollouts, plus an autoregressive model for fine-grained per-timestep dynamics) directly on LS-DYNA finite-element crash data, predicting full-mesh vehicle/barrier deformation without running the FEM solver.
+
+<p align="center">
+  <img src="assets/readme/rollout_concrete_barrier.gif" width="49%" alt="Rollout: T-lok F-shape concrete barrier, 100 km/h" />
+  <img src="assets/readme/rollout_wbeam_barrier.gif" width="49%" alt="Rollout: two-layer W-beam barrier" />
+</p>
+<p align="center"><sub><b>PRED</b> (model, left panel of each pair) vs. <b>GT</b> (LS-DYNA ground truth, right panel) — top-down and side views of a full vehicle-barrier collision rollout, on two different barrier geometries.</sub></p>
+
+## Results
+
+Standard EN 1317 crash-barrier report metrics — Acceleration Severity Index (ASI) and longitudinal/lateral occupant risk acceleration (ORA<sub>x</sub>, ORA<sub>y</sub>) — computed from an autoregressive rollout on a held-out validation case (100 km/h, unseen during training) and compared against LS-DYNA ground truth:
+
+<p align="center">
+  <img src="assets/readme/gc_barrier_displacement.png" width="48%" alt="Barrier resultant displacement: prediction vs ground truth" />
+  <img src="assets/readme/gc_barrier_asi.png" width="48%" alt="Acceleration Severity Index (EN 1317): prediction vs ground truth" />
+</p>
+<p align="center">
+  <img src="assets/readme/gc_barrier_ora_x.png" width="48%" alt="Longitudinal occupant risk acceleration ORA_x: prediction vs ground truth" />
+  <img src="assets/readme/gc_barrier_ora_y.png" width="48%" alt="Lateral occupant risk acceleration ORA_y: prediction vs ground truth" />
+</p>
+
+## LS-DYNA Data processing and Build dataset
+
+`dataset/build_dataset.py` converts one LS-DYNA simulation (a k-file + its `d3plot`/`d3plot01`/... sequence) into a single downsampled HDF5 file for training:
+
+1. Parse the k-file for part names + material properties.
+2. Optionally exclude parts (e.g. rotating tires/rims) via a YAML name-pattern list, before any sampling runs.
+3. Parse k-file geometry, then region-aware sample ~100k nodes (FPS by default — random/stride/poisson-disk also available). Fixed per-region budgets keep the barrier and vehicle-contact area denser than the far field, so the model sees more detail where the collision actually happens.
+4. Read the d3plot header for part mass + full mesh connectivity (shell/solid/beam).
+5. Scan every d3plot state's timestamp, then keep every N-th frame (`--frame-stride`) — this is temporal downsampling, independent of the spatial node sampling above.
+6. Extract, per kept frame, node positions + effective plastic strain (element strain scatter-averaged onto nodes, eroded elements excluded) and an erosion/liveness mask, for the sampled nodes only.
+7. Write one HDF5 file:
+   - `/metadata` — static per-node data: sampled node IDs, reference (t=0) positions, region/part/material labels and properties, nodal mass, and a *sparse* visualization-only mesh connectivity (only elements whose every node survived sampling; overlay a point cloud for full coverage).
+   - `/states` — per-frame data: `times`, `positions` (deformed xyz), `eff_plastic_strain`, `node_alive` (erosion mask).
+8. Always also renders vehicle-CG/barrier kinematics (ORA_x, ORA_y, ASI, displacement, rotation) as CSV + plots, both at full native d3plot resolution (ground truth) and read back from the finished HDF5 ("what the model actually sees") — see `dataset/gc_barrier.py`.
+
+Node sampling is the expensive step (FPS is `O(n × region_size)`); everything downstream reuses the same node subset rather than resampling. Usage examples are below, under [Prepare your dataset from DYNA-style files](#prepare-your-dataset-from-dyna-style-files).
 
 ## Training 
 ### Set Up Python Environment and install dependencies
