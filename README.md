@@ -3,8 +3,10 @@
 Machine-learning surrogate for vehicle-barrier crash simulation. Collider trains neural PDE surrogates (Transolver-based — a time-conditioned model for coarse-interval rollouts, plus an autoregressive model for fine-grained per-timestep dynamics) directly on LS-DYNA finite-element crash data, predicting full-mesh vehicle/barrier deformation without running the FEM solver.
 
 <p align="center">
-  <img src="assets/readme/rollout_concrete_barrier.gif" width="49%" alt="Rollout: T-lok F-shape concrete barrier, 100 km/h" />
-  <img src="assets/readme/rollout_wbeam_barrier.gif" width="49%" alt="Rollout: two-layer W-beam barrier" />
+  <img src="assets/readme/rollout_concrete_barrier.gif" width="85%" alt="Rollout: T-lok F-shape concrete barrier, 100 km/h" />
+</p>
+<p align="center">
+  <img src="assets/readme/rollout_wbeam_barrier.gif" width="85%" alt="Rollout: two-layer W-beam barrier" />
 </p>
 <p align="center"><sub><b>PRED</b> (model, left panel of each pair) vs. <b>GT</b> (LS-DYNA ground truth, right panel) — top-down and side views of a full vehicle-barrier collision rollout, on two different barrier geometries.</sub></p>
 
@@ -173,7 +175,8 @@ sbatch configs/experiments/resume_train_weitj.slurm configs/experiments/wj04.yam
 ```
 
 ### Barrier plate projection on xy plate 
-![Barrier middle plate projection on xy plate](SPEC/lines.png) *Figure. Barrier middle plate projection on xy plate*
+<p align="center"><img src="SPEC/lines.png" width="40%" alt="Barrier middle plate projection on xy plate" /></p>
+<p align="center"><sub><em>Figure. Barrier middle plate projection on xy plate</em></sub></p>
 
 *Table. Barrier plate projection parameters*
 | Degree | Slope m = tan(θ) | Line Equation | y-intercept (x=0) | x-intercept (y=0) |
