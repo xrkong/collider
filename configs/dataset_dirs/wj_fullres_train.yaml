@@ -6,22 +6,12 @@
 #   bash dataset/run_build_dataset.sh --all
 # Referenced by path (not inlined) so it can be shared/updated without
 # editing every experiment yaml — see train.py's _resolve_dirs_override.
-- path: "/raid/proj_iim1/xrkong/h5_full_res/New_Road_Barrier_10_14_FD_0_3_0_1_LR_NoThic.h5"
-  barrier_label: New_No_Beam
-  layers: 4
-  kirigami_thickness: 0.7
-  inter_layer_plate_thickness: 2.0
-  w_beam_thickness: 0            
-  angle: -25.4
-  speed: 100.0
-- path: "/raid/proj_iim1/xrkong/h5_full_res/New_Road_Barrier_concrete_W_beam.h5"
-  barrier_label: New_Beam
-  layers: 0
-  kirigami_thickness: 0.3
-  inter_layer_plate_thickness: 1.5
-  w_beam_thickness: 2.7
-  angle: -25.4
-  speed: 100.0
+#
+# Only the 11 trajectories with raw FEM data still present under
+# /raid/proj_iim1/xrkong/fem/ are listed here. Two entries from
+# wj10_r1_train.yaml are dropped entirely (no raw source to build from):
+#   New_Road_Barrier_10_14_FD_0_3_0_1_LR_NoThic
+#   New_Road_Barrier_concrete_W_beam (plain, not _four_layer)
 - path: "/raid/proj_iim1/xrkong/h5_full_res/New_Road_Barrier_W_beam_two_layer.h5"
   barrier_label: New_Beam
   layers: 2

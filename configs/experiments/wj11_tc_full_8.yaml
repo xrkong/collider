@@ -1,4 +1,4 @@
-name: "wj11_tc_full_64"
+name: "wj11_tc_full_8"
 description: "Time-conditioned (TC) Transolver — history-free, non-autoregressive. Train with train_tc.py, not train.py."
 model:
   name: "transolverplus_net"
@@ -14,10 +14,10 @@ overrides:
   # (the AR configs' top-level "block_act: gelu" override is a dead key —
   # _deep_set has no dot to split on, so it lands on cfg["block_act"], never
   # cfg["model"]["block_act"] — not repeated here).
-  model.hidden_dim: 256
+  model.hidden_dim: 128
   model.layers: 32
   model.num_heads: 8
-  model.slice_num: 64
+  model.slice_num: 8
 
   # 3 (reference_coords) + 8 cond (speed, layer, kirigami_thickness,
   # inter_layer_plate_thickness, w_beam_thickness + 3-way barrier_label
@@ -32,7 +32,7 @@ overrides:
   train.min_lr: 0.00001
   train.batch_size: 1
   train.n_epochs: 500
-  train.val_every_epochs: 10
+  train.val_every_epochs: 20
   train.val_batch_size: 1
   # train.grad_clip / train.weight_decay: left at transolverplus_tc.yaml's
   # defaults (0.1 / 1e-5, the SPEC's recommended TC values) — override here

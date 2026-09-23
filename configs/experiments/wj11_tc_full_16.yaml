@@ -14,10 +14,10 @@ overrides:
   # (the AR configs' top-level "block_act: gelu" override is a dead key —
   # _deep_set has no dot to split on, so it lands on cfg["block_act"], never
   # cfg["model"]["block_act"] — not repeated here).
-  model.hidden_dim: 256
+  model.hidden_dim: 128
   model.layers: 32
   model.num_heads: 8
-  model.slice_num: 256
+  model.slice_num: 16
 
   # 3 (reference_coords) + 8 cond (speed, layer, kirigami_thickness,
   # inter_layer_plate_thickness, w_beam_thickness + 3-way barrier_label

@@ -3,7 +3,7 @@
 #SBATCH --account=proj_iim1
 #SBATCH --job-name=dot-train-tc
 #SBATCH --partition=LocalQ
-#SBATCH --gres=gpu:1
+#SBATCH --gres=gpu:2
 #SBATCH --time=168:00:00
 #SBATCH --output=logs/%x-%j.out
 #SBATCH --error=logs/%x-%j.err

@@ -1,10 +1,12 @@
 # Validation trajectory list for configs/experiments/wj_fullres_tc.yaml
 # (data.val_dirs). Full-resolution counterpart of wj10_r1_val.yaml — see
 # wj_fullres_train.yaml for how these HDF5s are built.
-- path: "/raid/proj_iim1/xrkong/h5_full_res/T_lok_F_shape_barrier_9_3_100km.h5"
-  barrier_label: T_lok
-  angle: -25.4
-  speed: 100.0
+#
+# wj10_r1_val.yaml's T_lok_F_shape_barrier_9_3_100km entry is dropped — no
+# raw FEM source under /raid/proj_iim1/xrkong/fem/ to build it from. That
+# leaves only ONE validation trajectory below — thin, but functional. If
+# you want more val coverage, move one of the T_lok_* entries from
+# wj_fullres_train.yaml over here instead.
 # Sept 4
 - path: "/raid/proj_iim1/xrkong/h5_full_res/New_Road_Barrier_concrete_W_beam_four_layer_05_1_5mm.h5"
   barrier_label: New_Beam
